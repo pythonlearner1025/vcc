@@ -1,0 +1,6 @@
+*.DS_Store
+ref/
+env/
+assets/
+data/
+__pycache__/

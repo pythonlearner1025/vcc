@@ -10,6 +10,7 @@ import numpy as np
 import pandas as pd
 import h5py
 import scanpy as sc
+import wandb
 from pathlib import Path
 from typing import Dict, List, Set, Tuple
 from tqdm import tqdm
@@ -340,6 +341,18 @@ def main():
     n_hvgs = 2000  # Number of highly variable genes
     tokenization_strategy = "binned"  # "direct", "binned", or "log"
     
+    # Initialize wandb
+    wandb.init(
+        project="VCC",
+        config={
+            "batch_size": batch_size,
+            "learning_rate": learning_rate,
+            "n_epochs": n_epochs,
+            "n_hvgs": n_hvgs,
+            "tokenization_strategy": tokenization_strategy
+        }
+    )
+    
     # Load config
     config = load_config(data_dir)
     print(f"Dataset info:")
@@ -385,6 +398,13 @@ def main():
             total_loss += loss
             n_batches += 1
             
+            # Log batch metrics
+            wandb.log({
+                "batch_loss": loss,
+                "epoch": epoch,
+                "batch": batch_idx
+            })
+            
             if batch_idx % 100 == 0:
                 print(f"Epoch {epoch}, Batch {batch_idx}, Loss: {loss:.4f}")
             
@@ -394,6 +414,12 @@ def main():
         
         avg_loss = total_loss / n_batches
         print(f"Epoch {epoch} - Average Loss: {avg_loss:.4f}")
+        
+        # Log epoch metrics
+        wandb.log({
+            "epoch_loss": avg_loss,
+            "epoch": epoch
+        })
     
     # Example: Generate synthetic cells
     print("\nGenerating synthetic cells...")
@@ -420,6 +446,16 @@ def main():
     print(f"Top 10 HVGs: {hvg_info['hvg_names'][:10]}")
     print(f"Mean percent cells expressed (top 10): "
           f"{np.mean(hvg_info['statistics']['percent_cells_expressed']):.1f}%")
+    
+    # Log final metrics
+    wandb.log({
+        "final_synthetic_avg_expression": synthetic_expression.mean().item(),
+        "final_synthetic_sparsity": (synthetic_expression == 0).float().mean().item(),
+        "model_parameters": sum(p.numel() for p in model.parameters()),
+        "vocab_size": vocab_size
+    })
+    
+    wandb.finish()
 
 
 if __name__ == "__main__":

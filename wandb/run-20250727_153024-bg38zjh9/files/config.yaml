@@ -1,0 +1,62 @@
+_wandb:
+    value:
+        cli_version: 0.21.0
+        e:
+            rngtx55djgjgom25ap9mbnsz9k0frrcu:
+                apple:
+                    ecpuCores: 4
+                    gpuCores: 30
+                    memoryGb: 36
+                    name: Apple M3 Max
+                    pcpuCores: 10
+                    ramTotalBytes: "38654705664"
+                    swapTotalBytes: "7516192768"
+                codePath: train.py
+                codePathLocal: train.py
+                cpu_count: 14
+                cpu_count_logical: 14
+                disk:
+                    /:
+                        total: "994662584320"
+                        used: "715692666880"
+                email: mjsong2021@gmail.com
+                executable: /Users/minjunes/vcc/env/bin/python3
+                git:
+                    commit: 88359c9d9fe15ce15fdad188cfdcf643bfd70ba1
+                    remote: https://github.com/pythonlearner1025/vcc.git
+                host: Minjunes-MacBook-Pro-3.local
+                memory:
+                    total: "38654705664"
+                os: macOS-14.4-arm64-arm-64bit-Mach-O
+                program: /Users/minjunes/vcc/train.py
+                python: CPython 3.13.5
+                root: /Users/minjunes/vcc
+                startedAt: "2025-07-27T22:30:24.406139Z"
+                writerId: rngtx55djgjgom25ap9mbnsz9k0frrcu
+        m: []
+        python_version: 3.13.5
+        t:
+            "1":
+                - 1
+                - 5
+                - 53
+            "2":
+                - 1
+                - 5
+                - 53
+            "3":
+                - 16
+            "4": 3.13.5
+            "5": 0.21.0
+            "12": 0.21.0
+            "13": darwin-arm64
+batch_size:
+    value: 32
+learning_rate:
+    value: 0.0001
+n_epochs:
+    value: 10
+n_hvgs:
+    value: 2000
+tokenization_strategy:
+    value: binned

@@ -1,0 +1,90 @@
+Dataset info:
+  Total cells: 113,224
+  Total genes: 36,601
+  Max expression: 32500
+  Sparsity: 94.0%
+
+Tokenization: binned
+Vocabulary size: 10
+Loading precomputed HVGs from data/scRNA/hvg_info.json
+
+HVG Dataset initialized:
+  Original genes: 36,601
+  HVG genes: 2,000
+  Reduction: 94.5%
+
+Dataset size: 113,224 cells
+Input dimension: 2000 genes (reduced from 36,601)
+/Users/minjunes/vcc/env/lib/python3.13/site-packages/torch/nn/modules/transformer.py:382: UserWarning: enable_nested_tensor is True, but self.use_nested_tensor is False because encoder_layer.self_attn.batch_first was not True(use batch_first for better inference performance)
+  warnings.warn(
+
+Model parameters: 391,050
+
+Starting training...
+/Users/minjunes/vcc/env/lib/python3.13/site-packages/torch/utils/data/dataloader.py:683: UserWarning: 'pin_memory' argument is set as true but not supported on MPS now, then device pinned memory won't be used.
+  warnings.warn(warn_msg)
+Epoch 0, Batch 0, Loss: 2.4821
+Traceback (most recent call last):
+  File "/Users/minjunes/vcc/train.py", line 462, in <module>
+    main()
+    ~~~~^^
+  File "/Users/minjunes/vcc/train.py", line 397, in main
+    loss = train_step(model, batch, tokenize, criterion, optimizer)
+  File "/Users/minjunes/vcc/train.py", line 322, in train_step
+    logits = model(tokens)
+  File "/Users/minjunes/vcc/env/lib/python3.13/site-packages/torch/nn/modules/module.py", line 1751, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "/Users/minjunes/vcc/env/lib/python3.13/site-packages/torch/nn/modules/module.py", line 1762, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/Users/minjunes/vcc/train.py", line 305, in forward
+    x = self.transformer(x)
+  File "/Users/minjunes/vcc/env/lib/python3.13/site-packages/torch/nn/modules/module.py", line 1751, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "/Users/minjunes/vcc/env/lib/python3.13/site-packages/torch/nn/modules/module.py", line 1762, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/Users/minjunes/vcc/env/lib/python3.13/site-packages/torch/nn/modules/transformer.py", line 514, in forward
+    output = mod(
+        output,
+    ...<2 lines>...
+        src_key_padding_mask=src_key_padding_mask_for_layers,
+    )
+  File "/Users/minjunes/vcc/env/lib/python3.13/site-packages/torch/nn/modules/module.py", line 1751, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "/Users/minjunes/vcc/env/lib/python3.13/site-packages/torch/nn/modules/module.py", line 1762, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/Users/minjunes/vcc/env/lib/python3.13/site-packages/torch/nn/modules/transformer.py", line 914, in forward
+    + self._sa_block(x, src_mask, src_key_padding_mask, is_causal=is_causal)
+      ~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/minjunes/vcc/env/lib/python3.13/site-packages/torch/nn/modules/transformer.py", line 928, in _sa_block
+    x = self.self_attn(
+        ~~~~~~~~~~~~~~^
+        x,
+        ^^
+    ...<5 lines>...
+        is_causal=is_causal,
+        ^^^^^^^^^^^^^^^^^^^^
+    )[0]
+    ^
+  File "/Users/minjunes/vcc/env/lib/python3.13/site-packages/torch/nn/modules/module.py", line 1751, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "/Users/minjunes/vcc/env/lib/python3.13/site-packages/torch/nn/modules/module.py", line 1762, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/Users/minjunes/vcc/env/lib/python3.13/site-packages/torch/nn/modules/activation.py", line 1373, in forward
+    attn_output, attn_output_weights = F.multi_head_attention_forward(
+                                       ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^
+        query,
+        ^^^^^^
+    ...<17 lines>...
+        is_causal=is_causal,
+        ^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "/Users/minjunes/vcc/env/lib/python3.13/site-packages/torch/nn/functional.py", line 6410, in multi_head_attention_forward
+    attn_output = scaled_dot_product_attention(
+        q, k, v, attn_mask, dropout_p, is_causal
+    )
+KeyboardInterrupt

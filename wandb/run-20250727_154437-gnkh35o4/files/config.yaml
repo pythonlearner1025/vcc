@@ -1,0 +1,69 @@
+_wandb:
+    value:
+        cli_version: 0.21.0
+        e:
+            0bomoic0g8vn20cq6zww1pjjbdb97826:
+                codePath: train_mini_diffusion.py
+                codePathLocal: train_mini_diffusion.py
+                email: mjsong2021@gmail.com
+                executable: /Users/minjunes/vcc/env/bin/python3
+                git:
+                    commit: 88359c9d9fe15ce15fdad188cfdcf643bfd70ba1
+                    remote: https://github.com/pythonlearner1025/vcc.git
+                host: Minjunes-MacBook-Pro-3.local
+                os: macOS-14.4-arm64-arm-64bit-Mach-O
+                program: /Users/minjunes/vcc/train_mini_diffusion.py
+                python: CPython 3.13.5
+                root: /Users/minjunes/vcc
+                startedAt: "2025-07-27T22:44:37.581316Z"
+                writerId: 0bomoic0g8vn20cq6zww1pjjbdb97826
+        m: []
+        python_version: 3.13.5
+        t:
+            "1":
+                - 1
+                - 5
+                - 53
+            "2":
+                - 1
+                - 5
+                - 53
+            "3":
+                - 13
+                - 16
+            "4": 3.13.5
+            "5": 0.21.0
+            "12": 0.21.0
+            "13": darwin-arm64
+batch_size:
+    value: 64
+dim:
+    value: 512
+eval_every:
+    value: 1000
+ffn_mult:
+    value: 4
+learning_rate:
+    value: 0.0003
+log_every:
+    value: 100
+max_steps:
+    value: 50000
+n_genes:
+    value: 2000
+n_head:
+    value: 8
+n_layer:
+    value: 6
+n_timesteps:
+    value: 1000
+save_every:
+    value: 5000
+schedule:
+    value: cosine
+vocab_size:
+    value: 65
+warmup_steps:
+    value: 1000
+weight_decay:
+    value: 0.01

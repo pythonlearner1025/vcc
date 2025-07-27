@@ -215,11 +215,33 @@ HVGs are selected using the dispersion metric (variance/mean ratio):
 
 ## Examples
 
+### Basic Training Example
 See `train.py` for a complete training example with:
 - HVG preprocessing integration
 - Custom tokenization strategies (direct, binned, log-scale)
 - Simple transformer architecture
 - Training loop with loss tracking
+
+### Mini Discrete Diffusion Model
+`train_mini_diffusion.py` provides a scaled-down discrete diffusion transformer:
+- ~50M parameters (vs 17B full model)
+- 512 hidden dim, 8 attention heads, 6 transformer layers
+- Discrete diffusion with masking noise schedule
+- Full training pipeline with evaluation and checkpointing
+- Designed for sanity checking before large-scale training
+
+```bash
+# Train mini diffusion model
+python train_mini_diffusion.py
+```
+
+### 17B Model Architecture
+`model_17b.py` contains the full 17B parameter discrete diffusion transformer:
+- 24 dense transformer layers + 12 MoE layers
+- Top-2 routing with 16 experts per MoE layer
+- 3072 hidden dim, 24 attention heads
+- Perturbation conditioning with LoRA adapters
+- Optimized for distributed training with DeepSpeed
 
 ## Citation
 
