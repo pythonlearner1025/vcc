@@ -4,3 +4,4 @@ env/
 assets/
 data/
 __pycache__/
+wandb/
