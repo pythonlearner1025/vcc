@@ -251,7 +251,7 @@ class VCCValidationDataset(Dataset):
         
         # Load validation genes
         self.val_df = pd.read_csv(validation_csv)
-        self.validation_genes = self.val_df['Gene'].tolist()
+        self.validation_genes = self.val_df['target_gene'].tolist()
         
         # Build control indices
         self.control_indices = self.vcc_dataset.get_control_cells()
@@ -413,7 +413,7 @@ def create_vcc_validation_dataloader(
     vcc_dataset = VCCDataset(str(data_path), max_cells=max_cells, use_hvgs=use_hvgs)
     
     # Create validation dataset
-    validation_csv = Path(data_dir) / "Validation_gene_list.csv"
+    validation_csv = Path(data_dir) / "pert_counts_Validation.csv"
     if not validation_csv.exists():
         raise FileNotFoundError(f"Validation CSV not found: {validation_csv}")
         
