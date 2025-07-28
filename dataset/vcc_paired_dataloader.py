@@ -233,6 +233,10 @@ class VCCPairedDataset(Dataset):
             except ValueError:
                 target_idx = -1
         
+        # Get batch information for selected cells
+        control_batches = [self.adata.obs.iloc[idx]['batch'] for idx in selected_ctrl]
+        pert_batches = [self.adata.obs.iloc[idx]['batch'] for idx in selected_pert]
+        
         # Apply tokenizer if provided
         if self.tokenizer is not None:
             control_expr = self.tokenizer(control_expr)
@@ -253,6 +257,8 @@ class VCCPairedDataset(Dataset):
             'control_mean': torch.FloatTensor(control_mean),
             'log2fc': torch.FloatTensor(log2fc),
             'perturbation_magnitude': float(np.linalg.norm(log2fc)),
+            'control_batches': control_batches,  # List of batch names for control cells
+            'pert_batches': pert_batches,        # List of batch names for perturbed cells
         }
         
         return result
@@ -344,6 +350,10 @@ class VCCValidationDataset(Dataset):
             target_idx = self.vcc_dataset.get_gene_index(target_gene)
             if target_idx is None:
                 target_idx = -1
+            
+            # Get batch information for selected cells (validation uses VCCDataset)
+            control_batches = [self.vcc_dataset.batches[idx] for idx in selected_ctrl1]
+            pert_batches = [self.vcc_dataset.batches[idx] for idx in selected_ctrl2]
                 
             # Apply tokenizer if provided
             if self.tokenizer is not None:
@@ -365,6 +375,8 @@ class VCCValidationDataset(Dataset):
                 'control_mean': torch.FloatTensor(control_mean),
                 'log2fc': torch.FloatTensor(log2fc),
                 'perturbation_magnitude': 0.0,  # No perturbation for validation genes
+                'control_batches': control_batches,  # List of batch names for control cells
+                'pert_batches': pert_batches,        # List of batch names for perturbed cells
             }
         except Exception as e:
             print(f"Error in validation dataset __getitem__ at idx {idx}: {e}")

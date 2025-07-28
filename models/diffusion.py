@@ -47,10 +47,13 @@ class ConditionalModelConfig:
     schedule: str = "cosine"
     
     # Training parameters
-    batch_size: int = 32
+    pretrain_batch_size: int = 32
     learning_rate: float = 3e-4
     weight_decay: float = 0.01
     warmup_steps: int = 1000
+
+    vcc_batch_size: int = 1
+    vcc_set_size: int = 64
     
     # Training epochs (replacing step-based training)
     pretrain_epochs: int = 50
