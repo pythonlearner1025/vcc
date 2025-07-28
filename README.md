@@ -1,248 +1,174 @@
-# Single-Cell RNA-seq Data Downloader for ML Training
+# VCC: Perturbation Prediction with Diffusion Models
 
-A production-ready pipeline to download and preprocess human single-cell RNA-seq data from the Arc Institute's scBaseCount dataset, optimized for discrete diffusion transformer training with PyTorch.
+Implementation of perturbation prediction models using discrete diffusion transformers, inspired by the Visual Compressive Clustering (VCC) architecture.
+
+## Overview
+
+This repository contains:
+- ST-style conditional diffusion transformer for perturbation prediction
+- Discrete tokenization of gene expression values
+- Control set cross-attention mechanism
+- Zero-shot perturbation prediction capabilities
 
 ## Installation
 
 ```bash
-# Install required packages
-pip install numpy pandas scanpy gcsfs pyarrow h5py tqdm torch matplotlib seaborn
+# Clone the repository
+git clone https://github.com/yourusername/vcc
+cd vcc
 
-# Or use the provided conda environment
-conda env create -f conda_env.yml
-conda activate scrna-ml
+# Create conda environment
+conda create -n vcc python=3.9
+conda activate vcc
+
+# Install PyTorch (adjust for your CUDA version)
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+
+# Install other dependencies
+pip install -r requirements.txt
 ```
 
-## Usage
+## Data Preparation
 
-### 1. Download Data
+### 1. Download scRNA-seq Data
+
+Download a subset of the scBaseCount dataset:
 
 ```bash
-# Download 1 million cells (default)
-python download.py
-
-# Download specific number of cells
-python download.py --cell-count 5000000 --output-dir data/scRNA
-
-# Resume interrupted download
-python download.py --resume
-
-# Download with specific parameters
-python download.py \
-    --cell-count 2000000 \
-    --output-dir data/scRNA \
-    --batch-size 10000 \
-    --max-genes 5000 \
-    --n-threads 4
+python dataset/download.py --cell-count 1e5 --output-dir data/scRNA_1e5
 ```
 
-### 2. Preprocess Highly Variable Genes (HVGs)
+This downloads ~100k cells from human scRNA-seq experiments.
 
-After downloading, compute the top 2000 highly variable genes to reduce memory usage:
+### 2. Prepare VCC Data
+
+Place the VCC dataset files in `data/vcc_data/`:
+- `adata_Training.h5ad` - Training data
+- `adata_Validation.h5ad` - Validation data  
+- `pert_counts_Validation.csv` - Validation perturbation counts
+
+### 3. Compute Cross-Dataset HVGs (CRITICAL)
+
+**Important**: You must compute cross-dataset HVGs to ensure consistent gene indices between pretraining and fine-tuning:
 
 ```bash
-# Compute HVGs (creates hvg_info.json and visualizations)
-python preprocess_hvgs.py --data-dir data/scRNA/processed
-
-# Custom parameters
-python preprocess_hvgs.py \
-    --data-dir data/scRNA/processed \
-    --n-hvgs 3000 \
-    --min-cells-pct 0.05 \
-    --output-dir results/hvg
-
-# Force recomputation
-python preprocess_hvgs.py --force
+python scripts/compute_cross_dataset_hvgs.py \
+    --scrna-dir data/scRNA_1e5/processed \
+    --vcc-path data/vcc_data/adata_Training.h5ad \
+    --output-dir data/vcc_data
 ```
 
-### 3. Train Your Model
+This creates mappings that align gene indices across both datasets. Without this step, transfer learning will not work properly. See [docs/cross_dataset_hvgs.md](docs/cross_dataset_hvgs.md) for details.
+
+## Model Architecture
+
+The ST-style conditional diffusion transformer includes:
+
+## Training
+
+### Basic Training
+
+Train the ST-style conditional diffusion model:
+
+```bash
+python train_st_conditional_diffusion.py
+```
+
+### Configuration
+
+Key hyperparameters in `train_st_conditional_diffusion.py`:
 
 ```python
-# Standard usage with all genes
-from dataset import ScRNADataset, create_dataloader
-
-dataset = ScRNADataset("data/scRNA/processed")
-dataloader = create_dataloader("data/scRNA/processed", batch_size=32)
-
-# Memory-efficient usage with HVGs only
-from train import HVGDataset, create_hvg_dataloader
-
-# Automatically loads precomputed HVGs
-dataset = HVGDataset("data/scRNA/processed", n_hvgs=2000)
-dataloader = create_hvg_dataloader("data/scRNA/processed", batch_size=32)
-
-# Each batch returns (expression, metadata)
-for batch_idx, (expression, metadata) in enumerate(dataloader):
-    # expression: [batch_size, 2000] - only HVG features
-    # metadata: dict with cell_id, experiment_id, etc.
-    pass
+config = ConditionalModelConfig(
+    # Model
+    dim=256,
+    n_head=8, 
+    n_layer=8,
+    
+    # Diffusion
+    n_timesteps=10,
+    mask_ratio=0.30,
+    
+    # Training
+    pretrain_epochs=10,
+    finetune_epochs=20,
+    batch_size=32,
+    learning_rate=1e-4,
+)
 ```
 
-## Output Structure
+### Training Phases
 
-```
-data/scRNA/
-├── config.json              # Dataset configuration
-├── hvg_info.json           # HVG selection results (after preprocessing)
-├── hvg_analysis.png        # HVG statistics visualization
-├── processed/
-│   ├── batch_0000.h5       # Expression data in batches
-│   ├── batch_0001.h5
-│   └── ...
-└── metadata/
-    ├── experiments.json     # Experiment metadata
-    └── cells.json          # Cell metadata
-```
+1. **Pretraining**: Train on single cells from scRNA-seq data (using cross-dataset HVGs)
+2. **Fine-tuning**: Train with control-perturbed paired sets from VCC data
 
-## Data Format
+### Mixed Training
 
-### How download.py Works
+During fine-tuning, the model randomly alternates between:
+- Conditioned generation (using control sets)
+- Unconditioned generation (standard diffusion)
 
-The download script performs the following steps:
+This improves robustness and generation quality.
 
-1. **Connects to GCS**: Uses `gcsfs` to access the Arc Institute's public Google Cloud Storage bucket
-2. **Loads metadata**: Reads experiment metadata to identify human samples
-3. **Random sampling**: Randomly selects experiments until reaching the target cell count
-4. **Batch processing**: Downloads and processes experiments in batches to manage memory
-5. **Data conversion**: Converts sparse matrices to dense int16 format for efficient ML training
-6. **File organization**: Saves processed data in numbered batch files
+## Evaluation
 
-### Batch Files (batch_XXXX.h5)
+### Zero-shot Perturbation Prediction
 
-Each batch file is an HDF5 file containing cells from multiple experiments, structured for efficient loading:
+The model is evaluated on held-out perturbations not seen during training:
 
-```
-batch_0000.h5
-├── X                    # Expression matrix [n_cells, n_genes], dtype=int16
-├── genes               # Gene identifiers (ENSG IDs), shape [n_genes]
-├── cells               # Cell barcodes, shape [n_cells]  
-└── obs/                # Cell-level metadata group
-    ├── gene_count      # Number of genes detected per cell
-    ├── umi_count       # Total UMI counts per cell
-    └── SRX_accession   # Source experiment ID for each cell
+```python
+python eval_zero_shot.py --checkpoint checkpoint_st_final.pt
 ```
 
-**Key fields:**
-- `X`: The gene expression count matrix (not 'expression'). Each row is a cell, each column is a gene
-- `genes`: Ensembl gene IDs in the same order across all batches
-- `cells`: Unique cell barcodes/identifiers
-- `obs/gene_count`: Quality metric - cells with very low gene counts may be low quality
-- `obs/umi_count`: Total molecular counts per cell
-- `obs/SRX_accession`: Links each cell back to its source experiment
+### Metrics
 
-### config.json
+- **Gene-wise correlation**: Pearson correlation of predicted vs actual log2FC
+- **Top-20 DE gene recovery**: Overlap of top differentially expressed genes
+- **Direction accuracy**: Accuracy of up/down regulation prediction
 
-The configuration file contains global dataset information:
+## Model Checkpoints
 
-```json
-{
-  "total_cells_downloaded": 1000000,
-  "n_batches": 100,
-  "batch_size": 10000,
-  "gene_list": ["ENSG00000243485", "ENSG00000237613", ...],  # All 36,601 genes
-  "max_expression_value": 32500,  # Maximum count observed
-  "sparsity": 0.94,  # Fraction of zeros in the data
-  "download_timestamp": "2024-01-15T10:30:00",
-  "source_samples": [
-    {
-      "srx_accession": "SRX12345",
-      "n_cells": 5000,
-      "tissue": "blood",
-      "organism": "Homo sapiens"
-    },
-    ...
-  ]
-}
+Checkpoints are saved during training:
+- `checkpoint_st_pretrained.pt` - After pretraining phase
+- `checkpoint_st_epoch_X_step_Y.pt` - During training
+- `checkpoint_st_final.pt` - Final model
+
+## Troubleshooting
+
+### Common Issues
+
+1. **Transfer learning not working**: Make sure you've run `compute_cross_dataset_hvgs.py`
+2. **Out of memory**: Reduce batch size or set size
+3. **Slow training**: Enable gradient checkpointing or use mixed precision
+
+### Verifying Gene Alignment
+
+Check that gene indices are properly aligned:
+
+```python
+# Load cross-dataset HVG info
+import json
+with open('data/vcc_data/cross_dataset_hvg_info.json', 'r') as f:
+    hvg_info = json.load(f)
+
+print(f"Total HVGs: {len(hvg_info['hvg_names'])}")
+print(f"Genes mapped from scRNA: {len(hvg_info['scrna_to_hvg'])}")
+print(f"Genes mapped from VCC: {len(hvg_info['vcc_to_hvg'])}")
 ```
-
-### HVG Info File (hvg_info.json)
-
-The highly variable gene selection file contains:
-
-```json
-{
-  "hvg_indices": [4521, 4456, 4523, ...],  # Indices into gene_list
-  "hvg_names": ["ENSG00000211675", "ENSG00000211592", ...],  # Gene IDs
-  "gene_to_hvg_idx": {
-    "4521": 0,  # Maps gene index to position in HVG list
-    "4456": 1,
-    ...
-  },
-  "statistics": {
-    "total_cells_analyzed": 1000000,
-    "mean_dispersion": 156.7,  # Average variance/mean ratio
-    "min_dispersion": 9.73,
-    "max_dispersion": 24818.79,
-    "top_10_hvgs": [...],  # Most variable genes
-    "top_10_dispersions": [...],  # Their dispersion values
-    "top_10_pct_cells": [...]  # Percentage of cells expressing
-  }
-}
-```
-
-### HVG Computation Details
-
-HVGs are selected using the dispersion metric (variance/mean ratio):
-
-1. **Gene statistics**: For each gene, compute mean expression and variance across all cells
-2. **Dispersion**: Calculate variance/mean ratio - high dispersion indicates biological variability beyond technical noise
-3. **Filtering**: Exclude genes expressed in < 0.1% of cells (likely noise)
-4. **Selection**: Take top 2000 genes by dispersion
-
-**Why dispersion?** 
-- Genes with high mean expression naturally have high variance
-- Dispersion normalizes for expression level
-- High dispersion genes are often cell-type markers or involved in biological processes
-- Standard practice in single-cell analysis (used by Seurat, Scanpy, etc.)
-
-**Biological interpretation:**
-- Top HVGs often include immunoglobulin genes, cell surface markers, and transcription factors
-- These genes distinguish cell types and states
-- Focusing on HVGs reduces noise while preserving biological signal
-
-## Memory Estimates
-
-- **Full genes (36,601)**: ~73KB per cell
-- **HVG only (2,000)**: ~4KB per cell (94.5% reduction)
-- **1M cells**: ~4GB with HVGs vs ~73GB full
-
-## Performance Tips
-
-1. **Preprocessing**: Always run `preprocess_hvgs.py` before training
-2. **Batch Size**: Use larger batches (128-512) for better GPU utilization
-3. **Data Loading**: Use multiple workers in DataLoader
-4. **Caching**: HVG info is cached for fast repeated access
-
-## Examples
-
-### Basic Training Example
-See `train.py` for a complete training example with:
-- HVG preprocessing integration
-- Custom tokenization strategies (direct, binned, log-scale)
-- Simple transformer architecture
-- Training loop with loss tracking
-
-### Mini Discrete Diffusion Model
-`train_mini_diffusion.py` provides a scaled-down discrete diffusion transformer:
-- ~50M parameters (vs 17B full model)
-- 512 hidden dim, 8 attention heads, 6 transformer layers
-- Discrete diffusion with masking noise schedule
-- Full training pipeline with evaluation and checkpointing
-- Designed for sanity checking before large-scale training
-
-```bash
-# Train mini diffusion model
-python train_mini_diffusion.py
-```
-
-### 17B Model Architecture
-`model_17b.py` contains the full 17B parameter discrete diffusion transformer:
-- 24 dense transformer layers + 12 MoE layers
-- Top-2 routing with 16 experts per MoE layer
-- 3072 hidden dim, 24 attention heads
-- Perturbation conditioning with LoRA adapters
-- Optimized for distributed training with DeepSpeed
 
 ## Citation
 
-If you use this data, please cite the Arc Institute's scBaseCount dataset. 
+If you use this code, please cite:
+
+```bibtex
+@article{vcc2024,
+  title={Visual Compressive Clustering: Perturbation Prediction with Diffusion Models},
+  author={...},
+  journal={...},
+  year={2024}
+}
+```
+
+## License
+
+MIT License - see LICENSE file for details. 

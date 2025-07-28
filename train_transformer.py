@@ -1,68 +1,46 @@
 #!/usr/bin/env python3
 """
-Training script for BERT-style Conditional Masked Language Model.
-
-This script implements the same architecture as ST-style diffusion but with:
-- BERT-style masked language modeling objective
-- Same control set cross-attention
-- Same adaptive masking based on conditioning
+BERT-style transformer for VCC perturbation prediction.
 """
 
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader
 import wandb
 import time
 from pathlib import Path
-from typing import Optional, Tuple, Dict
+from typing import Optional, Dict, List, Tuple
 import numpy as np
 import json
-import torch.nn as nn
-import torch.nn.functional as F
-import math
 from dataclasses import dataclass
+import math
 
-from dataset import ScRNADataset, create_dataloader
-from vcc_paired_dataloader import (
+from models.transformer import ConditionalBERTTransformer
+from models.diffusion import create_optimizer, cosine_lr_schedule, create_gene_mapping
+from dataset.scrna_hvg_dataset import ScRNADatasetWithHVGs, create_scrna_hvg_dataloader
+from dataset.vcc_dataloader import VCCDataset
+from dataset.vcc_paired_dataloader import (
     create_vcc_paired_dataloader,
     create_vcc_validation_dataloader
 )
-from vcc_dataloader import VCCDataset
 
 
-class HVGDataset(torch.utils.data.Dataset):
-    """Wrapper around ScRNADataset that selects HVG features."""
+class TokenizedScRNADataset(torch.utils.data.Dataset):
+    """Wrapper around ScRNADatasetWithHVGs that applies tokenization."""
     
-    def __init__(self, data_dir: str, n_hvgs: int = 2000, tokenizer=None):
-        self.base_dataset = ScRNADataset(data_dir)
-        self.n_hvgs = n_hvgs
+    def __init__(self, scrna_dataset: ScRNADatasetWithHVGs, tokenizer):
+        self.dataset = scrna_dataset
         self.tokenizer = tokenizer
         
-        # Load HVG indices if available
-        hvg_info_path = Path(data_dir).parent / "hvg_info.json"
-        if hvg_info_path.exists():
-            with open(hvg_info_path, 'r') as f:
-                hvg_info = json.load(f)
-            self.hvg_indices = hvg_info['hvg_indices'][:n_hvgs]
-        else:
-            # If no precomputed HVGs, use first n_hvgs genes as a fallback
-            print(f"Warning: No precomputed HVGs found at {hvg_info_path}")
-            print(f"Using first {n_hvgs} genes instead")
-            self.hvg_indices = list(range(n_hvgs))
-    
     def __len__(self):
-        return len(self.base_dataset)
+        return len(self.dataset)
     
     def __getitem__(self, idx):
-        # Get full expression vector from base dataset
-        full_expr, metadata = self.base_dataset[idx]
-        
-        # Select HVG features
-        hvg_expr = full_expr[self.hvg_indices]
-        
-        # Apply tokenizer if provided
-        if self.tokenizer is not None:
-            hvg_expr = self.tokenizer(hvg_expr)
-        
-        return hvg_expr
+        x = self.dataset[idx]  # Already returns tensor with HVG genes
+        # Apply tokenizer to convert continuous expression to discrete tokens
+        tokens = self.tokenizer(x)
+        return tokens
 
 
 @dataclass
@@ -709,41 +687,43 @@ def evaluate_zero_shot(
 
 
 def main():
-    # Configuration - matching diffusion config
+    # Configuration matching ST diffusion model
     config = TransformerConfig(
-        # Model architecture
+        # Model architecture (smaller for BERT-style)
         dim=128,
         n_head=4,
         n_layer=4,
         ffn_mult=4,
         vocab_size=64,
-        n_genes=2000,
+        n_genes=2000,  # HVGs
         
         # Conditioning
-        n_total_genes=18080,  # VCC has 18080 genes
-        gene_embed_dim=128,
+        n_total_genes=2000,  # Using cross-dataset HVGs
+        gene_embed_dim=64,
         perturb_sign_dim=16,
-        perturb_magnitude_dim=64,
+        perturb_magnitude_dim=32,
         magnitude_clip=5.0,
         
         # Control set encoder
         control_set_encoder_layers=2,
-        control_set_dim_hidden=128,
-        control_set_dim_out=512,
+        control_set_dim_hidden=64,
+        control_set_dim_out=64,
         
-        # MLM parameters
-        mask_ratio=0.30,
-        mask_token_id=63,  # Use last token as [MASK]
+        # Masking
+        mask_ratio=0.15,  # BERT-style masking
         
         # Training
-        batch_size=4,
+        batch_size=32,
         learning_rate=1e-4,
         weight_decay=0.01,
         warmup_steps=5000,
         
+        # Data
+        pretrain_data_dir="data/scRNA_1e5/processed",
+        
         # Epochs
-        pretrain_epochs=20,
-        finetune_epochs=30,
+        pretrain_epochs=10,
+        finetune_epochs=20,
         
         # Logging
         log_every=50,
@@ -766,41 +746,54 @@ def main():
     print(f"\nModel created with {sum(p.numel() for p in model.parameters()):,} parameters")
     
     # Create tokenizer
-    tokenizer = create_simple_tokenizer(config.vocab_size)
+    tokenizer, detokenizer = create_simple_tokenizer(config.vocab_size)
+    
+    # Path to cross-dataset HVG info
+    hvg_info_path = "data/vcc_data/cross_dataset_hvg_info.json"
+    
+    # Check if cross-dataset HVG info exists
+    if not Path(hvg_info_path).exists():
+        print(f"\nERROR: Cross-dataset HVG info not found at {hvg_info_path}")
+        print("Please run: python scripts/compute_cross_dataset_hvgs.py")
+        return
     
     # Create dataloaders
     print("\n=== Creating Dataloaders ===")
     
-    # Create pretraining dataloader from scRNA data
-    scRNA_data_dir = "data/scRNA/processed"
-    if Path(scRNA_data_dir).exists():
-        print(f"\nCreating pretraining dataloader from {scRNA_data_dir}")
-        pretrain_dataset = HVGDataset(
-            scRNA_data_dir, 
-            n_hvgs=config.n_genes,  # Use same number of genes as model
-            tokenizer=tokenizer
-        )
-        pretrain_dataloader = torch.utils.data.DataLoader(
-            pretrain_dataset,
-            batch_size=config.batch_size * 8,  # Larger batch size for pretraining
-            shuffle=True,
-            num_workers=4,
-            pin_memory=True
-        )
-        print(f"Pretraining dataset: {len(pretrain_dataset):,} cells")
-    else:
-        print(f"\nWarning: scRNA data not found at {scRNA_data_dir}")
-        print("Skipping pretraining phase")
-        pretrain_dataloader = None
+    # Create pretrain dataloader using cross-dataset HVGs
+    print("Creating scRNA pretrain dataloader with cross-dataset HVGs...")
+    scrna_dataset, _ = create_scrna_hvg_dataloader(
+        data_dir=config.pretrain_data_dir,
+        hvg_info_path=hvg_info_path,
+        batch_size=1,  # We'll batch in the wrapper
+        shuffle=False,
+        num_workers=0,
+        use_cache=True
+    )
     
-    # VCC paired dataloader for fine-tuning
+    # Wrap with tokenizer
+    pretrain_dataset = TokenizedScRNADataset(scrna_dataset, tokenizer)
+    
+    pretrain_dataloader = DataLoader(
+        pretrain_dataset,
+        batch_size=config.batch_size,
+        shuffle=True,
+        num_workers=4,
+        pin_memory=True,
+        drop_last=True
+    )
+    
+    print(f"Pretrain dataset: {len(pretrain_dataset):,} cells, {scrna_dataset.n_hvgs} HVG genes")
+    print("Gene indices are now consistent with VCC fine-tuning!")
+    
+    # VCC paired dataloader for fine-tuning (already uses HVGs from hvg_info.json)
     vcc_dataset, vcc_dataloader = create_vcc_paired_dataloader(
         set_size=16,
         batch_size=config.batch_size,
         tokenizer=tokenizer,
         num_workers=4,
         match_by_batch=True,
-        use_hvgs=True  # Use HVG genes
+        use_hvgs=True  # Uses hvg_info.json which should now be cross-dataset
     )
     
     # VCC validation dataloader
@@ -809,21 +802,26 @@ def main():
         batch_size=config.batch_size,
         tokenizer=tokenizer,
         n_samples_per_gene=10,
-        use_hvgs=True  # Use HVG genes
+        use_hvgs=True,  # Uses hvg_info.json which should now be cross-dataset
+        num_workers=0
     )
     
-    # Load HVG info to get gene names
-    hvg_info_path = Path("data/vcc_data/hvg_info.json")
+    # Load cross-dataset HVG info to get gene names
     with open(hvg_info_path, 'r') as f:
         hvg_info = json.load(f)
     hvg_genes = hvg_info['hvg_names']
     
-    # VCC dataset already uses HVG genes, so mapping is identity
-    hvg_to_vcc_mapping = {i: i for i in range(len(hvg_genes))}
+    # Create gene to index mapping
     vcc_gene_to_idx = {gene: idx for idx, gene in enumerate(hvg_genes)}
     
     global_step = 0
     
+    # Calculate total training steps
+    pretrain_steps = config.pretrain_epochs * len(pretrain_dataloader) if config.pretrain_epochs > 0 else 0
+    finetune_steps = config.finetune_epochs * len(vcc_dataloader)
+    total_training_steps = pretrain_steps + finetune_steps
+    print(f"\nTotal training steps: {total_training_steps:,} (pretrain: {pretrain_steps:,}, finetune: {finetune_steps:,})")
+
     # Phase 1: Pretraining on single cells (optional, can skip if starting from checkpoint)
     if pretrain_dataloader is not None and config.pretrain_epochs > 0:
         print("\n=== Phase 1: Pretraining ===")
