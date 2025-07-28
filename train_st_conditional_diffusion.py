@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Optional, Tuple, Dict
 import numpy as np
 import json
+from torch.utils.data import Dataset, DataLoader
 
 from models.diffusion import (
     ConditionalModelConfig, 
@@ -25,13 +26,30 @@ from models.diffusion import (
     prepare_perturbation_conditioning,
     create_gene_mapping
 )
-from dataset import ScRNADataset
+from dataset import ScRNADataset, create_dataloader
 from vcc_paired_dataloader import (
     create_vcc_paired_dataloader,
     create_vcc_validation_dataloader
 )
 from vcc_dataloader import VCCDataset
 from eval import evaluate_on_vcc_validation, log_vcc_metrics, create_vcc_evaluator
+
+
+class TokenizedScRNADataset(Dataset):
+    """Wrapper around ScRNADataset that applies tokenization."""
+    
+    def __init__(self, data_dir: str, tokenizer, max_genes: Optional[int] = None):
+        self.dataset = ScRNADataset(data_dir, max_genes=max_genes)
+        self.tokenizer = tokenizer
+        
+    def __len__(self):
+        return len(self.dataset)
+    
+    def __getitem__(self, idx):
+        x, meta = self.dataset[idx]
+        # Apply tokenizer to convert continuous expression to discrete tokens
+        tokens = self.tokenizer(x)
+        return tokens
 
 
 def create_simple_tokenizer(vocab_size: int = 64):
@@ -68,6 +86,7 @@ def train_epoch_st(
     config: ConditionalModelConfig,
     epoch: int,
     global_step: int,
+    total_training_steps: int,
     use_control_sets: bool = True,
     mixed_training: bool = True,
 ) -> int:
@@ -170,7 +189,6 @@ def train_epoch_st(
         optimizer.step()
         
         # Update learning rate
-        total_training_steps = config.pretrain_epochs * len(dataloader) + config.finetune_epochs * len(dataloader)
         lr = cosine_lr_schedule(optimizer, global_step, total_training_steps, config)
         
         epoch_losses.append(loss.item())
@@ -297,7 +315,8 @@ def main():
         schedule="cosine",
         
         # Training
-        batch_size=4,  # Smaller batch size due to sets
+        batch_size=4,  # Smaller batch size for paired sets
+        pretrain_batch_size=128,  # Larger batch size for single-cell pretraining
         learning_rate=1e-4,
         weight_decay=0.01,
         warmup_steps=5000,
@@ -333,11 +352,24 @@ def main():
     # Create dataloaders
     print("\n=== Creating Dataloaders ===")
     
-    # Skip scRNA pretraining - we'll use VCC data directly
-    # If you want to pretrain on scRNA data, you'll need to:
-    # 1. Run preprocess_hvgs.py on scRNA data first
-    # 2. Create an HVG-filtered dataset similar to VCCDataset
-    pretrain_dataloader = None
+    # Create pretrain dataloader from HVG-filtered scRNA data
+    print("Creating scRNA pretrain dataloader...")
+    pretrain_dataset = TokenizedScRNADataset(
+        data_dir="data/scRNA/processed",
+        tokenizer=tokenizer,
+        max_genes=config.n_genes  # Use 2000 HVG genes
+    )
+    
+    pretrain_dataloader = DataLoader(
+        pretrain_dataset,
+        batch_size=config.pretrain_batch_size,
+        shuffle=True,
+        num_workers=4,
+        pin_memory=True,
+        drop_last=True
+    )
+    
+    print(f"Pretrain dataset: {len(pretrain_dataset):,} cells, {pretrain_dataset.dataset.n_genes} genes")
     
     # VCC paired dataloader for fine-tuning
     vcc_dataset, vcc_dataloader = create_vcc_paired_dataloader(
@@ -370,25 +402,44 @@ def main():
     
     global_step = 0
     
-    # Phase 1: Pretraining on single cells (optional, can skip if starting from checkpoint)
-    if pretrain_dataloader is not None and config.pretrain_epochs > 0:
-        print("\n=== Phase 1: Pretraining ===")
+    # Calculate total training steps for learning rate schedule
+    pretrain_steps = config.pretrain_epochs * len(pretrain_dataloader) if config.pretrain_epochs > 0 else 0
+    finetune_steps = config.finetune_epochs * len(vcc_dataloader)
+    total_training_steps = pretrain_steps + finetune_steps
+    print(f"\nTotal training steps: {total_training_steps:,} (pretrain: {pretrain_steps:,}, finetune: {finetune_steps:,})")
+    
+    # Phase 1: Pretraining on single cells
+    if config.pretrain_epochs > 0:
+        print(f"\n=== Phase 1: Pretraining on scRNA data ({config.pretrain_epochs} epochs) ===")
+        print(f"Using {len(pretrain_dataset):,} cells for pretraining")
+        
         for epoch in range(config.pretrain_epochs):
             global_step = train_epoch_st(
                 model, diffusion, pretrain_dataloader, optimizer, config,
-                epoch, global_step,
+                epoch, global_step, total_training_steps,
                 use_control_sets=False,  # No control sets in pretraining
                 mixed_training=False
             )
+            
+        # Save checkpoint after pretraining
+        pretrain_checkpoint = 'checkpoint_st_pretrained.pt'
+        torch.save({
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'config': config,
+            'epoch': config.pretrain_epochs,
+            'global_step': global_step,
+        }, pretrain_checkpoint)
+        print(f"Saved pretrained model to {pretrain_checkpoint}")
     else:
-        print("\n=== Skipping Phase 1: Pretraining (no scRNA data) ===")
+        print("\n=== Skipping Phase 1: Pretraining (pretrain_epochs=0) ===")
     
     # Phase 2: Fine-tuning with control sets
     print("\n=== Phase 2: Fine-tuning with Control Sets ===")
     for epoch in range(config.pretrain_epochs, config.pretrain_epochs + config.finetune_epochs):
         global_step = train_epoch_st(
             model, diffusion, vcc_dataloader, optimizer, config,
-            epoch, global_step,
+            epoch, global_step, total_training_steps,
             use_control_sets=True,
             mixed_training=True  # Mix conditioned and unconditioned batches
         )
