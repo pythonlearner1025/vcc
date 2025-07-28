@@ -1,459 +1,816 @@
 #!/usr/bin/env python3
 """
-Example usage of the downloaded scRNA-seq data for discrete diffusion transformer training.
+Training script for BERT-style Conditional Masked Language Model.
+
+This script implements the same architecture as ST-style diffusion but with:
+- BERT-style masked language modeling objective
+- Same control set cross-attention
+- Same adaptive masking based on conditioning
 """
 
-import json
 import torch
-import torch.nn as nn
-import numpy as np
-import pandas as pd
-import h5py
-import scanpy as sc
 import wandb
+import time
 from pathlib import Path
-from typing import Dict, List, Set, Tuple
-from tqdm import tqdm
-from dataset import ScRNADataset, create_dataloader
+from typing import Optional, Tuple, Dict
+import numpy as np
+import json
+import torch.nn as nn
+import torch.nn.functional as F
+import math
+from dataclasses import dataclass
+
+from vcc_paired_dataloader import (
+    create_vcc_paired_dataloader,
+    create_vcc_validation_dataloader
+)
+from vcc_dataloader import VCCDataset
 
 
-def compute_hvgs(data_dir: str, n_hvgs: int = 2000, cache_file: str = "hvg_info.json") -> Dict:
-    """
-    Compute highly variable genes across the entire dataset.
+@dataclass
+class TransformerConfig:
+    """Configuration for BERT-style transformer model - matching diffusion config."""
+    # Model architecture
+    dim: int = 128
+    n_head: int = 4
+    n_layer: int = 4
+    ffn_mult: int = 4
+    vocab_size: int = 64  # 64 expression bins
+    n_genes: int = 2000  # Number of HVGs
     
-    Returns:
-        Dict containing:
-        - hvg_indices: List of gene indices for HVGs
-        - hvg_names: List of gene names for HVGs
-        - gene_to_hvg_idx: Dict mapping gene index to HVG index
-        - statistics: Dict with variance/mean info
-    """
-    cache_path = Path(data_dir).parent / cache_file
+    # Conditioning
+    n_total_genes: int = 18080  # VCC has 18080 genes
+    gene_embed_dim: int = 128
+    perturb_sign_dim: int = 16
+    perturb_magnitude_dim: int = 64
+    magnitude_clip: float = 5.0
     
-    # Check if already computed
-    if cache_path.exists():
-        print(f"Loading precomputed HVGs from {cache_path}")
-        with open(cache_path, 'r') as f:
-            return json.load(f)
+    # Control set encoder
+    control_set_encoder_layers: int = 2
+    control_set_dim_hidden: int = 128
+    control_set_dim_out: int = 512
     
-    print(f"Computing top {n_hvgs} highly variable genes...")
+    # MLM parameters (replacing diffusion)
+    mask_ratio: float = 0.30  # Fraction of genes to mask (BERT-style)
+    mask_token_id: int = 63  # Use last token as [MASK]
     
-    # Load gene list
-    with open(Path(data_dir).parent / "config.json", 'r') as f:
-        config = json.load(f)
-    gene_list = config['gene_list']
-    n_genes = len(gene_list)
+    # Training parameters
+    batch_size: int = 4  # Smaller batch size due to sets
+    learning_rate: float = 1e-4
+    weight_decay: float = 0.01
+    warmup_steps: int = 5000
     
-    # Accumulate statistics across all batches
-    gene_means = np.zeros(n_genes)
-    gene_vars = np.zeros(n_genes)
-    gene_counts = np.zeros(n_genes)  # Number of non-zero cells per gene
-    total_cells = 0
+    # Training epochs
+    pretrain_epochs: int = 20
+    finetune_epochs: int = 30
     
-    # Process each batch
-    batch_files = sorted(Path(data_dir).glob("batch_*.h5"))
-    for batch_file in tqdm(batch_files, desc="Computing gene statistics"):
-        with h5py.File(batch_file, 'r') as f:
-            expression = f['X'][:]  # Changed from 'expression' to 'X'
-            
-            # Update statistics
-            batch_mean = expression.mean(axis=0)
-            batch_var = expression.var(axis=0)
-            batch_nonzero = (expression > 0).sum(axis=0)
-            
-            # Online update for mean and variance
-            n = expression.shape[0]
-            gene_means = (gene_means * total_cells + batch_mean * n) / (total_cells + n)
-            gene_vars = (gene_vars * total_cells + batch_var * n) / (total_cells + n)
-            gene_counts += batch_nonzero
-            total_cells += n
-    
-    # Compute dispersion (variance/mean ratio) - standard HVG metric
-    # Avoid division by zero
-    dispersions = np.divide(gene_vars, gene_means, 
-                           out=np.zeros_like(gene_vars), 
-                           where=gene_means > 0)
-    
-    # Filter genes expressed in at least 0.1% of cells
-    min_cells = int(0.001 * total_cells)
-    expressed_mask = gene_counts >= min_cells
-    
-    # Set dispersion to -1 for non-expressed genes
-    dispersions[~expressed_mask] = -1
-    
-    # Get top HVGs by dispersion
-    hvg_indices = np.argsort(dispersions)[-n_hvgs:].tolist()
-    hvg_indices.reverse()  # Highest dispersion first
-    
-    # Create mappings
-    hvg_names = [gene_list[i] for i in hvg_indices]
-    gene_to_hvg_idx = {gene_idx: hvg_idx for hvg_idx, gene_idx in enumerate(hvg_indices)}
-    
-    # Prepare result
-    hvg_info = {
-        'hvg_indices': hvg_indices,
-        'hvg_names': hvg_names,
-        'gene_to_hvg_idx': gene_to_hvg_idx,
-        'statistics': {
-            'total_cells_analyzed': total_cells,
-            'mean_dispersion': float(dispersions[hvg_indices].mean()),
-            'min_dispersion': float(dispersions[hvg_indices].min()),
-            'max_dispersion': float(dispersions[hvg_indices].max()),
-            'mean_expression': [float(gene_means[i]) for i in hvg_indices[:10]],  # First 10
-            'percent_cells_expressed': [float(100 * gene_counts[i] / total_cells) 
-                                      for i in hvg_indices[:10]]
-        }
-    }
-    
-    # Save cache
-    with open(cache_path, 'w') as f:
-        json.dump(hvg_info, f, indent=2)
-    
-    print(f"Selected {n_hvgs} HVGs from {len(expressed_mask[expressed_mask])} expressed genes")
-    print(f"Top 5 HVGs: {hvg_names[:5]}")
-    print(f"Dispersion range: {hvg_info['statistics']['min_dispersion']:.2f} - "
-          f"{hvg_info['statistics']['max_dispersion']:.2f}")
-    
-    return hvg_info
+    # Logging
+    log_every: int = 50
+    eval_every: int = 1000
+    save_every: int = 5000
+    vcc_eval_interval: int = 5000
 
 
-class HVGDataset(ScRNADataset):
-    """Dataset that returns only HVG features with smart gene selection."""
+class MultiQueryAttention(nn.Module):
+    """Multi-Query Attention (MQA) with shared key/value projections."""
     
-    def __init__(self, data_dir: str, n_hvgs: int = 2000, transform=None):
-        super().__init__(data_dir, transform)
-        
-        # Compute or load HVGs
-        self.hvg_info = compute_hvgs(data_dir, n_hvgs)
-        self.hvg_indices = set(self.hvg_info['hvg_indices'])
-        self.gene_to_hvg = self.hvg_info['gene_to_hvg_idx']
-        self.n_hvgs = n_hvgs
-        
-        print(f"\nHVG Dataset initialized:")
-        print(f"  Original genes: {self.n_genes:,}")
-        print(f"  HVG genes: {self.n_hvgs:,}")
-        print(f"  Reduction: {100 * (1 - self.n_hvgs/self.n_genes):.1f}%")
-    
-    def __getitem__(self, idx):
-        """Get a cell with HVG selection."""
-        # Find which batch this index belongs to
-        batch_idx = np.searchsorted(self.batch_starts[1:], idx, side='right')
-        local_idx = idx - self.batch_starts[batch_idx]
-        
-        with h5py.File(self.batch_files[batch_idx], 'r') as f:
-            # Get full expression vector
-            full_expression = f['X'][local_idx]  # Changed from 'expression' to 'X'
-            
-            # Get metadata
-            cell_metadata = {
-                'cell_id': f['cells'][local_idx].decode('utf-8') if 'cells' in f else f'cell_{idx}',
-                'experiment_id': f['obs/SRX_accession'][local_idx].decode('utf-8') if 'obs/SRX_accession' in f else 'unknown',
-                'batch_idx': batch_idx,
-                'local_idx': local_idx
-            }
-        
-        # Convert to tensor
-        full_expression = torch.from_numpy(full_expression).float()
-        
-        # Smart HVG selection
-        hvg_expression = self._select_hvg_features(full_expression)
-        
-        if self.transform:
-            hvg_expression = self.transform(hvg_expression)
-        
-        return hvg_expression, cell_metadata
-    
-    def _select_hvg_features(self, full_expression: torch.Tensor) -> torch.Tensor:
-        """
-        Select HVG features with smart fallback for cells with few HVGs expressed.
-        
-        Strategy:
-        1. Select all HVGs that are expressed in this cell
-        2. If < n_hvgs, fill remaining slots with top expressed non-HVG genes
-        """
-        hvg_expression = torch.zeros(self.n_hvgs)
-        
-        # Get expressed genes in this cell
-        nonzero_indices = torch.nonzero(full_expression).squeeze(-1).tolist()
-        
-        # Separate into HVG and non-HVG
-        hvg_in_cell = []
-        non_hvg_in_cell = []
-        
-        for gene_idx in nonzero_indices:
-            if gene_idx in self.gene_to_hvg:
-                hvg_idx = self.gene_to_hvg[gene_idx]
-                hvg_in_cell.append((hvg_idx, gene_idx))
-            else:
-                non_hvg_in_cell.append(gene_idx)
-        
-        # Fill HVG values
-        for hvg_idx, gene_idx in hvg_in_cell:
-            hvg_expression[hvg_idx] = full_expression[gene_idx]
-        
-        # If we have fewer than n_hvgs expressed, fill with top non-HVG genes
-        n_filled = len(hvg_in_cell)
-        if n_filled < self.n_hvgs and non_hvg_in_cell:
-            # Sort non-HVG genes by expression value
-            non_hvg_values = [(idx, full_expression[idx].item()) for idx in non_hvg_in_cell]
-            non_hvg_values.sort(key=lambda x: x[1], reverse=True)
-            
-            # Fill remaining slots
-            n_to_fill = min(len(non_hvg_values), self.n_hvgs - n_filled)
-            for i in range(n_to_fill):
-                gene_idx, value = non_hvg_values[i]
-                # Place in the next available slot
-                hvg_expression[n_filled + i] = value
-        
-        return hvg_expression
-
-
-def create_hvg_dataloader(data_dir: str, batch_size: int = 32, 
-                         n_hvgs: int = 2000, shuffle: bool = True, 
-                         num_workers: int = 0):
-    """Create a dataloader for HVG features."""
-    dataset = HVGDataset(data_dir, n_hvgs)
-    return torch.utils.data.DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=shuffle,
-        num_workers=num_workers,
-        pin_memory=True
-    )
-
-
-def load_config(data_dir: str):
-    """Load dataset configuration."""
-    with open(Path(data_dir).parent / "config.json", 'r') as f:
-        return json.load(f)
-
-
-def create_tokenizer(max_value: int, strategy: str = "direct"):
-    """Create a tokenizer for gene expression values."""
-    
-    if strategy == "direct":
-        # Direct mapping: each count is a token
-        def tokenize(x):
-            return x.long()
-        
-        def detokenize(tokens):
-            return tokens.float()
-        
-        vocab_size = max_value + 1
-        
-    elif strategy == "binned":
-        # Bin counts into discrete levels
-        bins = torch.tensor([0, 1, 5, 10, 50, 100, 500, 1000, 5000])
-        
-        def tokenize(x):
-            return torch.bucketize(x, bins)
-        
-        def detokenize(tokens):
-            # Return bin centers
-            bin_centers = (bins[:-1] + bins[1:]) / 2
-            bin_centers = torch.cat([torch.tensor([0.]), bin_centers, torch.tensor([bins[-1].float()])])
-            return bin_centers[tokens]
-        
-        vocab_size = len(bins) + 1
-        
-    elif strategy == "log":
-        # Log-scale tokenization
-        def tokenize(x):
-            return torch.log1p(x).long()
-        
-        def detokenize(tokens):
-            return torch.expm1(tokens.float())
-        
-        vocab_size = int(np.log1p(max_value)) + 1
-    
-    else:
-        raise ValueError(f"Unknown tokenization strategy: {strategy}")
-    
-    return tokenize, detokenize, vocab_size
-
-
-class SimpleTransformer(nn.Module):
-    """Simple transformer for demonstration."""
-    
-    def __init__(self, vocab_size: int, n_genes: int, d_model: int = 128):
+    def __init__(self, dim: int, n_head: int):
         super().__init__()
-        self.vocab_size = vocab_size
-        self.n_genes = n_genes
+        self.dim = dim
+        self.n_head = n_head
+        self.head_dim = dim // n_head
         
-        # Token embedding
-        self.token_embed = nn.Embedding(vocab_size, d_model)
+        # Query projection for all heads
+        self.q_proj = nn.Linear(dim, dim)
         
-        # Position embedding for genes
-        self.pos_embed = nn.Parameter(torch.randn(1, n_genes, d_model))
-        
-        # Transformer
-        self.transformer = nn.TransformerEncoder(
-            nn.TransformerEncoderLayer(d_model, nhead=4, dim_feedforward=256),
-            num_layers=1
-        )
+        # Shared key/value projection (single head)
+        self.kv_proj = nn.Linear(dim, 2 * self.head_dim)
         
         # Output projection
-        self.output_proj = nn.Linear(d_model, vocab_size)
+        self.out_proj = nn.Linear(dim, dim)
+        
+    def forward(self, x: torch.Tensor, kv: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        Args:
+            x: Input tensor (B, N, D)
+            kv: Optional key/value tensor (B, M, D). If None, uses x.
+        
+        Returns:
+            Output tensor (B, N, D)
+        """
+        B, N, D = x.shape
+        
+        # Use x for key/value if not provided
+        if kv is None:
+            kv = x
+        
+        # Project queries for all heads
+        q = self.q_proj(x).view(B, N, self.n_head, self.head_dim).transpose(1, 2)  # (B, H, N, HD)
+        
+        # Project shared key/value
+        kv_proj = self.kv_proj(kv)  # (B, M, 2*HD)
+        k, v = kv_proj.chunk(2, dim=-1)  # Each is (B, M, HD)
+        
+        # Expand k, v for all heads
+        k = k.unsqueeze(1).expand(-1, self.n_head, -1, -1)  # (B, H, M, HD)
+        v = v.unsqueeze(1).expand(-1, self.n_head, -1, -1)  # (B, H, M, HD)
+        
+        # Attention
+        scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)  # (B, H, N, M)
+        attn = F.softmax(scores, dim=-1)
+        out = torch.matmul(attn, v)  # (B, H, N, HD)
+        
+        # Reshape and project output
+        out = out.transpose(1, 2).contiguous().view(B, N, D)
+        out = self.out_proj(out)
+        
+        return out
+
+
+class TransformerBlock(nn.Module):
+    """Transformer block with MQA and cross-attention support."""
     
-    def forward(self, tokens):
-        # tokens: [batch_size, n_genes]
-        x = self.token_embed(tokens)  # [batch_size, n_genes, d_model]
-        x = x + self.pos_embed
+    def __init__(self, dim: int, n_head: int, ffn_mult: int = 4):
+        super().__init__()
+        # Self-attention
+        self.ln1 = nn.LayerNorm(dim)
+        self.self_attn = MultiQueryAttention(dim, n_head)
         
-        # Transformer expects [seq_len, batch_size, d_model]
-        x = x.transpose(0, 1)
-        x = self.transformer(x)
-        x = x.transpose(0, 1)
+        # Cross-attention (optional)
+        self.ln2 = nn.LayerNorm(dim)
+        self.cross_attn = MultiQueryAttention(dim, n_head)
         
-        # Project to vocabulary
-        logits = self.output_proj(x)  # [batch_size, n_genes, vocab_size]
+        # FFN
+        self.ln3 = nn.LayerNorm(dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, dim * ffn_mult),
+            nn.GELU(),
+            nn.Linear(dim * ffn_mult, dim)
+        )
+        
+    def forward(self, x: torch.Tensor, context: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        Args:
+            x: Input tensor (B, N, D)
+            context: Optional context tensor for cross-attention (B, M, D)
+        """
+        # Self-attention
+        x = x + self.self_attn(self.ln1(x))
+        
+        # Cross-attention (if context provided)
+        if context is not None:
+            x = x + self.cross_attn(self.ln2(x), kv=context)
+        
+        # FFN
+        x = x + self.mlp(self.ln3(x))
+        
+        return x
+
+
+class ControlSetEncoder(nn.Module):
+    """Encoder for control cell sets following ST architecture."""
+    
+    def __init__(self, n_genes: int, d_hidden: int = 128, d_out: int = 512, n_layers: int = 2):
+        super().__init__()
+        
+        # Cell-level MLP
+        self.cell_mlp = nn.Sequential(
+            nn.Linear(n_genes, d_hidden),
+            nn.GELU(),
+            nn.Linear(d_hidden, d_hidden)
+        )
+        
+        # Set-level transformer
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_hidden,
+            nhead=4,
+            dim_feedforward=4 * d_hidden,
+            batch_first=True,
+            activation='gelu'
+        )
+        self.set_attn = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+        
+        # Output projection
+        self.out_proj = nn.Linear(d_hidden, d_out)
+        
+    def forward(self, x_ctrl: torch.Tensor) -> torch.Tensor:
+        """
+        Encode control set.
+        
+        Args:
+            x_ctrl: Control cells (B, S, G) where S is set size, G is n_genes
+            
+        Returns:
+            Encoded control set (B, S, d_out)
+        """
+        # Cell-level encoding
+        h = self.cell_mlp(x_ctrl)  # (B, S, d_hidden)
+        
+        # Set-level attention
+        h = self.set_attn(h)  # (B, S, d_hidden)
+        
+        # Project to output dimension
+        h = self.out_proj(h)  # (B, S, d_out)
+        
+        return h
+
+
+class ConditionalBERTTransformer(nn.Module):
+    """BERT-style transformer with continuous perturbation conditioning."""
+    
+    def __init__(self, config: TransformerConfig):
+        super().__init__()
+        self.config = config
+        
+        # Token and position embeddings
+        self.token_emb = nn.Embedding(config.vocab_size, config.dim)
+        self.pos_emb = nn.Parameter(torch.randn(1, config.n_genes, config.dim) * 0.02)
+        
+        # Control set encoder
+        self.control_encoder = ControlSetEncoder(
+            n_genes=config.n_genes,
+            d_hidden=config.control_set_dim_hidden,
+            d_out=config.control_set_dim_out,
+            n_layers=config.control_set_encoder_layers
+        )
+        
+        # Conditioning embeddings
+        self.gene_embed = nn.Embedding(config.n_total_genes, config.gene_embed_dim)
+        
+        # Sign embedding: -1 (knockdown), 0 (control), +1 (activation)
+        self.perturb_sign_embed = nn.Embedding(3, config.perturb_sign_dim)
+        
+        # Magnitude processing: continuous log2 fold change
+        self.perturb_magnitude = nn.Sequential(
+            nn.Linear(1, config.perturb_magnitude_dim),
+            nn.GELU(),
+            nn.Linear(config.perturb_magnitude_dim, config.perturb_magnitude_dim),
+            nn.GELU(),
+            nn.Linear(config.perturb_magnitude_dim, config.dim)
+        )
+        
+        # Combine conditioning
+        total_cond_dim = config.gene_embed_dim + config.perturb_sign_dim + config.dim
+        self.cond_proj = nn.Sequential(
+            nn.Linear(total_cond_dim, config.dim),
+            nn.GELU(),
+            nn.Linear(config.dim, config.dim)
+        )
+        
+        # Transformer blocks with cross-attention
+        self.blocks = nn.ModuleList([
+            TransformerBlock(config.dim, config.n_head, config.ffn_mult)
+            for _ in range(config.n_layer)
+        ])
+        
+        # Output projection
+        self.ln_f = nn.LayerNorm(config.dim)
+        self.head = nn.Linear(config.dim, config.vocab_size)
+        
+        # Initialize weights
+        self.apply(self._init_weights)
+        
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            
+    def forward(
+        self, 
+        tokens: torch.LongTensor,  # (B, N)
+        control_set: Optional[torch.LongTensor] = None,  # (B, S, N) tokenized control cells
+        target_gene_idx: Optional[torch.LongTensor] = None,  # (B,)
+        perturb_magnitude: Optional[torch.FloatTensor] = None,  # (B,) log2 fold change
+        perturb_sign: Optional[torch.LongTensor] = None,  # (B,) -1, 0, +1
+    ) -> torch.Tensor:
+        """
+        Forward pass with continuous perturbation conditioning.
+        
+        Args:
+            tokens: Input tokens of shape (batch_size, n_genes)
+            control_set: Tokenized control cells (batch_size, set_size, n_genes)
+            target_gene_idx: Target gene indices
+            perturb_magnitude: Log2 fold change values (continuous)
+            perturb_sign: Direction of perturbation (-1: down, 0: control, +1: up)
+            
+        Returns:
+            Logits of shape (batch_size, n_genes, vocab_size)
+        """
+        B, N = tokens.shape
+        
+        # Embed tokens and add position embeddings
+        x = self.token_emb(tokens) + self.pos_emb
+        
+        # Control set encoding (if provided)
+        context = None
+        if control_set is not None:
+            # Control set should be (B, S, N) where S is set size
+            context = self.control_encoder(control_set.float())  # (B, S, control_set_dim_out)
+        
+        # Conditioning embedding
+        if target_gene_idx is not None and perturb_magnitude is not None and perturb_sign is not None:
+            # Gene embedding
+            gene_emb = self.gene_embed(target_gene_idx)  # (B, gene_embed_dim)
+            
+            # Clip and normalize magnitude
+            magnitude_clipped = torch.clamp(perturb_magnitude, -self.config.magnitude_clip, self.config.magnitude_clip)
+            magnitude_normalized = magnitude_clipped / self.config.magnitude_clip  # Normalize to [-1, 1]
+            magnitude_emb = self.perturb_magnitude(magnitude_normalized.unsqueeze(-1))  # (B, D)
+            
+            # Sign embedding (shift to 0, 1, 2 for embedding lookup)
+            sign_idx = perturb_sign + 1  # Convert from [-1, 0, 1] to [0, 1, 2]
+            sign_emb = self.perturb_sign_embed(sign_idx)  # (B, sign_dim)
+            
+            # Combine embeddings
+            cond_emb = torch.cat([gene_emb, sign_emb, magnitude_emb], dim=-1)
+            cond_emb = self.cond_proj(cond_emb)  # (B, D)
+            
+            # Add conditioning to sequence (broadcast to all positions)
+            x = x + cond_emb.unsqueeze(1)
+        
+        # Apply transformer blocks with optional cross-attention to control set
+        for block in self.blocks:
+            x = block(x, context=context)
+            
+        # Final layer norm and projection
+        x = self.ln_f(x)
+        logits = self.head(x)
         
         return logits
 
 
-def train_step(model, batch, tokenize, criterion, optimizer):
-    """Single training step."""
-    x, meta = batch
+def compute_mlm_loss(
+    model: ConditionalBERTTransformer,
+    tokens: torch.LongTensor,
+    mask_ratio: float = 0.30,
+    control_set: Optional[torch.LongTensor] = None,
+    target_gene_idx: Optional[torch.LongTensor] = None,
+    perturb_magnitude: Optional[torch.FloatTensor] = None,
+    perturb_sign: Optional[torch.LongTensor] = None,
+) -> torch.Tensor:
+    """
+    Compute masked language modeling loss.
     
-    # Tokenize
-    tokens = tokenize(x)
+    Args:
+        model: The transformer model
+        tokens: Original token sequence (B, N)
+        mask_ratio: Fraction of tokens to mask
+        control_set: Optional control set for conditioning
+        target_gene_idx: Target gene indices for perturbation
+        perturb_magnitude: Perturbation magnitudes
+        perturb_sign: Perturbation signs
+        
+    Returns:
+        MLM loss
+    """
+    B, N = tokens.shape
+    device = tokens.device
+    
+    # Create mask
+    mask = torch.rand(B, N, device=device) < mask_ratio
+    
+    # Save original tokens for loss computation
+    labels = tokens.clone()
+    labels[~mask] = -100  # Ignore non-masked positions in loss
+    
+    # Apply masking to input
+    masked_tokens = tokens.clone()
+    masked_tokens[mask] = model.config.mask_token_id
     
     # Forward pass
-    logits = model(tokens)
+    logits = model(
+        masked_tokens,
+        control_set=control_set,
+        target_gene_idx=target_gene_idx,
+        perturb_magnitude=perturb_magnitude,
+        perturb_sign=perturb_sign
+    )
     
-    # Compute loss (predict each gene)
-    loss = criterion(logits.reshape(-1, logits.size(-1)), tokens.reshape(-1))
+    # Compute loss only on masked positions
+    loss = F.cross_entropy(
+        logits.view(-1, model.config.vocab_size),
+        labels.view(-1),
+        ignore_index=-100
+    )
     
-    # Backward pass
-    optimizer.zero_grad()
-    loss.backward()
-    optimizer.step()
+    return loss
+
+
+def create_optimizer(model: nn.Module, config: TransformerConfig):
+    """Create AdamW optimizer with weight decay."""
+    decay = set()
+    no_decay = set()
     
-    return loss.item()
+    for mn, m in model.named_modules():
+        for pn, p in m.named_parameters(recurse=False):
+            fpn = f"{mn}.{pn}" if mn else pn
+            
+            if pn.endswith('bias'):
+                no_decay.add(fpn)
+            elif pn.endswith('weight') and isinstance(m, (nn.LayerNorm, nn.Embedding)):
+                no_decay.add(fpn)
+            else:
+                decay.add(fpn)
+    
+    param_dict = {pn: p for pn, p in model.named_parameters()}
+    optim_groups = [
+        {"params": [param_dict[pn] for pn in sorted(decay)], "weight_decay": config.weight_decay},
+        {"params": [param_dict[pn] for pn in sorted(no_decay)], "weight_decay": 0.0},
+    ]
+    
+    return torch.optim.AdamW(optim_groups, lr=config.learning_rate, betas=(0.9, 0.95))
+
+
+def cosine_lr_schedule(optimizer, step: int, total_steps: int, config: TransformerConfig):
+    """Cosine learning rate schedule with warmup."""
+    if step < config.warmup_steps:
+        lr = config.learning_rate * step / config.warmup_steps
+    else:
+        progress = (step - config.warmup_steps) / (total_steps - config.warmup_steps)
+        lr = config.learning_rate * 0.5 * (1 + math.cos(math.pi * progress))
+        
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = lr
+    return lr
+
+
+def create_simple_tokenizer(vocab_size: int = 64):
+    """
+    Create a simple binning tokenizer for gene expression values.
+    
+    Returns:
+        tokenizer: A callable that discretizes expression values
+    """
+    class SimpleTokenizer:
+        def __init__(self, vocab_size):
+            self.vocab_size = vocab_size
+            # Define bins for expression values
+            # We'll use log-scale bins
+            self.bins = torch.logspace(-2, 4, vocab_size - 1)  # From 0.01 to 10000
+            self.bins = torch.cat([torch.tensor([0.0]), self.bins])
+            
+        def __call__(self, x):
+            """Tokenize expression values into discrete bins."""
+            if isinstance(x, np.ndarray):
+                x = torch.from_numpy(x)
+            # Bucketize into bins
+            tokens = torch.bucketize(x, self.bins)
+            return tokens.clamp(0, self.vocab_size - 1)
+    
+    return SimpleTokenizer(vocab_size)
+
+
+def train_epoch_transformer(
+    model: ConditionalBERTTransformer,
+    dataloader: torch.utils.data.DataLoader,
+    optimizer: torch.optim.Optimizer,
+    config: TransformerConfig,
+    epoch: int,
+    global_step: int,
+    use_control_sets: bool = True,
+    mixed_training: bool = True,
+) -> int:
+    """
+    Train for one epoch using MLM objective.
+    
+    Args:
+        model: The transformer model
+        dataloader: Training data loader (paired sets)
+        optimizer: Optimizer
+        config: Model configuration
+        epoch: Current epoch number
+        global_step: Global step counter
+        use_control_sets: Whether to use control set conditioning
+        mixed_training: Whether to mix conditioned and unconditioned batches
+        
+    Returns:
+        Updated global step
+    """
+    model.train()
+    epoch_start = time.time()
+    epoch_losses = []
+    
+    total_steps = len(dataloader)
+    
+    for batch_idx, batch in enumerate(dataloader):
+        # Move batch to GPU
+        if 'perturbed_expr' in batch:
+            # VCC paired data
+            X_pert = batch['perturbed_expr'].cuda()
+            X_ctrl = batch['control_expr'].cuda() if use_control_sets else None
+            
+            # Get batch size and set size
+            B, S, N = X_pert.shape  # (batch, set_size, n_genes)
+            
+            # Flatten for processing
+            X_pert_flat = X_pert.view(B * S, N)
+            
+            # Conditioning
+            target_gene_idx = batch['target_gene_idx']
+            if isinstance(target_gene_idx, list):
+                target_gene_idx = torch.tensor(target_gene_idx)
+            target_gene_idx = target_gene_idx.cuda()
+            
+            # Get log2fc and compute sign
+            log2fc = batch['log2fc'].cuda()
+            # Average log2fc across genes to get a single value per sample
+            if log2fc.dim() > 1:
+                log2fc_avg = log2fc.mean(dim=-1)
+            else:
+                log2fc_avg = log2fc
+            perturb_sign = torch.sign(log2fc_avg).long()
+            
+            # Expand conditioning to match flattened batch
+            target_gene_idx = target_gene_idx.unsqueeze(1).expand(-1, S).reshape(-1)
+            log2fc_avg = log2fc_avg.unsqueeze(1).expand(-1, S).reshape(-1)
+            perturb_sign = perturb_sign.unsqueeze(1).expand(-1, S).reshape(-1)
+            
+            # Decide if this batch should be conditioned
+            if mixed_training and torch.rand(1).item() < 0.5:
+                # 50% of batches are unconditioned (control-only)
+                X_ctrl = None
+                target_gene_idx = None
+                log2fc = None
+                perturb_sign = None
+                tokens = X_pert_flat  # Still use perturbed cells but without conditioning
+            else:
+                tokens = X_pert_flat
+                log2fc = log2fc_avg
+        else:
+            # Regular pretraining data (not paired)
+            tokens = batch.cuda()
+            B = tokens.shape[0]
+            X_ctrl = None
+            target_gene_idx = None
+            log2fc = None
+            perturb_sign = None
+        
+        # Compute MLM loss
+        loss = compute_mlm_loss(
+            model, 
+            tokens,
+            mask_ratio=config.mask_ratio,
+            control_set=X_ctrl,
+            target_gene_idx=target_gene_idx,
+            perturb_magnitude=log2fc,
+            perturb_sign=perturb_sign,
+        )
+        
+        # Backward pass
+        optimizer.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        optimizer.step()
+        
+        # Update learning rate
+        total_training_steps = config.pretrain_epochs * len(dataloader) + config.finetune_epochs * len(dataloader)
+        lr = cosine_lr_schedule(optimizer, global_step, total_training_steps, config)
+        
+        epoch_losses.append(loss.item())
+        
+        # Logging
+        if global_step % config.log_every == 0:
+            avg_loss = np.mean(epoch_losses[-100:]) if len(epoch_losses) > 100 else np.mean(epoch_losses)
+            print(f"Epoch {epoch:3d} [{batch_idx+1:4d}/{total_steps:4d}] | "
+                  f"Step {global_step:6d} | Loss: {loss.item():.4f} | "
+                  f"Avg Loss: {avg_loss:.4f} | LR: {lr:.2e}")
+            
+            wandb.log({
+                'train_loss': loss.item(),
+                'avg_train_loss': avg_loss,
+                'learning_rate': lr,
+                'epoch': epoch,
+                'global_step': global_step,
+                'use_control_sets': X_ctrl is not None,
+            })
+        
+        # Save checkpoint
+        if global_step % config.save_every == 0 and global_step > 0:
+            checkpoint_path = f'checkpoint_transformer_epoch_{epoch}_step_{global_step}.pt'
+            torch.save({
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'config': config,
+                'epoch': epoch,
+                'global_step': global_step,
+            }, checkpoint_path)
+            print(f"Saved checkpoint: {checkpoint_path}")
+        
+        global_step += 1
+    
+    epoch_time = time.time() - epoch_start
+    avg_epoch_loss = np.mean(epoch_losses)
+    print(f"\nEpoch {epoch} completed in {epoch_time:.1f}s | Avg Loss: {avg_epoch_loss:.4f}")
+    
+    return global_step
+
+
+def evaluate_zero_shot(
+    model: ConditionalBERTTransformer,
+    val_dataloader: torch.utils.data.DataLoader,
+    config: TransformerConfig,
+    gene_to_idx: Dict[str, int],
+    epoch: int,
+) -> Dict[str, float]:
+    """
+    Evaluate zero-shot perturbation prediction on validation genes.
+    """
+    model.eval()
+    
+    all_predictions = []
+    all_targets = []
+    all_genes = []
+    
+    with torch.no_grad():
+        for batch in val_dataloader:
+            # Get control sets
+            X_ctrl = batch['X_ctrl_tokens'].cuda()
+            target_genes = batch['target_gene']
+            target_gene_idx = batch['target_gene_idx'].cuda()
+            log2fc = batch['log2fc'].cuda()
+            perturb_sign = batch['perturb_sign'].cuda()
+            
+            B, S, N = X_ctrl.shape
+            
+            # For transformer, we need to predict perturbed cells
+            # We'll use the control cells as input and predict with perturbation conditioning
+            X_ctrl_flat = X_ctrl.view(B * S, N)
+            
+            # Expand conditioning
+            target_gene_idx_exp = target_gene_idx.unsqueeze(1).expand(-1, S).reshape(-1)
+            log2fc_exp = log2fc.unsqueeze(1).expand(-1, S).reshape(-1)
+            perturb_sign_exp = perturb_sign.unsqueeze(1).expand(-1, S).reshape(-1)
+            
+            # Forward pass to get predictions
+            logits = model(
+                X_ctrl_flat,
+                control_set=X_ctrl,
+                target_gene_idx=target_gene_idx_exp,
+                perturb_magnitude=log2fc_exp,
+                perturb_sign=perturb_sign_exp
+            )
+            
+            # Get predicted tokens
+            predictions = logits.argmax(dim=-1)  # (B*S, N)
+            predictions = predictions.view(B, S, N)
+            
+            # Store results
+            all_predictions.append(predictions.cpu())
+            all_genes.extend(target_genes)
+    
+    # Compute metrics
+    metrics = {
+        'zero_shot_genes_evaluated': len(set(all_genes)),
+        'epoch': epoch
+    }
+    
+    return metrics
 
 
 def main():
-    # Configuration
-    data_dir = "data/scRNA/processed"
-    batch_size = 32
-    learning_rate = 1e-4
-    n_epochs = 10
-    n_hvgs = 2000  # Number of highly variable genes
-    tokenization_strategy = "binned"  # "direct", "binned", or "log"
+    # Configuration - matching diffusion config
+    config = TransformerConfig(
+        # Model architecture
+        dim=128,
+        n_head=4,
+        n_layer=4,
+        ffn_mult=4,
+        vocab_size=64,
+        n_genes=2000,
+        
+        # Conditioning
+        n_total_genes=18080,  # VCC has 18080 genes
+        gene_embed_dim=128,
+        perturb_sign_dim=16,
+        perturb_magnitude_dim=64,
+        magnitude_clip=5.0,
+        
+        # Control set encoder
+        control_set_encoder_layers=2,
+        control_set_dim_hidden=128,
+        control_set_dim_out=512,
+        
+        # MLM parameters
+        mask_ratio=0.30,
+        mask_token_id=63,  # Use last token as [MASK]
+        
+        # Training
+        batch_size=4,
+        learning_rate=1e-4,
+        weight_decay=0.01,
+        warmup_steps=5000,
+        
+        # Epochs
+        pretrain_epochs=20,
+        finetune_epochs=30,
+        
+        # Logging
+        log_every=50,
+        eval_every=1000,
+        save_every=5000,
+        vcc_eval_interval=5000,
+    )
     
     # Initialize wandb
     wandb.init(
-        project="VCC",
-        config={
-            "batch_size": batch_size,
-            "learning_rate": learning_rate,
-            "n_epochs": n_epochs,
-            "n_hvgs": n_hvgs,
-            "tokenization_strategy": tokenization_strategy
-        }
+        project="vcc-bert-transformer",
+        config=config.__dict__,
+        name=f"bert_transformer_{time.strftime('%Y%m%d_%H%M%S')}"
     )
     
-    # Load config
-    config = load_config(data_dir)
-    print(f"Dataset info:")
-    print(f"  Total cells: {config['total_cells_downloaded']:,}")
-    print(f"  Total genes: {len(config['gene_list']):,}")
-    print(f"  Max expression: {config['max_expression_value']}")
-    print(f"  Sparsity: {config['sparsity']:.1%}")
+    # Create model
+    model = ConditionalBERTTransformer(config).cuda()
+    optimizer = create_optimizer(model, config)
+    
+    print(f"\nModel created with {sum(p.numel() for p in model.parameters()):,} parameters")
     
     # Create tokenizer
-    tokenize, detokenize, vocab_size = create_tokenizer(
-        config['max_expression_value'], 
-        tokenization_strategy
+    tokenizer = create_simple_tokenizer(config.vocab_size)
+    
+    # Create dataloaders
+    print("\n=== Creating Dataloaders ===")
+    
+    # Skip scRNA pretraining - we'll use VCC data directly
+    pretrain_dataloader = None
+    
+    # VCC paired dataloader for fine-tuning
+    vcc_dataset, vcc_dataloader = create_vcc_paired_dataloader(
+        set_size=16,
+        batch_size=config.batch_size,
+        tokenizer=tokenizer,
+        num_workers=4,
+        match_by_batch=True,
+        use_hvgs=True  # Use HVG genes
     )
-    print(f"\nTokenization: {tokenization_strategy}")
-    print(f"Vocabulary size: {vocab_size}")
     
-    # Create HVG dataset and dataloader
-    dataloader = create_hvg_dataloader(data_dir, batch_size=batch_size, n_hvgs=n_hvgs)
-    dataset = dataloader.dataset
-    print(f"\nDataset size: {len(dataset):,} cells")
-    print(f"Input dimension: {n_hvgs} genes (reduced from {len(config['gene_list']):,})")
-    
-    # Create model with HVG dimension
-    model = SimpleTransformer(
-        vocab_size=vocab_size,
-        n_genes=n_hvgs,  # Use HVG count instead of all genes
-        d_model=128
+    # VCC validation dataloader
+    val_dataset, val_dataloader = create_vcc_validation_dataloader(
+        set_size=16,
+        batch_size=config.batch_size,
+        tokenizer=tokenizer,
+        n_samples_per_gene=10,
+        use_hvgs=True  # Use HVG genes
     )
-    print(f"\nModel parameters: {sum(p.numel() for p in model.parameters()):,}")
     
-    # Training setup
-    criterion = nn.CrossEntropyLoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+    # Load HVG info to get gene names
+    hvg_info_path = Path("data/vcc_data/hvg_info.json")
+    with open(hvg_info_path, 'r') as f:
+        hvg_info = json.load(f)
+    hvg_genes = hvg_info['hvg_names']
     
-    # Training loop
-    print("\nStarting training...")
-    for epoch in range(n_epochs):
-        total_loss = 0
-        n_batches = 0
+    # VCC dataset already uses HVG genes, so mapping is identity
+    hvg_to_vcc_mapping = {i: i for i in range(len(hvg_genes))}
+    vcc_gene_to_idx = {gene: idx for idx, gene in enumerate(hvg_genes)}
+    
+    global_step = 0
+    
+    # Phase 1: Pretraining on single cells (optional, can skip if starting from checkpoint)
+    if pretrain_dataloader is not None and config.pretrain_epochs > 0:
+        print("\n=== Phase 1: Pretraining ===")
+        for epoch in range(config.pretrain_epochs):
+            global_step = train_epoch_transformer(
+                model, pretrain_dataloader, optimizer, config,
+                epoch, global_step,
+                use_control_sets=False,  # No control sets in pretraining
+                mixed_training=False
+            )
+    else:
+        print("\n=== Skipping Phase 1: Pretraining (no scRNA data) ===")
+    
+    # Phase 2: Fine-tuning with control sets
+    print("\n=== Phase 2: Fine-tuning with Control Sets ===")
+    for epoch in range(config.pretrain_epochs, config.pretrain_epochs + config.finetune_epochs):
+        global_step = train_epoch_transformer(
+            model, vcc_dataloader, optimizer, config,
+            epoch, global_step,
+            use_control_sets=True,
+            mixed_training=True  # Mix conditioned and unconditioned batches
+        )
         
-        for batch_idx, batch in enumerate(dataloader):
-            loss = train_step(model, batch, tokenize, criterion, optimizer)
-            total_loss += loss
-            n_batches += 1
+        # Evaluate zero-shot performance
+        if epoch % 5 == 0:
+            print("\n=== Zero-shot Evaluation ===")
+            metrics = evaluate_zero_shot(
+                model, val_dataloader, config,
+                vcc_gene_to_idx, epoch
+            )
             
-            # Log batch metrics
-            wandb.log({
-                "batch_loss": loss,
-                "epoch": epoch,
-                "batch": batch_idx
-            })
-            
-            if batch_idx % 100 == 0:
-                print(f"Epoch {epoch}, Batch {batch_idx}, Loss: {loss:.4f}")
-            
-            # Just train on a few batches for demonstration
-            if batch_idx >= 10:
-                break
-        
-        avg_loss = total_loss / n_batches
-        print(f"Epoch {epoch} - Average Loss: {avg_loss:.4f}")
-        
-        # Log epoch metrics
-        wandb.log({
-            "epoch_loss": avg_loss,
-            "epoch": epoch
-        })
+            print(f"Zero-shot genes evaluated: {metrics['zero_shot_genes_evaluated']}")
+            wandb.log(metrics)
     
-    # Example: Generate synthetic cells
-    print("\nGenerating synthetic cells...")
-    model.eval()
-    with torch.no_grad():
-        # Start with zeros (most genes are not expressed)
-        synthetic_tokens = torch.zeros(4, n_hvgs, dtype=torch.long)
-        
-        # You would implement proper sampling here
-        # For now, just get the model predictions
-        logits = model(synthetic_tokens)
-        predicted_tokens = logits.argmax(dim=-1)
-        
-        # Detokenize
-        synthetic_expression = detokenize(predicted_tokens)
-        
-        print(f"Generated {synthetic_expression.shape[0]} synthetic cells")
-        print(f"Average expression: {synthetic_expression.mean():.2f}")
-        print(f"Sparsity: {(synthetic_expression == 0).float().mean():.1%}")
-        
-    # Show HVG statistics
-    print("\nHVG Statistics:")
-    hvg_info = dataset.hvg_info
-    print(f"Top 10 HVGs: {hvg_info['hvg_names'][:10]}")
-    print(f"Mean percent cells expressed (top 10): "
-          f"{np.mean(hvg_info['statistics']['percent_cells_expressed']):.1f}%")
-    
-    # Log final metrics
-    wandb.log({
-        "final_synthetic_avg_expression": synthetic_expression.mean().item(),
-        "final_synthetic_sparsity": (synthetic_expression == 0).float().mean().item(),
-        "model_parameters": sum(p.numel() for p in model.parameters()),
-        "vocab_size": vocab_size
-    })
+    # Final save
+    final_checkpoint = 'checkpoint_transformer_final.pt'
+    torch.save({
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'config': config,
+        'epoch': config.pretrain_epochs + config.finetune_epochs,
+        'global_step': global_step,
+    }, final_checkpoint)
+    print(f"\nTraining complete! Final model saved to {final_checkpoint}")
     
     wandb.finish()
 
