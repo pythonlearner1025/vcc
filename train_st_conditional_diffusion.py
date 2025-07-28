@@ -118,7 +118,7 @@ def train_epoch_st(
     for batch_idx, batch in enumerate(dataloader):
         print(f"\nProcessing batch {batch_idx+1}/{total_steps}")
         
-        if 'perturbed_expr' in batch:
+        if isinstance(batch, dict) and 'perturbed_expr' in batch:
             print("Processing VCC paired data")
             X_pert = batch['perturbed_expr'].cuda()
             X_ctrl = batch['control_expr'].cuda() if use_control_sets else None
@@ -255,7 +255,6 @@ def evaluate_zero_shot(
     all_predictions = []
     all_targets = []
     all_genes = []
-    
     with torch.no_grad():
         for batch in val_dataloader:
             # Get control sets
@@ -280,7 +279,7 @@ def evaluate_zero_shot(
                 shape=(B * S, N),  # Generate S cells per perturbation
                 control_set=X_ctrl,
                 target_gene_idx=target_gene_idx.unsqueeze(1).expand(-1, S).reshape(-1),
-                perturb_magnitude=log2fc.unsqueeze(1).expand(-1, S).reshape(-1),
+                perturb_magnitude=log2fc_avg.unsqueeze(1).expand(-1, S).reshape(-1),  # Fixed: use log2fc_avg
                 perturb_sign=perturb_sign.unsqueeze(1).expand(-1, S).reshape(-1),
                 temperature=1.0,
                 device='cuda'
@@ -337,8 +336,8 @@ def main():
         warmup_steps=5000,
         
         # Epochs
-        pretrain_epochs=20,
-        finetune_epochs=30,
+        pretrain_epochs=0,
+        finetune_epochs=1,
         
         # Logging
         log_every=50,
@@ -377,7 +376,7 @@ def main():
     
     pretrain_dataloader = DataLoader(
         pretrain_dataset,
-        batch_size=config.pretrain_batch_size,
+        batch_size=config.batch_size,  # Fixed: use batch_size instead of pretrain_batch_size
         shuffle=True,
         num_workers=4,
         pin_memory=True,
@@ -403,7 +402,7 @@ def main():
         tokenizer=tokenizer,
         n_samples_per_gene=10,
         use_hvgs=True,  # Use HVG genes
-        num_workers=4
+        num_workers=0  # Disable multiprocessing to avoid worker issues
     )
     
     # Load HVG info to get gene names
