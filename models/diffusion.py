@@ -424,14 +424,17 @@ class PartialMaskingDiffusion:
             Mask ratio to use
         """
         if is_conditioned:
-            # Ramp from 30% → 100% over first 100k steps
-            max_mask = min(1.0, 0.3 + 0.7 * step / 100_000)
+            # Curriculum learning: gradually increase masking difficulty
+            # Start with 30% masking, ramp to 90% (not 100% to avoid trivial cases)
+            max_mask = min(0.9, 0.3 + 0.6 * step / 100_000)
         else:
-            max_mask = 0.6  # Unconditioned batches never see full masking
+            # Pretraining: moderate masking for representation learning
+            max_mask = 0.5
         
-        # Right-skewed distribution
-        u = torch.rand(1).item()
-        return max_mask * (1 - u**4)
+        # Sample from a beta distribution for more principled randomness
+        # Beta(2, 5) gives a right-skewed distribution favoring lower values
+        u = torch.distributions.Beta(2, 5).sample().item()
+        return max_mask * u
     
     def q_sample(
         self, 
@@ -666,4 +669,342 @@ def cosine_lr_schedule(optimizer, step: int, total_steps: int, config: Condition
         
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
-    return lr 
+    return lr
+
+
+class AuxiliaryLosses:
+    """Additional loss functions for diffusion training."""
+    
+    @staticmethod
+    def mmd_loss(x_real: torch.Tensor, x_fake: torch.Tensor, sigma: float = 1.0) -> torch.Tensor:
+        """
+        Maximum Mean Discrepancy loss for distribution matching.
+        
+        Args:
+            x_real: Real samples (B1, D)
+            x_fake: Generated samples (B2, D)
+            sigma: Bandwidth parameter for RBF kernel
+            
+        Returns:
+            MMD loss value
+        """
+        def rbf_kernel(x, y, sigma):
+            """RBF kernel for MMD."""
+            pairwise_dists = torch.cdist(x, y) ** 2
+            return torch.exp(-pairwise_dists / (2 * sigma ** 2))
+        
+        # Kernel matrices
+        k_xx = rbf_kernel(x_real, x_real, sigma)
+        k_yy = rbf_kernel(x_fake, x_fake, sigma)
+        k_xy = rbf_kernel(x_real, x_fake, sigma)
+        
+        # MMD^2 estimator
+        m, n = x_real.size(0), x_fake.size(0)
+        mmd = (k_xx.sum() - k_xx.diag().sum()) / (m * (m - 1))
+        mmd += (k_yy.sum() - k_yy.diag().sum()) / (n * (n - 1))
+        mmd -= 2 * k_xy.sum() / (m * n)
+        
+        return mmd
+    
+    @staticmethod
+    def wasserstein_loss(x_real: torch.Tensor, x_fake: torch.Tensor) -> torch.Tensor:
+        """
+        Approximate Wasserstein distance using sorted samples.
+        
+        Args:
+            x_real: Real samples (B, D)
+            x_fake: Generated samples (B, D)
+            
+        Returns:
+            Wasserstein distance approximation
+        """
+        # Flatten and sort samples
+        real_sorted, _ = torch.sort(x_real.flatten())
+        fake_sorted, _ = torch.sort(x_fake.flatten())
+        
+        # Ensure same length for comparison
+        min_len = min(len(real_sorted), len(fake_sorted))
+        real_sorted = real_sorted[:min_len]
+        fake_sorted = fake_sorted[:min_len]
+        
+        return torch.mean(torch.abs(real_sorted - fake_sorted))
+    
+    @staticmethod
+    def sparsity_regularization(x: torch.Tensor, target_sparsity: float = 0.9) -> torch.Tensor:
+        """
+        Regularization term to encourage sparsity in generated samples.
+        
+        Args:
+            x: Generated samples (B, N)
+            target_sparsity: Target fraction of zeros
+            
+        Returns:
+            Sparsity loss
+        """
+        actual_sparsity = (x == 0).float().mean()
+        return torch.abs(actual_sparsity - target_sparsity)
+
+
+class ImprovedPartialMaskingDiffusion(PartialMaskingDiffusion):
+    """Enhanced diffusion with auxiliary losses and better sampling."""
+    
+    def __init__(self, config: ConditionalModelConfig, aux_loss_weight: float = 0.1):
+        super().__init__(config)
+        self.aux_loss_weight = aux_loss_weight
+        self.aux_losses = AuxiliaryLosses()
+    
+    def compute_loss_with_aux(
+        self,
+        model: nn.Module,
+        x_start: torch.LongTensor,
+        control_set: Optional[torch.LongTensor] = None,
+        target_gene_idx: Optional[torch.LongTensor] = None,
+        perturb_magnitude: Optional[torch.FloatTensor] = None,
+        perturb_sign: Optional[torch.LongTensor] = None,
+        mask_token: int = 63,
+        step: int = 0,
+        use_aux_losses: bool = True,
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Compute training loss with optional auxiliary losses.
+        
+        Returns:
+            Dictionary with 'main_loss', 'aux_loss', and 'total_loss'
+        """
+        # Standard diffusion loss
+        main_loss = self.compute_loss(
+            model, x_start, control_set, target_gene_idx, 
+            perturb_magnitude, perturb_sign, mask_token, step
+        )
+        
+        losses = {'main_loss': main_loss}
+        
+        if use_aux_losses and step > 1000:  # Start aux losses after warmup
+            # Generate samples for auxiliary losses
+            with torch.no_grad():
+                B, N = x_start.shape
+                generated = self.p_sample_loop(
+                    model, (B, N),
+                    control_set=control_set,
+                    target_gene_idx=target_gene_idx,
+                    perturb_magnitude=perturb_magnitude,
+                    perturb_sign=perturb_sign,
+                    device=x_start.device
+                )
+            
+            # Convert to continuous values for comparison
+            x_real_continuous = x_start.float()
+            x_fake_continuous = generated.float()
+            
+            # Compute auxiliary losses
+            aux_loss = 0.0
+            
+            # Distribution matching
+            if B > 1:  # Need multiple samples for MMD
+                mmd_loss = self.aux_losses.mmd_loss(x_real_continuous, x_fake_continuous)
+                aux_loss += mmd_loss
+                losses['mmd_loss'] = mmd_loss
+            
+            # Sparsity regularization (important for scRNA-seq)
+            sparsity_loss = self.aux_losses.sparsity_regularization(x_fake_continuous)
+            aux_loss += sparsity_loss
+            losses['sparsity_loss'] = sparsity_loss
+            
+            aux_loss *= self.aux_loss_weight
+            losses['aux_loss'] = aux_loss
+        else:
+            losses['aux_loss'] = torch.tensor(0.0, device=main_loss.device)
+        
+        losses['total_loss'] = losses['main_loss'] + losses['aux_loss']
+        return losses
+class DiffusionEvaluator:
+    """Comprehensive evaluation utilities for diffusion models."""
+    
+    def __init__(self, tokenizer, detokenizer):
+        self.tokenizer = tokenizer
+        self.detokenizer = detokenizer
+    
+    def evaluate_generation_quality(
+        self, 
+        generated_tokens: torch.Tensor, 
+        real_tokens: torch.Tensor
+    ) -> Dict[str, float]:
+        """
+        Evaluate quality of generated samples.
+        
+        Args:
+            generated_tokens: Generated token sequences (B, N)
+            real_tokens: Real token sequences (B, N)
+            
+        Returns:
+            Dictionary of evaluation metrics
+        """
+        # Convert to continuous values
+        generated_expr = self.detokenizer(generated_tokens)
+        real_expr = self.detokenizer(real_tokens)
+        
+        metrics = {}
+        
+        # Basic statistics
+        metrics['mean_expression_real'] = real_expr.mean().item()
+        metrics['mean_expression_gen'] = generated_expr.mean().item()
+        metrics['std_expression_real'] = real_expr.std().item()
+        metrics['std_expression_gen'] = generated_expr.std().item()
+        
+        # Sparsity (important for scRNA-seq)
+        metrics['sparsity_real'] = (real_expr == 0).float().mean().item()
+        metrics['sparsity_gen'] = (generated_expr == 0).float().mean().item()
+        
+        # Distribution comparison
+        if generated_tokens.numel() > 0 and real_tokens.numel() > 0:
+            # KL divergence between token distributions
+            real_dist = torch.bincount(real_tokens.flatten(), minlength=64).float()
+            gen_dist = torch.bincount(generated_tokens.flatten(), minlength=64).float()
+            
+            real_dist = real_dist / real_dist.sum()
+            gen_dist = gen_dist / gen_dist.sum()
+            
+            # Add small epsilon to avoid log(0)
+            eps = 1e-8
+            kl_div = F.kl_div(
+                torch.log(gen_dist + eps), 
+                real_dist + eps, 
+                reduction='sum'
+            ).item()
+            metrics['kl_divergence'] = kl_div
+            
+            # Jensen-Shannon divergence (symmetric)
+            m = (real_dist + gen_dist) / 2
+            js_div = 0.5 * F.kl_div(torch.log(real_dist + eps), m + eps, reduction='sum').item()
+            js_div += 0.5 * F.kl_div(torch.log(gen_dist + eps), m + eps, reduction='sum').item()
+            metrics['js_divergence'] = js_div
+        
+        # Correlation analysis
+        if generated_expr.shape[0] > 1:  # Need multiple samples
+            # Gene-gene correlation preservation
+            real_corr = torch.corrcoef(real_expr.T)
+            gen_corr = torch.corrcoef(generated_expr.T)
+            
+            # Remove NaN values (can occur with constant genes)
+            mask = ~(torch.isnan(real_corr) | torch.isnan(gen_corr))
+            if mask.sum() > 0:
+                corr_preservation = torch.corrcoef(torch.stack([
+                    real_corr[mask], gen_corr[mask]
+                ]))[0, 1].item()
+                metrics['correlation_preservation'] = corr_preservation
+        
+        return metrics
+    
+    def evaluate_perturbation_effects(
+        self,
+        control_expr: torch.Tensor,
+        perturbed_expr: torch.Tensor,
+        target_gene_idx: int,
+        expected_log2fc: float
+    ) -> Dict[str, float]:
+        """
+        Evaluate how well the model captures perturbation effects.
+        
+        Args:
+            control_expr: Control expression values (B, N)
+            perturbed_expr: Perturbed expression values (B, N)
+            target_gene_idx: Index of perturbed gene
+            expected_log2fc: Expected log2 fold change
+            
+        Returns:
+            Perturbation evaluation metrics
+        """
+        metrics = {}
+        
+        # Convert to continuous if needed
+        if control_expr.dtype == torch.long:
+            control_expr = self.detokenizer(control_expr)
+        if perturbed_expr.dtype == torch.long:
+            perturbed_expr = self.detokenizer(perturbed_expr)
+        
+        # Compute actual log2 fold change
+        control_mean = control_expr.mean(dim=0)
+        perturbed_mean = perturbed_expr.mean(dim=0)
+        
+        # Add pseudocount to avoid log(0)
+        log2fc = torch.log2((perturbed_mean + 0.1) / (control_mean + 0.1))
+        
+        # Target gene effect
+        target_log2fc = log2fc[target_gene_idx].item()
+        metrics['target_log2fc_actual'] = target_log2fc
+        metrics['target_log2fc_expected'] = expected_log2fc
+        metrics['target_log2fc_error'] = abs(target_log2fc - expected_log2fc)
+        
+        # Direction correctness
+        expected_direction = 1 if expected_log2fc > 0 else -1 if expected_log2fc < 0 else 0
+        actual_direction = 1 if target_log2fc > 0.1 else -1 if target_log2fc < -0.1 else 0
+        metrics['direction_correct'] = int(expected_direction == actual_direction)
+        
+        # Off-target effects (should be minimal)
+        off_target_effects = torch.abs(log2fc)
+        off_target_effects[target_gene_idx] = 0  # Exclude target gene
+        metrics['off_target_mean'] = off_target_effects.mean().item()
+        metrics['off_target_max'] = off_target_effects.max().item()
+        
+        # Specificity score (ratio of on-target to off-target effect)
+        if off_target_effects.mean() > 0:
+            metrics['specificity_score'] = abs(target_log2fc) / off_target_effects.mean().item()
+        else:
+            metrics['specificity_score'] = float('inf')
+        
+        return metrics
+    
+    def compute_biological_metrics(
+        self, 
+        generated_expr: torch.Tensor,
+        real_expr: torch.Tensor,
+        gene_names: Optional[List[str]] = None
+    ) -> Dict[str, float]:
+        """
+        Compute biologically relevant metrics.
+        
+        Args:
+            generated_expr: Generated expression (B, N)
+            real_expr: Real expression (B, N)
+            gene_names: Optional gene names for interpretation
+            
+        Returns:
+            Biological evaluation metrics
+        """
+        metrics = {}
+        
+        # Convert to continuous if needed
+        if generated_expr.dtype == torch.long:
+            generated_expr = self.detokenizer(generated_expr)
+        if real_expr.dtype == torch.long:
+            real_expr = self.detokenizer(real_expr)
+        
+        # Expression magnitude distribution
+        real_total_counts = real_expr.sum(dim=1)
+        gen_total_counts = generated_expr.sum(dim=1)
+        
+        metrics['total_count_mean_real'] = real_total_counts.mean().item()
+        metrics['total_count_mean_gen'] = gen_total_counts.mean().item()
+        metrics['total_count_std_real'] = real_total_counts.std().item()
+        metrics['total_count_std_gen'] = gen_total_counts.std().item()
+        
+        # Gene expression distribution
+        real_gene_means = real_expr.mean(dim=0)
+        gen_gene_means = generated_expr.mean(dim=0)
+        
+        # Correlation of gene means
+        if len(real_gene_means) > 1:
+            gene_mean_corr = torch.corrcoef(torch.stack([real_gene_means, gen_gene_means]))[0, 1]
+            if not torch.isnan(gene_mean_corr):
+                metrics['gene_mean_correlation'] = gene_mean_corr.item()
+        
+        # Highly expressed gene preservation
+        top_k = min(100, len(real_gene_means))
+        real_top_genes = torch.topk(real_gene_means, top_k).indices.cpu()
+        gen_top_genes = torch.topk(gen_gene_means, top_k).indices.cpu()
+        
+        # Overlap in top genes
+        overlap = len(set(real_top_genes.tolist()) & set(gen_top_genes.tolist()))
+        metrics[f'top_{top_k}_gene_overlap'] = overlap / top_k
+        
+        return metrics
