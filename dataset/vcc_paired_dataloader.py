@@ -13,7 +13,7 @@ from typing import Dict, List, Optional, Tuple
 import pandas as pd
 import os
 import json
-from vcc_dataloader import load_hvg_info_with_cache
+from .vcc_dataloader import load_hvg_info_with_cache
 
 
 class VCCPairedDataset(Dataset):
@@ -275,32 +275,38 @@ class VCCValidationDataset(Dataset):
     
     def __getitem__(self, idx):
         """Get a validation sample with synthetic perturbation."""
-        target_gene = self.samples[idx]
-        
-        # For validation, we use control cells since these are held-out genes
-        # Sample two sets of control cells - one for "control" and one for "perturbed"
-        selected_ctrl1 = np.random.choice(self.control_indices, self.set_size, replace=False)
-        selected_ctrl2 = np.random.choice(self.control_indices, self.set_size, replace=False)
-        
-        # Extract expressions
-        control_expr = self.vcc_dataset.expression[selected_ctrl1]
-        # For zero-shot evaluation, we use control cells as "perturbed" 
-        # The model should predict what the perturbation would look like
-        pert_expr = self.vcc_dataset.expression[selected_ctrl2]
-        
-        # Since these are validation genes, we don't have real perturbation effects
-        # Create synthetic statistics for evaluation
-        control_mean = control_expr.mean(axis=0)
-        pert_mean = pert_expr.mean(axis=0)
-        # For held-out genes, log2fc should be close to 0 (no real perturbation)
-        log2fc = np.zeros_like(control_mean)
-        
-        # Get target gene index
-        target_idx = self.vcc_dataset.get_gene_index(target_gene)
-        if target_idx is None:
-            target_idx = -1
+        try:
+            target_gene = self.samples[idx]
             
-                    # Apply tokenizer if provided
+            # For validation, we use control cells since these are held-out genes
+            # Sample two sets of control cells - one for "control" and one for "perturbed"
+            if len(self.control_indices) < self.set_size:
+                # Use replacement if not enough control cells
+                selected_ctrl1 = np.random.choice(self.control_indices, self.set_size, replace=True)
+                selected_ctrl2 = np.random.choice(self.control_indices, self.set_size, replace=True)
+            else:
+                selected_ctrl1 = np.random.choice(self.control_indices, self.set_size, replace=False)
+                selected_ctrl2 = np.random.choice(self.control_indices, self.set_size, replace=False)
+            
+            # Extract expressions
+            control_expr = self.vcc_dataset.expression[selected_ctrl1]
+            # For zero-shot evaluation, we use control cells as "perturbed" 
+            # The model should predict what the perturbation would look like
+            pert_expr = self.vcc_dataset.expression[selected_ctrl2]
+            
+            # Since these are validation genes, we don't have real perturbation effects
+            # Create synthetic statistics for evaluation
+            control_mean = control_expr.mean(axis=0)
+            pert_mean = pert_expr.mean(axis=0)
+            # For held-out genes, log2fc should be close to 0 (no real perturbation)
+            log2fc = np.zeros_like(control_mean)
+            
+            # Get target gene index
+            target_idx = self.vcc_dataset.get_gene_index(target_gene)
+            if target_idx is None:
+                target_idx = -1
+                
+            # Apply tokenizer if provided
             if self.tokenizer is not None:
                 control_expr = self.tokenizer(control_expr)
                 pert_expr = self.tokenizer(pert_expr)
@@ -321,6 +327,12 @@ class VCCValidationDataset(Dataset):
                 'log2fc': torch.FloatTensor(log2fc),
                 'perturbation_magnitude': 0.0,  # No perturbation for validation genes
             }
+        except Exception as e:
+            print(f"Error in validation dataset __getitem__ at idx {idx}: {e}")
+            print(f"Target gene: {target_gene if 'target_gene' in locals() else 'unknown'}")
+            print(f"Control indices length: {len(self.control_indices)}")
+            print(f"Set size: {self.set_size}")
+            raise e
 
 
 def create_vcc_paired_dataloader(

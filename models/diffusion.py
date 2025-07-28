@@ -352,8 +352,9 @@ class ConditionalDiffusionTransformer(nn.Module):
         
         # Conditioning embedding
         if target_gene_idx is not None and perturb_magnitude is not None and perturb_sign is not None:
-            # Gene embedding
-            gene_emb = self.gene_embed(target_gene_idx)  # (B, gene_embed_dim)
+            # Gene embedding - clamp indices to valid range to avoid CUDA assertion errors
+            target_gene_idx_clamped = torch.clamp(target_gene_idx, 0, self.config.n_total_genes - 1)
+            gene_emb = self.gene_embed(target_gene_idx_clamped)  # (B, gene_embed_dim)
             
             # Clip and normalize magnitude
             magnitude_clipped = torch.clamp(perturb_magnitude, -self.config.magnitude_clip, self.config.magnitude_clip)
@@ -362,7 +363,8 @@ class ConditionalDiffusionTransformer(nn.Module):
             
             # Sign embedding (shift to 0, 1, 2 for embedding lookup)
             sign_idx = perturb_sign + 1  # Convert from [-1, 0, 1] to [0, 1, 2]
-            sign_emb = self.perturb_sign_embed(sign_idx)  # (B, sign_dim)
+            sign_idx_clamped = torch.clamp(sign_idx, 0, 2)  # Ensure valid range [0, 1, 2]
+            sign_emb = self.perturb_sign_embed(sign_idx_clamped)  # (B, sign_dim)
             
             # Combine embeddings
             cond_emb = torch.cat([gene_emb, sign_emb, magnitude_emb], dim=-1)
