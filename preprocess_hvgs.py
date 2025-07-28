@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Dict, List, Tuple
 from tqdm import tqdm
 import logging
+import scanpy as sc
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -65,6 +66,38 @@ def compute_gene_statistics(data_dir: str) -> Tuple[np.ndarray, np.ndarray, np.n
             total_cells += n
     
     return gene_means, gene_vars, gene_counts, total_cells
+
+
+def compute_vcc_gene_statistics(data_path: str) -> Tuple[np.ndarray, np.ndarray, np.ndarray, int, List[str]]:
+    """
+    Compute gene statistics from VCC data.
+    
+    Returns:
+        gene_means: Mean expression per gene
+        gene_vars: Variance per gene
+        gene_counts: Number of cells expressing each gene
+        total_cells: Total number of cells
+        gene_list: List of gene names
+    """
+    logger.info(f"Loading VCC data from {data_path}")
+    adata = sc.read_h5ad(data_path)
+    
+    # Convert to dense array if sparse
+    if hasattr(adata.X, 'toarray'):
+        expression = adata.X.toarray()
+    else:
+        expression = adata.X.copy()
+    
+    # Compute statistics
+    gene_means = expression.mean(axis=0)
+    gene_vars = expression.var(axis=0)
+    gene_counts = (expression > 0).sum(axis=0)
+    total_cells = expression.shape[0]
+    gene_list = adata.var.index.tolist()
+    
+    logger.info(f"Computed statistics for {total_cells} cells and {len(gene_list)} genes")
+    
+    return gene_means, gene_vars, gene_counts, total_cells, gene_list
 
 
 def select_hvgs(gene_means: np.ndarray, gene_vars: np.ndarray, 
@@ -205,9 +238,106 @@ def main():
                         help='Output directory for results')
     parser.add_argument('--force', action='store_true',
                         help='Force recomputation even if cache exists')
+    parser.add_argument('--vcc-data-path', type=str, default=None,
+                        help='Path to VCC data (adata_Training.h5ad)')
+    parser.add_argument('--process-vcc', action='store_true',
+                        help='Process VCC data for HVGs')
     
     args = parser.parse_args()
     
+    # Process VCC data if requested
+    if args.process_vcc or args.vcc_data_path:
+        # Find VCC data path
+        if args.vcc_data_path:
+            vcc_path = Path(args.vcc_data_path)
+        else:
+            # Try to find VCC data automatically
+            possible_paths = [
+                Path("/workspace/vcc/data/vcc_data/adata_Training.h5ad"),
+                Path("/data/vcc_data/adata_Training.h5ad"),
+                Path("./data/vcc_data/adata_Training.h5ad"),
+            ]
+            vcc_path = None
+            for p in possible_paths:
+                if p.exists():
+                    vcc_path = p
+                    break
+            
+            if vcc_path is None:
+                logger.error("Could not find VCC data. Please specify --vcc-data-path")
+                return
+        
+        output_dir = vcc_path.parent
+        cache_file = output_dir / 'hvg_info.json'
+        
+        # Check if already computed
+        if cache_file.exists() and not args.force:
+            logger.info(f"VCC HVG info already exists at {cache_file}")
+            logger.info("Use --force to recompute")
+            
+            # Load and display summary
+            with open(cache_file, 'r') as f:
+                hvg_info = json.load(f)
+            
+            print("\nVCC HVG Summary:")
+            print(f"  Number of HVGs: {len(hvg_info['hvg_indices'])}")
+            print(f"  Top 5 HVGs: {hvg_info['hvg_names'][:5]}")
+            return
+        
+        # Compute gene statistics for VCC
+        logger.info("Computing gene statistics for VCC data...")
+        gene_means, gene_vars, gene_counts, total_cells, gene_list = compute_vcc_gene_statistics(str(vcc_path))
+        
+        # Select HVGs
+        logger.info(f"Selecting top {args.n_hvgs} highly variable genes from VCC data...")
+        hvg_indices = select_hvgs(gene_means, gene_vars, gene_counts, total_cells, 
+                                 args.n_hvgs, args.min_cells_pct)
+        
+        # Analyze HVGs
+        logger.info("Analyzing VCC HVG statistics...")
+        stats = analyze_hvgs(hvg_indices, gene_means, gene_vars, gene_counts, 
+                            total_cells, gene_list, output_dir)
+        
+        # Create mappings
+        hvg_names = [gene_list[i] for i in hvg_indices]
+        gene_to_hvg_idx = {int(gene_idx): int(hvg_idx) 
+                           for hvg_idx, gene_idx in enumerate(hvg_indices)}
+        
+        # Also create gene name to HVG index mapping
+        gene_name_to_hvg_idx = {gene_list[gene_idx]: int(hvg_idx) 
+                                for hvg_idx, gene_idx in enumerate(hvg_indices)}
+        
+        # Prepare final output
+        hvg_info = {
+            'hvg_indices': hvg_indices.tolist(),
+            'hvg_names': hvg_names,
+            'gene_to_hvg_idx': gene_to_hvg_idx,
+            'gene_name_to_hvg_idx': gene_name_to_hvg_idx,
+            'total_genes': len(gene_list),
+            'statistics': stats
+        }
+        
+        # Save results
+        with open(cache_file, 'w') as f:
+            json.dump(hvg_info, f, indent=2)
+        
+        logger.info(f"Saved VCC HVG info to {cache_file}")
+        logger.info(f"Saved visualizations to {output_dir}")
+        
+        # Print summary
+        print("\nVCC HVG Selection Summary:")
+        print(f"  Total cells analyzed: {stats['total_cells_analyzed']:,}")
+        print(f"  Total genes: {stats['total_genes']:,}")
+        print(f"  Selected HVGs: {stats['n_hvgs']:,}")
+        print(f"\nTop 10 VCC HVGs:")
+        for i, (gene, disp, pct) in enumerate(zip(stats['top_10_hvgs'], 
+                                                  stats['top_10_dispersions'],
+                                                  stats['top_10_pct_cells'])):
+            print(f"  {i+1:2d}. {gene:<15} (dispersion: {disp:6.2f}, cells: {pct:5.1f}%)")
+        
+        return
+    
+    # Original scRNA processing
     data_dir = Path(args.data_dir)
     output_dir = Path(args.output_dir)
     cache_file = output_dir / 'hvg_info.json'
