@@ -52,30 +52,67 @@ class TokenizedScRNADataset(Dataset):
         tokens = self.tokenizer(x)
         return tokens
 
-def create_simple_tokenizer(vocab_size: int = 64):
+def create_simple_tokenizer(vocab_size: int = 64, max_value: float = 10000.0):
     """
     Create a simple binning tokenizer for gene expression values.
     
+    Args:
+        vocab_size: Number of discrete bins (should be 63 + 1 mask token)
+        max_value: Maximum expression value to handle
+    
     Returns:
         tokenizer: A callable that discretizes expression values
+        detokenizer: A callable that converts tokens back to approximate expression values
     """
     class SimpleTokenizer:
-        def __init__(self, vocab_size):
-            self.vocab_size = vocab_size
-            # Define bins for expression values
-            # We'll use log-scale bins
-            self.bins = torch.logspace(-2, 4, vocab_size - 1)  # From 0.01 to 10000
-            self.bins = torch.cat([torch.tensor([0.0]), self.bins])
+        def __init__(self, vocab_size, max_value):
+            self.vocab_size = vocab_size - 1  # Reserve last token for [MASK]
+            self.max_value = max_value
+            self.mask_token = vocab_size - 1
+            
+            # Define bins for expression values - use log-scale for better distribution
+            # Bin 0: exactly 0 (very common in scRNA-seq)
+            # Bins 1-(vocab_size-2): log-scale from 0.1 to max_value
+            self.bins = torch.zeros(self.vocab_size)
+            self.bins[1:] = torch.logspace(
+                np.log10(0.1), 
+                np.log10(max_value), 
+                self.vocab_size - 1
+            )
             
         def __call__(self, x):
             """Tokenize expression values into discrete bins."""
             if isinstance(x, np.ndarray):
                 x = torch.from_numpy(x)
+            
+            # Handle zero values explicitly
+            zero_mask = (x == 0)
+            
+            # Clip values to max range
+            x_clipped = torch.clamp(x, 0, self.max_value)
+            
             # Bucketize into bins
-            tokens = torch.bucketize(x, self.bins)
+            tokens = torch.bucketize(x_clipped, self.bins)
+            
+            # Ensure zero values map to token 0
+            tokens[zero_mask] = 0
+            
             return tokens.clamp(0, self.vocab_size - 1)
+        
+        def detokenize(self, tokens):
+            """Convert tokens back to approximate expression values."""
+            # Use bin centers for reconstruction
+            bin_centers = torch.zeros(self.vocab_size)
+            bin_centers[0] = 0.0  # Zero bin
+            
+            for i in range(1, self.vocab_size - 1):
+                bin_centers[i] = (self.bins[i] + self.bins[i+1]) / 2
+            bin_centers[-1] = self.bins[-1]  # Last bin uses upper bound
+            
+            return bin_centers[tokens]
     
-    return SimpleTokenizer(vocab_size)
+    tokenizer = SimpleTokenizer(vocab_size, max_value)
+    return tokenizer, tokenizer.detokenize
 
 
 def train_epoch_st(
@@ -362,7 +399,7 @@ def main():
     print(f"\nModel created with {sum(p.numel() for p in model.parameters()):,} parameters")
     
     # Create tokenizer
-    tokenizer = create_simple_tokenizer(config.vocab_size)
+    tokenizer, detokenizer = create_simple_tokenizer(config.vocab_size)
     
     # Create dataloaders
     print("\n=== Creating Dataloaders ===")
@@ -486,4 +523,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main() 
+    main()
