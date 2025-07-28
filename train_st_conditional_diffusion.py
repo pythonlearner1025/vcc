@@ -280,7 +280,7 @@ def main():
         n_genes=2000,
         
         # Conditioning
-        n_total_genes=18080,  # VCC has 18080 genes
+        n_total_genes=2000,  # Using HVG genes only
         gene_embed_dim=128,
         perturb_sign_dim=16,
         perturb_magnitude_dim=64,
@@ -355,7 +355,8 @@ def main():
         batch_size=config.batch_size,
         tokenizer=tokenizer,
         n_samples_per_gene=10,
-        use_hvgs=True  # Use HVG genes
+        use_hvgs=True,  # Use HVG genes
+        num_workers=4
     )
     
     # Load HVG info to get gene names
