@@ -20,11 +20,49 @@ import torch.nn.functional as F
 import math
 from dataclasses import dataclass
 
+from dataset import ScRNADataset, create_dataloader
 from vcc_paired_dataloader import (
     create_vcc_paired_dataloader,
     create_vcc_validation_dataloader
 )
 from vcc_dataloader import VCCDataset
+
+
+class HVGDataset(torch.utils.data.Dataset):
+    """Wrapper around ScRNADataset that selects HVG features."""
+    
+    def __init__(self, data_dir: str, n_hvgs: int = 2000, tokenizer=None):
+        self.base_dataset = ScRNADataset(data_dir)
+        self.n_hvgs = n_hvgs
+        self.tokenizer = tokenizer
+        
+        # Load HVG indices if available
+        hvg_info_path = Path(data_dir).parent / "hvg_info.json"
+        if hvg_info_path.exists():
+            with open(hvg_info_path, 'r') as f:
+                hvg_info = json.load(f)
+            self.hvg_indices = hvg_info['hvg_indices'][:n_hvgs]
+        else:
+            # If no precomputed HVGs, use first n_hvgs genes as a fallback
+            print(f"Warning: No precomputed HVGs found at {hvg_info_path}")
+            print(f"Using first {n_hvgs} genes instead")
+            self.hvg_indices = list(range(n_hvgs))
+    
+    def __len__(self):
+        return len(self.base_dataset)
+    
+    def __getitem__(self, idx):
+        # Get full expression vector from base dataset
+        full_expr, metadata = self.base_dataset[idx]
+        
+        # Select HVG features
+        hvg_expr = full_expr[self.hvg_indices]
+        
+        # Apply tokenizer if provided
+        if self.tokenizer is not None:
+            hvg_expr = self.tokenizer(hvg_expr)
+        
+        return hvg_expr
 
 
 @dataclass
@@ -733,8 +771,27 @@ def main():
     # Create dataloaders
     print("\n=== Creating Dataloaders ===")
     
-    # Skip scRNA pretraining - we'll use VCC data directly
-    pretrain_dataloader = None
+    # Create pretraining dataloader from scRNA data
+    scRNA_data_dir = "data/scRNA/processed"
+    if Path(scRNA_data_dir).exists():
+        print(f"\nCreating pretraining dataloader from {scRNA_data_dir}")
+        pretrain_dataset = HVGDataset(
+            scRNA_data_dir, 
+            n_hvgs=config.n_genes,  # Use same number of genes as model
+            tokenizer=tokenizer
+        )
+        pretrain_dataloader = torch.utils.data.DataLoader(
+            pretrain_dataset,
+            batch_size=config.batch_size * 8,  # Larger batch size for pretraining
+            shuffle=True,
+            num_workers=4,
+            pin_memory=True
+        )
+        print(f"Pretraining dataset: {len(pretrain_dataset):,} cells")
+    else:
+        print(f"\nWarning: scRNA data not found at {scRNA_data_dir}")
+        print("Skipping pretraining phase")
+        pretrain_dataloader = None
     
     # VCC paired dataloader for fine-tuning
     vcc_dataset, vcc_dataloader = create_vcc_paired_dataloader(
