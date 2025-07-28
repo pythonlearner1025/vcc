@@ -35,6 +35,7 @@ from vcc_dataloader import VCCDataset
 from eval import evaluate_on_vcc_validation, log_vcc_metrics, create_vcc_evaluator
 
 
+
 class TokenizedScRNADataset(Dataset):
     """Wrapper around ScRNADataset that applies tokenization."""
     
@@ -50,7 +51,6 @@ class TokenizedScRNADataset(Dataset):
         # Apply tokenizer to convert continuous expression to discrete tokens
         tokens = self.tokenizer(x)
         return tokens
-
 
 def create_simple_tokenizer(vocab_size: int = 64):
     """
