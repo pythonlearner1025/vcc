@@ -1,12 +1,5 @@
 #!/usr/bin/env python3
-"""
-Training script for BERT-style Conditional Masked Language Model.
-
-This script implements the same architecture as ST-style diffusion but with:
-- BERT-style masked language modeling objective
-- Same control set cross-attention
-- Same adaptive masking based on conditioning
-"""
+"""Training script for BERT-style Conditional Masked Language Model."""
 
 import torch
 import wandb
@@ -20,49 +13,13 @@ import torch.nn.functional as F
 import math
 from dataclasses import dataclass
 
-from dataset import ScRNADataset, create_dataloader
+from dataset import ScRNADataset, ProcessedScRNADataset, create_dataloader
 from vcc_paired_dataloader import (
     create_vcc_paired_dataloader,
     create_vcc_validation_dataloader
 )
 from vcc_dataloader import VCCDataset
-
-
-class HVGDataset(torch.utils.data.Dataset):
-    """Wrapper around ScRNADataset that selects HVG features."""
-    
-    def __init__(self, data_dir: str, n_hvgs: int = 2000, tokenizer=None):
-        self.base_dataset = ScRNADataset(data_dir)
-        self.n_hvgs = n_hvgs
-        self.tokenizer = tokenizer
-        
-        # Load HVG indices if available
-        hvg_info_path = Path(data_dir).parent / "hvg_info.json"
-        if hvg_info_path.exists():
-            with open(hvg_info_path, 'r') as f:
-                hvg_info = json.load(f)
-            self.hvg_indices = hvg_info['hvg_indices'][:n_hvgs]
-        else:
-            # If no precomputed HVGs, use first n_hvgs genes as a fallback
-            print(f"Warning: No precomputed HVGs found at {hvg_info_path}")
-            print(f"Using first {n_hvgs} genes instead")
-            self.hvg_indices = list(range(n_hvgs))
-    
-    def __len__(self):
-        return len(self.base_dataset)
-    
-    def __getitem__(self, idx):
-        # Get full expression vector from base dataset
-        full_expr, metadata = self.base_dataset[idx]
-        
-        # Select HVG features
-        hvg_expr = full_expr[self.hvg_indices]
-        
-        # Apply tokenizer if provided
-        if self.tokenizer is not None:
-            hvg_expr = self.tokenizer(hvg_expr)
-        
-        return hvg_expr
+from utils import create_simple_tokenizer, load_hvg_info
 
 
 @dataclass
@@ -475,32 +432,6 @@ def cosine_lr_schedule(optimizer, step: int, total_steps: int, config: Transform
     return lr
 
 
-def create_simple_tokenizer(vocab_size: int = 64):
-    """
-    Create a simple binning tokenizer for gene expression values.
-    
-    Returns:
-        tokenizer: A callable that discretizes expression values
-    """
-    class SimpleTokenizer:
-        def __init__(self, vocab_size):
-            self.vocab_size = vocab_size
-            # Define bins for expression values
-            # We'll use log-scale bins
-            self.bins = torch.logspace(-2, 4, vocab_size - 1)  # From 0.01 to 10000
-            self.bins = torch.cat([torch.tensor([0.0]), self.bins])
-            
-        def __call__(self, x):
-            """Tokenize expression values into discrete bins."""
-            if isinstance(x, np.ndarray):
-                x = torch.from_numpy(x)
-            # Bucketize into bins
-            tokens = torch.bucketize(x, self.bins)
-            return tokens.clamp(0, self.vocab_size - 1)
-    
-    return SimpleTokenizer(vocab_size)
-
-
 def train_epoch_transformer(
     model: ConditionalBERTTransformer,
     dataloader: torch.utils.data.DataLoader,
@@ -775,7 +706,7 @@ def main():
     scRNA_data_dir = "data/scRNA/processed"
     if Path(scRNA_data_dir).exists():
         print(f"\nCreating pretraining dataloader from {scRNA_data_dir}")
-        pretrain_dataset = HVGDataset(
+        pretrain_dataset = ProcessedScRNADataset(
             scRNA_data_dir, 
             n_hvgs=config.n_genes,  # Use same number of genes as model
             tokenizer=tokenizer

@@ -1,12 +1,5 @@
 #!/usr/bin/env python3
-"""
-Training script for ST-style Conditional Discrete Diffusion Transformer.
-
-This script implements the ST architecture with:
-- Paired control-perturbed cell sets
-- Control set cross-attention
-- Adaptive masking based on conditioning
-"""
+"""Training script for ST-style Conditional Discrete Diffusion Transformer."""
 
 import torch
 import wandb
@@ -26,56 +19,14 @@ from models.diffusion import (
     prepare_perturbation_conditioning,
     create_gene_mapping
 )
-from dataset import ScRNADataset, create_dataloader
+from dataset import ScRNADataset, ProcessedScRNADataset, create_dataloader
 from vcc_paired_dataloader import (
     create_vcc_paired_dataloader,
     create_vcc_validation_dataloader
 )
 from vcc_dataloader import VCCDataset
 from eval import evaluate_on_vcc_validation, log_vcc_metrics, create_vcc_evaluator
-
-
-
-class TokenizedScRNADataset(Dataset):
-    """Wrapper around ScRNADataset that applies tokenization."""
-    
-    def __init__(self, data_dir: str, tokenizer, max_genes: Optional[int] = None):
-        self.dataset = ScRNADataset(data_dir, max_genes=max_genes)
-        self.tokenizer = tokenizer
-        
-    def __len__(self):
-        return len(self.dataset)
-    
-    def __getitem__(self, idx):
-        x, meta = self.dataset[idx]
-        # Apply tokenizer to convert continuous expression to discrete tokens
-        tokens = self.tokenizer(x)
-        return tokens
-
-def create_simple_tokenizer(vocab_size: int = 64):
-    """
-    Create a simple binning tokenizer for gene expression values.
-    
-    Returns:
-        tokenizer: A callable that discretizes expression values
-    """
-    class SimpleTokenizer:
-        def __init__(self, vocab_size):
-            self.vocab_size = vocab_size
-            # Define bins for expression values
-            # We'll use log-scale bins
-            self.bins = torch.logspace(-2, 4, vocab_size - 1)  # From 0.01 to 10000
-            self.bins = torch.cat([torch.tensor([0.0]), self.bins])
-            
-        def __call__(self, x):
-            """Tokenize expression values into discrete bins."""
-            if isinstance(x, np.ndarray):
-                x = torch.from_numpy(x)
-            # Bucketize into bins
-            tokens = torch.bucketize(x, self.bins)
-            return tokens.clamp(0, self.vocab_size - 1)
-    
-    return SimpleTokenizer(vocab_size)
+from utils import create_simple_tokenizer
 
 
 def train_epoch_st(
@@ -354,10 +305,10 @@ def main():
     
     # Create pretrain dataloader from HVG-filtered scRNA data
     print("Creating scRNA pretrain dataloader...")
-    pretrain_dataset = TokenizedScRNADataset(
+    pretrain_dataset = ProcessedScRNADataset(
         data_dir="data/scRNA/processed",
-        tokenizer=tokenizer,
-        max_genes=config.n_genes  # Use 2000 HVG genes
+        n_hvgs=config.n_genes,  # Use 2000 HVG genes
+        tokenizer=tokenizer
     )
     
     pretrain_dataloader = DataLoader(

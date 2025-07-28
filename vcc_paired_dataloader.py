@@ -13,7 +13,7 @@ from typing import Dict, List, Optional, Tuple
 import pandas as pd
 import os
 import json
-from vcc_dataloader import load_hvg_info_with_cache
+from utils import load_hvg_info
 
 
 class VCCPairedDataset(Dataset):
@@ -54,7 +54,7 @@ class VCCPairedDataset(Dataset):
         self.gene_name_to_hvg_idx = None
         
         if use_hvgs:
-            hvg_info = load_hvg_info_with_cache(data_path)
+            hvg_info = load_hvg_info(data_path)
             
             self.hvg_indices = hvg_info['hvg_indices']
             self.hvg_names = hvg_info['hvg_names']

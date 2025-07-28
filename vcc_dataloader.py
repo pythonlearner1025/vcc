@@ -13,78 +13,7 @@ from typing import Dict, List, Optional, Tuple
 import pandas as pd
 import os
 import json
-import hashlib
-from datetime import datetime
-
-
-def load_hvg_info_with_cache(data_path: str) -> Dict:
-    """
-    Load HVG information with caching for faster subsequent loads.
-    
-    Args:
-        data_path: Path to the h5ad file
-        
-    Returns:
-        Dictionary containing hvg_indices, hvg_names, and gene_name_to_hvg_idx
-    """
-    # Original HVG info path
-    hvg_info_path = Path(data_path).parent / 'hvg_info.json'
-    
-    # Cache directory and file
-    cache_dir = Path("/workspace/data/vcc_data")
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    
-    # Create a unique cache key based on the original file path and modification time
-    cache_key = hashlib.md5(str(hvg_info_path).encode()).hexdigest()
-    cache_file = cache_dir / f"hvg_cache_{cache_key}.json"
-    
-    # Check if cache exists and is valid
-    if cache_file.exists() and hvg_info_path.exists():
-        try:
-            # Check if original file is newer than cache
-            cache_mtime = cache_file.stat().st_mtime
-            orig_mtime = hvg_info_path.stat().st_mtime
-            
-            if cache_mtime >= orig_mtime:
-                # Load from cache
-                with open(cache_file, 'r') as f:
-                    cache_data = json.load(f)
-                    
-                # Verify cache has all required fields
-                if all(key in cache_data for key in ['hvg_indices', 'hvg_names', 'gene_name_to_hvg_idx']):
-                    print(f"Loading HVG info from cache: {cache_file}")
-                    return cache_data
-        except Exception as e:
-            print(f"Warning: Failed to load cache: {e}")
-    
-    # Load from original source
-    if not hvg_info_path.exists():
-        raise FileNotFoundError(
-            f"HVG info not found at {hvg_info_path}. "
-            "Please run preprocess_hvgs.py --process-vcc first."
-        )
-    
-    print(f"Loading HVG info from source: {hvg_info_path}")
-    with open(hvg_info_path, 'r') as f:
-        hvg_info = json.load(f)
-    
-    # Save to cache
-    try:
-        # Add metadata to cache
-        cache_data = hvg_info.copy()
-        cache_data['_cache_metadata'] = {
-            'source_path': str(hvg_info_path),
-            'cached_at': datetime.now().isoformat(),
-            'n_hvgs': len(hvg_info['hvg_indices'])
-        }
-        
-        with open(cache_file, 'w') as f:
-            json.dump(cache_data, f)
-        print(f"Cached HVG info to: {cache_file}")
-    except Exception as e:
-        print(f"Warning: Failed to save cache: {e}")
-    
-    return hvg_info
+from utils import load_hvg_info
 
 
 class VCCDataset(Dataset):
@@ -127,7 +56,7 @@ class VCCDataset(Dataset):
         self.gene_name_to_hvg_idx = None
         
         if use_hvgs:
-            hvg_info = load_hvg_info_with_cache(data_path)
+            hvg_info = load_hvg_info(data_path)
             
             self.hvg_indices = hvg_info['hvg_indices']
             self.hvg_names = hvg_info['hvg_names']

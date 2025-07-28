@@ -8,6 +8,7 @@ from torch.utils.data import Dataset, DataLoader
 import numpy as np
 from pathlib import Path
 from typing import Optional, Tuple
+from utils import load_hvg_info
 
 
 class ScRNADataset(Dataset):
@@ -71,6 +72,42 @@ class ScRNADataset(Dataset):
             x = self.transform(x)
         
         return x, meta
+
+
+class ProcessedScRNADataset(Dataset):
+    """Wrapper for ScRNADataset with HVG selection and tokenization."""
+    
+    def __init__(self, data_dir: str, n_hvgs: Optional[int] = None, tokenizer=None):
+        self.base_dataset = ScRNADataset(data_dir)
+        self.tokenizer = tokenizer
+        
+        # Load HVG indices if requested
+        if n_hvgs is not None:
+            hvg_info_path = Path(data_dir).parent / "hvg_info.json"
+            if hvg_info_path.exists():
+                hvg_info = load_hvg_info(str(hvg_info_path.parent / "adata_Training.h5ad"))
+                self.hvg_indices = hvg_info['hvg_indices'][:n_hvgs]
+            else:
+                print(f"Warning: No precomputed HVGs found, using first {n_hvgs} genes")
+                self.hvg_indices = list(range(n_hvgs))
+        else:
+            self.hvg_indices = None
+    
+    def __len__(self):
+        return len(self.base_dataset)
+    
+    def __getitem__(self, idx):
+        expr, metadata = self.base_dataset[idx]
+        
+        # Select HVG features if specified
+        if self.hvg_indices is not None:
+            expr = expr[self.hvg_indices]
+        
+        # Apply tokenizer if provided
+        if self.tokenizer is not None:
+            expr = self.tokenizer(expr)
+        
+        return expr, metadata
 
 
 def create_dataloader(data_dir: str, batch_size: int = 32, 

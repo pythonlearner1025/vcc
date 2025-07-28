@@ -1,12 +1,5 @@
 #!/usr/bin/env python3
-"""
-Explore and understand the VCC (Virtual Cell Challenge) evaluation dataset.
-This script inspects the training and validation data to understand:
-- Data structure and format
-- Gene perturbation information
-- Control cells
-- Evaluation requirements
-"""
+"""Explore VCC evaluation dataset structure and perturbation information."""
 
 import os
 import pandas as pd
