@@ -78,6 +78,14 @@ class VCCPairedDataset(Dataset):
         if max_cells is not None and len(self.adata) > max_cells:
             self.adata = self.adata[:max_cells]
             
+        # Convert to dense array ONCE during initialization for fast access
+        print("Converting expression data to dense array...")
+        if hasattr(self.adata.X, 'toarray'):
+            self.expression_data = self.adata.X.toarray()
+        else:
+            self.expression_data = self.adata.X.copy()
+        print(f"Expression data shape: {self.expression_data.shape}")
+            
         # Build indices
         self._build_indices()
         self._build_perturbation_groups()
@@ -176,12 +184,8 @@ class VCCPairedDataset(Dataset):
             selected_ctrl = np.random.choice(control_pool, self.set_size, replace=True)
             
         # Extract expressions
-        if hasattr(self.adata.X, 'toarray'):
-            control_expr = self.adata.X[selected_ctrl].toarray()
-            pert_expr = self.adata.X[selected_pert].toarray()
-        else:
-            control_expr = self.adata.X[selected_ctrl]
-            pert_expr = self.adata.X[selected_pert]
+        control_expr = self.expression_data[selected_ctrl]
+        pert_expr = self.expression_data[selected_pert]
             
         # Compute statistics
         control_mean = control_expr.mean(axis=0)
@@ -223,10 +227,7 @@ class VCCPairedDataset(Dataset):
     
     def get_control_mean(self):
         """Get overall mean of control cells."""
-        if hasattr(self.adata.X[self.control_indices], 'toarray'):
-            return self.adata.X[self.control_indices].toarray().mean(axis=0)
-        else:
-            return self.adata.X[self.control_indices].mean(axis=0)
+        return self.expression_data[self.control_indices].mean(axis=0)
 
 
 class VCCValidationDataset(Dataset):
@@ -250,7 +251,7 @@ class VCCValidationDataset(Dataset):
             tokenizer: Optional tokenizer
             n_samples_per_gene: Number of samples to generate per gene
         """
-        from vcc_dataloader import VCCDataset
+        from .vcc_dataloader import VCCDataset
         self.vcc_dataset = vcc_dataset
         self.set_size = set_size
         self.tokenizer = tokenizer
@@ -358,7 +359,7 @@ def create_vcc_paired_dataloader(
     """
     # Find data directory if not provided
     if data_dir is None:
-        from vcc_dataloader import find_vcc_data_dir
+        from .vcc_dataloader import find_vcc_data_dir
         data_dir = find_vcc_data_dir()
         if data_dir is None:
             raise FileNotFoundError(
@@ -414,7 +415,7 @@ def create_vcc_validation_dataloader(
         dataset: VCCValidationDataset instance
         dataloader: DataLoader instance
     """
-    from vcc_dataloader import VCCDataset, find_vcc_data_dir
+    from .vcc_dataloader import VCCDataset, find_vcc_data_dir
     
     # Find data directory
     if data_dir is None:

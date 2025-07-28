@@ -26,11 +26,11 @@ from models.diffusion import (
     create_gene_mapping
 )
 from dataset import ScRNADataset
-from vcc_paired_dataloader import (
+from dataset import (
     create_vcc_paired_dataloader,
-    create_vcc_validation_dataloader
+    create_vcc_validation_dataloader,
+    VCCDataset
 )
-from vcc_dataloader import VCCDataset
 from eval import evaluate_on_vcc_validation, log_vcc_metrics, create_vcc_evaluator
 
 
@@ -88,63 +88,69 @@ def train_epoch_st(
     Returns:
         Updated global step
     """
+    print("Setting model to train mode")
     model.train()
     epoch_start = time.time()
     epoch_losses = []
     
     total_steps = len(dataloader)
+    print(f"Starting epoch with {total_steps} total steps")
     
     for batch_idx, batch in enumerate(dataloader):
-        # Move batch to GPU
+        print(f"\nProcessing batch {batch_idx+1}/{total_steps}")
+        
         if 'perturbed_expr' in batch:
-            # VCC paired data
+            print("Processing VCC paired data")
             X_pert = batch['perturbed_expr'].cuda()
             X_ctrl = batch['control_expr'].cuda() if use_control_sets else None
             
-            # Get batch size and set size
             B, S, N = X_pert.shape  # (batch, set_size, n_genes)
+            print(f"Batch shape: {B} batches, {S} cells per set, {N} genes")
             
-            # Flatten for processing
+            print("Flattening perturbed expression")
             X_pert_flat = X_pert.view(B * S, N)
             
-            # Conditioning
+            print("Processing conditioning information")
             target_gene_idx = batch['target_gene_idx']
             if isinstance(target_gene_idx, list):
                 target_gene_idx = torch.tensor(target_gene_idx)
             target_gene_idx = target_gene_idx.cuda()
             
-            # Get log2fc and compute sign
+            print("Computing perturbation signs")
             log2fc = batch['log2fc'].cuda()
-            # Average log2fc across genes to get a single value per sample
             if log2fc.dim() > 1:
+                print("Averaging log2fc across genes")
                 log2fc_avg = log2fc.mean(dim=-1)
             else:
                 log2fc_avg = log2fc
             perturb_sign = torch.sign(log2fc_avg).long()
             
-            # Expand conditioning to match flattened batch
+            print("Expanding conditioning to match batch")
             target_gene_idx = target_gene_idx.unsqueeze(1).expand(-1, S).reshape(-1)
             log2fc_avg = log2fc_avg.unsqueeze(1).expand(-1, S).reshape(-1)
             perturb_sign = perturb_sign.unsqueeze(1).expand(-1, S).reshape(-1)
             
-            # Decide if this batch should be conditioned
             if mixed_training and torch.rand(1).item() < 0.5:
-                # 50% of batches are unconditioned (control-only)
+                print("Using unconditioned batch")
                 X_ctrl = None
                 target_gene_idx = None
                 log2fc = None
                 perturb_sign = None
-                tokens = X_pert_flat  # Still use perturbed cells but without conditioning
+                tokens = X_pert_flat
             else:
+                print("Using conditioned batch")
                 tokens = X_pert_flat
                 log2fc = log2fc_avg
                 
-                # Prepare control sets if using
                 if X_ctrl is not None:
-                    # Keep control sets in (B, S, N) shape for cross-attention
-                    X_ctrl = X_ctrl  # Already in correct shape
+                    print("Using control sets for cross-attention")
+                    # X_ctrl shape: (B, S, N)
+                    # We need to repeat each control set S times to match flattened perturbed cells
+                    # Each of the S perturbed cells from a batch should see the same control set
+                    X_ctrl_expanded = X_ctrl.unsqueeze(1).expand(-1, S, -1, -1)  # (B, S, S, N)
+                    X_ctrl = X_ctrl_expanded.reshape(B * S, S, N)  # (B*S, S, N)
         else:
-            # Regular pretraining data (not paired)
+            print("Processing regular pretraining data")
             tokens = batch.cuda()
             B = tokens.shape[0]
             X_ctrl = None
@@ -152,7 +158,7 @@ def train_epoch_st(
             log2fc = None
             perturb_sign = None
         
-        # Compute loss with ST-style conditioning
+        print("Computing diffusion loss")
         loss = diffusion.compute_loss(
             model, 
             tokens,
@@ -163,20 +169,22 @@ def train_epoch_st(
             step=global_step
         )
         
-        # Backward pass
+        print("Performing backward pass")
         optimizer.zero_grad()
         loss.backward()
+        print("Clipping gradients")
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        print("Optimizer step")
         optimizer.step()
         
-        # Update learning rate
+        print("Updating learning rate")
         total_training_steps = config.pretrain_epochs * len(dataloader) + config.finetune_epochs * len(dataloader)
         lr = cosine_lr_schedule(optimizer, global_step, total_training_steps, config)
         
         epoch_losses.append(loss.item())
         
-        # Logging
         if global_step % config.log_every == 0:
+            print("Logging metrics")
             avg_loss = np.mean(epoch_losses[-100:]) if len(epoch_losses) > 100 else np.mean(epoch_losses)
             print(f"Epoch {epoch:3d} [{batch_idx+1:4d}/{total_steps:4d}] | "
                   f"Step {global_step:6d} | Loss: {loss.item():.4f} | "
@@ -191,8 +199,8 @@ def train_epoch_st(
                 'use_control_sets': X_ctrl is not None,
             })
         
-        # Save checkpoint
         if global_step % config.save_every == 0 and global_step > 0:
+            print("Saving checkpoint")
             checkpoint_path = f'checkpoint_st_epoch_{epoch}_step_{global_step}.pt'
             torch.save({
                 'model_state_dict': model.state_dict(),
@@ -232,11 +240,18 @@ def evaluate_zero_shot(
     with torch.no_grad():
         for batch in val_dataloader:
             # Get control sets
-            X_ctrl = batch['X_ctrl_tokens'].cuda()
+            print(batch.keys())
+            X_ctrl = batch['control_expr'].cuda()  # Fixed: was 'X_ctrl_tokens'
             target_genes = batch['target_gene']
             target_gene_idx = batch['target_gene_idx'].cuda()
             log2fc = batch['log2fc'].cuda()
-            perturb_sign = batch['perturb_sign'].cuda()
+            
+            # Compute perturb_sign from log2fc like in training
+            if log2fc.dim() > 1:
+                log2fc_avg = log2fc.mean(dim=-1)
+            else:
+                log2fc_avg = log2fc
+            perturb_sign = torch.sign(log2fc_avg).long()
             
             B, S, N = X_ctrl.shape
             
@@ -289,7 +304,7 @@ def main():
         # Control set encoder
         control_set_encoder_layers=2,
         control_set_dim_hidden=128,
-        control_set_dim_out=512,
+        control_set_dim_out=128,  # Must match model dim for cross-attention
         
         # Diffusion
         n_timesteps=10,
@@ -297,7 +312,7 @@ def main():
         schedule="cosine",
         
         # Training
-        batch_size=4,  # Smaller batch size due to sets
+        batch_size=1,  # Smaller batch size due to sets
         learning_rate=1e-4,
         weight_decay=0.01,
         warmup_steps=5000,
