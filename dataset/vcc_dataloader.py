@@ -87,6 +87,70 @@ def load_hvg_info_with_cache(data_path: str) -> Dict:
     return hvg_info
 
 
+def load_dense_arrays_with_cache(data_path: str, hvg_indices: List[int], max_cells: Optional[int] = None) -> Optional[np.ndarray]:
+    """
+    Load dense expression arrays with caching for faster subsequent loads.
+    
+    Args:
+        data_path: Path to the h5ad file
+        hvg_indices: List of HVG indices for filtering
+        max_cells: Maximum number of cells to load
+        
+    Returns:
+        Dense expression array or None if not cached
+    """
+    # Cache directory and file
+    cache_dir = Path("/workspace/data/vcc_data")
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Create cache key based on data path, HVG indices, and max_cells
+    cache_key_data = f"{data_path}_{len(hvg_indices)}_{max_cells}"
+    cache_key = hashlib.md5(cache_key_data.encode()).hexdigest()
+    dense_cache_file = cache_dir / f"dense_cache_{cache_key}.npz"
+    
+    # Check if cache exists and is valid
+    if dense_cache_file.exists():
+        try:
+            # Check if original h5ad file is newer than cache
+            cache_mtime = dense_cache_file.stat().st_mtime
+            orig_mtime = Path(data_path).stat().st_mtime
+            
+            if cache_mtime >= orig_mtime:
+                print(f"Loading dense arrays from cache: {dense_cache_file}")
+                with np.load(dense_cache_file) as cached:
+                    return cached['expression_data']
+        except Exception as e:
+            print(f"Warning: Failed to load dense array cache: {e}")
+    
+    return None
+
+
+def save_dense_arrays_to_cache(data_path: str, hvg_indices: List[int], expression_data: np.ndarray, max_cells: Optional[int] = None):
+    """
+    Save dense expression arrays to cache.
+    
+    Args:
+        data_path: Path to the h5ad file
+        hvg_indices: List of HVG indices for filtering
+        expression_data: Dense expression array to cache
+        max_cells: Maximum number of cells loaded
+    """
+    # Cache directory
+    cache_dir = Path("/workspace/data/vcc_data")
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Create cache key based on data path, HVG indices, and max_cells
+    cache_key_data = f"{data_path}_{len(hvg_indices)}_{max_cells}"
+    cache_key = hashlib.md5(cache_key_data.encode()).hexdigest()
+    dense_cache_file = cache_dir / f"dense_cache_{cache_key}.npz"
+    
+    try:
+        np.savez_compressed(dense_cache_file, expression_data=expression_data)
+        print(f"Cached dense arrays to: {dense_cache_file}")
+    except Exception as e:
+        print(f"Warning: Failed to save dense array cache: {e}")
+
+
 class VCCDataset(Dataset):
     """
     Simple dataset for VCC data.
@@ -118,13 +182,16 @@ class VCCDataset(Dataset):
             raise FileNotFoundError(f"Data file not found: {data_path}")
             
         print(f"Loading VCC data from: {data_path}")
-        self.adata = sc.read_h5ad(data_path)
+        self.data_path = data_path
+        self.subset = subset
+        self.max_cells = max_cells
         
         # Load HVG information if requested
         self.use_hvgs = use_hvgs
         self.hvg_indices = None
         self.hvg_names = None
         self.gene_name_to_hvg_idx = None
+        self.expression = None
         
         if use_hvgs:
             hvg_info = load_hvg_info_with_cache(data_path)
@@ -135,45 +202,103 @@ class VCCDataset(Dataset):
             
             print(f"Using {len(self.hvg_indices)} HVG genes")
             
-            # Filter genes to only HVGs
-            self.adata = self.adata[:, self.hvg_indices]
-            self.gene_names = self.hvg_names
-        else:
-            self.gene_names = self.adata.var.index.tolist()
+            # Try to load dense arrays from cache if all HVG keys are present
+            if all(key in hvg_info for key in ['hvg_indices', 'hvg_names', 'gene_name_to_hvg_idx']):
+                # Create cache key that includes subset info
+                cache_key_data = f"{data_path}_{len(self.hvg_indices)}_{max_cells}_{subset}"
+                cache_key = hashlib.md5(cache_key_data.encode()).hexdigest()
+                
+                cache_dir = Path("/workspace/data/vcc_data")
+                dense_cache_file = cache_dir / f"dense_cache_{cache_key}.npz"
+                
+                # Check if cache exists and is valid
+                if dense_cache_file.exists():
+                    try:
+                        # Check if original h5ad file is newer than cache
+                        cache_mtime = dense_cache_file.stat().st_mtime
+                        orig_mtime = Path(data_path).stat().st_mtime
+                        
+                        if cache_mtime >= orig_mtime:
+                            print(f"Loading dense arrays from cache: {dense_cache_file}")
+                            with np.load(dense_cache_file, allow_pickle=True) as cached:
+                                self.expression = cached['expression_data']
+                                self.cell_ids = cached['cell_ids'].tolist()
+                                self.target_genes = cached['target_genes'].tolist()
+                                self.batches = cached['batches'].tolist()
+                                self.gene_names = self.hvg_names
+                                print(f"Using cached data: {len(self.cell_ids)} cells, {len(self.gene_names)} genes")
+                    except Exception as e:
+                        print(f"Warning: Failed to load dense array cache: {e}")
+                        self.expression = None
         
-        # Filter by subset if requested
-        if subset == 'control':
-            mask = self.adata.obs['target_gene'] == 'non-targeting'
-            self.adata = self.adata[mask]
-            print(f"Loaded {len(self.adata)} control cells")
-        elif subset == 'perturbed':
-            mask = self.adata.obs['target_gene'] != 'non-targeting'
-            self.adata = self.adata[mask]
-            print(f"Loaded {len(self.adata)} perturbed cells")
-        else:
-            print(f"Loaded all {len(self.adata)} cells")
-        
-        # Limit cells if requested
-        if max_cells is not None and len(self.adata) > max_cells:
-            self.adata = self.adata[:max_cells]
-            print(f"Limited to {max_cells} cells")
-        
-        # Store metadata
-        self.cell_ids = self.adata.obs.index.tolist()
-        self.target_genes = self.adata.obs['target_gene'].tolist()
-        self.batches = self.adata.obs['batch'].tolist()
-        
-        # Convert expression to dense array for simplicity
-        print("Converting expression data to dense array...")
-        if hasattr(self.adata.X, 'toarray'):
-            self.expression = self.adata.X.toarray()
-        else:
-            self.expression = self.adata.X.copy()
-        
-        print(f"Dataset ready: {len(self)} cells, {len(self.gene_names)} genes")
+        # Load adata only if we don't have cached dense arrays
+        if self.expression is None:
+            self.adata = sc.read_h5ad(data_path)
+            
+            if use_hvgs:
+                # Filter genes to only HVGs
+                self.adata = self.adata[:, self.hvg_indices]
+                self.gene_names = self.hvg_names
+            else:
+                self.gene_names = self.adata.var.index.tolist()
+            
+            # Filter by subset if requested
+            if subset == 'control':
+                mask = self.adata.obs['target_gene'] == 'non-targeting'
+                self.adata = self.adata[mask]
+                print(f"Loaded {len(self.adata)} control cells")
+            elif subset == 'perturbed':
+                mask = self.adata.obs['target_gene'] != 'non-targeting'
+                self.adata = self.adata[mask]
+                print(f"Loaded {len(self.adata)} perturbed cells")
+            else:
+                print(f"Loaded all {len(self.adata)} cells")
+            
+            # Limit cells if requested
+            if max_cells is not None and len(self.adata) > max_cells:
+                self.adata = self.adata[:max_cells]
+                print(f"Limited to {max_cells} cells")
+            
+            # Store metadata
+            self.cell_ids = self.adata.obs.index.tolist()
+            self.target_genes = self.adata.obs['target_gene'].tolist()
+            self.batches = self.adata.obs['batch'].tolist()
+            
+            # Convert expression to dense array for simplicity
+            print("Converting expression data to dense array...")
+            if hasattr(self.adata.X, 'toarray'):
+                self.expression = self.adata.X.toarray()
+            else:
+                self.expression = self.adata.X.copy()
+            
+            # Cache the dense arrays if using HVGs
+            if use_hvgs and all(key in hvg_info for key in ['hvg_indices', 'hvg_names', 'gene_name_to_hvg_idx']):
+                try:
+                    cache_key_data = f"{data_path}_{len(self.hvg_indices)}_{max_cells}_{subset}"
+                    cache_key = hashlib.md5(cache_key_data.encode()).hexdigest()
+                    
+                    cache_dir = Path("/workspace/data/vcc_data")
+                    cache_dir.mkdir(parents=True, exist_ok=True)
+                    dense_cache_file = cache_dir / f"dense_cache_{cache_key}.npz"
+                    
+                    np.savez_compressed(
+                        dense_cache_file, 
+                        expression_data=self.expression,
+                        cell_ids=np.array(self.cell_ids),
+                        target_genes=np.array(self.target_genes),
+                        batches=np.array(self.batches)
+                    )
+                    print(f"Cached dense arrays to: {dense_cache_file}")
+                except Exception as e:
+                    print(f"Warning: Failed to save dense array cache: {e}")
+            
+            print(f"Dataset ready: {len(self)} cells, {len(self.gene_names)} genes")
     
     def __len__(self):
-        return len(self.adata)
+        if hasattr(self, 'adata') and self.adata is not None:
+            return len(self.adata)
+        else:
+            return len(self.cell_ids)
     
     def __getitem__(self, idx):
         """Return a single cell's data."""

@@ -305,10 +305,10 @@ def main():
     # Configuration
     config = ConditionalModelConfig(
         # Model architecture
-        dim=128,
-        n_head=4,
-        n_layer=4,
-        ffn_mult=4,
+        dim=256,
+        n_head=8,
+        n_layer=8,
+        ffn_mult=8,
         vocab_size=64,
         n_genes=2000,
         
@@ -330,13 +330,13 @@ def main():
         schedule="cosine",
         
         # Training
-        batch_size=1,  # Smaller batch size due to sets
+        batch_size=32,  # Smaller batch size due to sets
         learning_rate=1e-4,
         weight_decay=0.01,
         warmup_steps=5000,
         
         # Epochs
-        pretrain_epochs=0,
+        pretrain_epochs=1,
         finetune_epochs=1,
         
         # Logging
