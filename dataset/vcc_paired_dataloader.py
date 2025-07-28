@@ -13,6 +13,7 @@ from typing import Dict, List, Optional, Tuple
 import pandas as pd
 import os
 import json
+from vcc_dataloader import load_hvg_info_with_cache
 
 
 class VCCPairedDataset(Dataset):
@@ -53,15 +54,7 @@ class VCCPairedDataset(Dataset):
         self.gene_name_to_hvg_idx = None
         
         if use_hvgs:
-            hvg_info_path = Path(data_path).parent / 'hvg_info.json'
-            if not hvg_info_path.exists():
-                raise FileNotFoundError(
-                    f"HVG info not found at {hvg_info_path}. "
-                    "Please run preprocess_hvgs.py --process-vcc first."
-                )
-            
-            with open(hvg_info_path, 'r') as f:
-                hvg_info = json.load(f)
+            hvg_info = load_hvg_info_with_cache(data_path)
             
             self.hvg_indices = hvg_info['hvg_indices']
             self.hvg_names = hvg_info['hvg_names']
