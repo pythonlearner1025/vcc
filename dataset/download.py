@@ -178,7 +178,7 @@ class ScRNADownloader:
             X_dense = adata_combined.X
         
         # Convert to int16 to save space (max gene count rarely exceeds 32k)
-        X_dense = X_dense.astype(np.int16)
+        X_dense = X_dense.astype(np.int32)
         
         # Save as HDF5 for efficient loading
         h5_path = self.processed_dir / f"batch_{batch_idx:04d}.h5"
