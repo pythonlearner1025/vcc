@@ -33,9 +33,6 @@ from dataset import (
     create_vcc_validation_dataloader,
     VCCDataset
 )
-from eval import evaluate_on_vcc_validation, log_vcc_metrics, create_vcc_evaluator
-
-
 
 class TokenizedScRNADataset(Dataset):
     """Wrapper around ScRNADatasetWithHVGs that applies tokenization."""
