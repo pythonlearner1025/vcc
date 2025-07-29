@@ -65,6 +65,9 @@ class ConditionalModelConfig:
     eval_every: int = 1000
     save_every: int = 5000
     vcc_eval_interval: int = 5000
+
+    debug_train_max_steps: int = 10
+    debug_eval_max_steps: int = 50
     
     @property
     def n_params(self) -> int:

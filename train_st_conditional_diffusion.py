@@ -128,6 +128,7 @@ def train_epoch_st(
     batch_to_idx: Optional[Dict[str, int]] = None,
     use_control_sets: bool = True,
     mixed_training: bool = True,
+    max_steps: Optional[int] = None,
 ) -> int:
     """
     Train for one epoch using ST-style conditioning.
@@ -144,6 +145,7 @@ def train_epoch_st(
         batch_to_idx: Mapping from batch names to indices for batch conditioning
         use_control_sets: Whether to use control set conditioning
         mixed_training: Whether to mix conditioned and unconditioned batches
+        max_steps: Maximum number of steps to run (for debugging), None for full epoch
         
     Returns:
         Updated global step
@@ -153,8 +155,15 @@ def train_epoch_st(
     epoch_losses = []
     
     total_steps = len(dataloader)
+    if max_steps is not None:
+        total_steps = min(total_steps, max_steps)
+        print(f"Debug mode: limiting epoch to {max_steps} steps")
     
     for batch_idx, batch in enumerate(dataloader):
+        # Early cutoff for debugging
+        if max_steps is not None and batch_idx >= max_steps:
+            print(f"Debug cutoff: stopping after {max_steps} steps")
+            break
         
         if isinstance(batch, dict) and 'perturbed_expr' in batch:
             # Processing VCC paired data
@@ -277,7 +286,8 @@ def train_epoch_st(
     
     epoch_time = time.time() - epoch_start
     avg_epoch_loss = np.mean(epoch_losses)
-    print(f"Epoch {epoch} completed in {epoch_time:.1f}s | Avg Loss: {avg_epoch_loss:.4f}")
+    steps_completed = min(len(dataloader), max_steps) if max_steps is not None else len(dataloader)
+    print(f"Epoch {epoch} completed in {epoch_time:.1f}s | Steps: {steps_completed} | Avg Loss: {avg_epoch_loss:.4f}")
     
     return global_step
 
@@ -290,17 +300,32 @@ def evaluate_zero_shot(
     gene_to_idx: Dict[str, int],
     epoch: int,
     batch_to_idx: Optional[Dict[str, int]] = None,
+    max_steps: Optional[int] = None,
 ) -> Dict[str, float]:
     """
     Evaluate zero-shot perturbation prediction on validation genes.
+    
+    Args:
+        max_steps: Maximum number of batches to evaluate (for debugging), None for full dataset
     """
     model.eval()
     
     all_predictions = []
     all_targets = []
     all_genes = []
+    
+    total_batches = len(val_dataloader)
+    if max_steps is not None:
+        total_batches = min(total_batches, max_steps)
+        print(f"Debug mode: limiting evaluation to {max_steps} batches")
+    
     with torch.no_grad():
-        for batch in val_dataloader:
+        for batch_idx, batch in enumerate(val_dataloader):
+            # Early cutoff for debugging
+            if max_steps is not None and batch_idx >= max_steps:
+                print(f"Debug cutoff: stopping evaluation after {max_steps} batches")
+                break
+                
             # Get control sets
             X_ctrl = batch['control_expr'].cuda()  # Fixed: was 'X_ctrl_tokens'
             target_genes = batch['target_gene']
@@ -349,8 +374,10 @@ def evaluate_zero_shot(
             all_genes.extend(target_genes)
     
     # Compute metrics
+    batches_evaluated = min(len(val_dataloader), max_steps) if max_steps is not None else len(val_dataloader)
     metrics = {
         'zero_shot_genes_evaluated': len(set(all_genes)),
+        'zero_shot_batches_evaluated': batches_evaluated,
         'epoch': epoch
     }
     
@@ -379,6 +406,10 @@ def main():
     2. Reduce set_size (but may hurt model performance)
     3. Consider gradient checkpointing
     4. Use multi-query attention (already implemented)
+    
+    DEBUG MODE:
+    For quick testing, set config.debug_max_steps to a small number (e.g., 10-50)
+    This will limit both training and evaluation to the specified number of steps.
     """
     # Configuration
     config = ConditionalModelConfig(
@@ -436,6 +467,10 @@ def main():
         eval_every=1000,
         save_every=5000,
         vcc_eval_interval=5000,
+        
+        # Debug - set to None for full training, or number of steps for quick debugging
+        debug_train_max_steps = None,
+        debug_eval_max_steps = 50 # equivalent to validation set's target perturb genes
     )
     
     # Initialize wandb
@@ -510,7 +545,7 @@ def main():
         set_size=config.vcc_set_size,
         batch_size=config.vcc_batch_size,
         tokenizer=tokenizer,
-        n_samples_per_gene=10,
+        n_samples_per_gene=1,
         use_hvgs=True,  # Uses hvg_info.json which should now be cross-dataset
         num_workers=0  # Disable multiprocessing to avoid worker issues
     )
@@ -549,7 +584,8 @@ def main():
                 epoch, global_step, total_training_steps,
                 batch_to_idx=None,  # No batch conditioning for pretraining
                 use_control_sets=False,  # No control sets in pretraining
-                mixed_training=False
+                mixed_training=False,
+                max_steps=config.debug_train_max_steps
             )
             
         # Save checkpoint after pretraining
@@ -576,7 +612,8 @@ def main():
             epoch, global_step, total_training_steps,
             batch_to_idx=batch_to_idx,  # Pass batch mapping for conditioning
             use_control_sets=True,
-            mixed_training=True  # Mix conditioned and unconditioned batches
+            mixed_training=True,  # Mix conditioned and unconditioned batches
+            max_steps=config.debug_train_max_steps
         )
         
         # Evaluate zero-shot performance
@@ -584,7 +621,8 @@ def main():
             print("\n=== Zero-shot Evaluation ===")
             metrics = evaluate_zero_shot(
                 model, diffusion, val_dataloader, config,
-                vcc_gene_to_idx, epoch, batch_to_idx
+                vcc_gene_to_idx, epoch, batch_to_idx,
+                max_steps=config.debug_eval_max_steps
             )
             
             print(f"Zero-shot genes evaluated: {metrics['zero_shot_genes_evaluated']}")
