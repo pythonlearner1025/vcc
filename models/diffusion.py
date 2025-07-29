@@ -66,7 +66,8 @@ class ConditionalModelConfig:
     save_every: int = 5000
     vcc_eval_interval: int = 5000
 
-    debug_train_max_steps: int = 10
+    debug_pretrain_max_steps: Optional[int] = None 
+    debug_finetune_max_steps: Optional[int] = None
     debug_eval_max_steps: int = 50
     
     @property

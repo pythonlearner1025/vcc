@@ -469,8 +469,9 @@ def main():
         vcc_eval_interval=5000,
         
         # Debug - set to None for full training, or number of steps for quick debugging
-        debug_train_max_steps = None,
-        debug_eval_max_steps = 50 # equivalent to validation set's target perturb genes
+        debug_pretrain_max_steps = 500000,
+        debug_finetune_max_steps = 10,
+        debug_eval_max_steps = 1 # equivalent to validation set's target perturb genes
     )
     
     # Initialize wandb
@@ -572,6 +573,18 @@ def main():
     total_training_steps = pretrain_steps + finetune_steps
     print(f"\nTotal training steps: {total_training_steps:,} (pretrain: {pretrain_steps:,}, finetune: {finetune_steps:,})")
     
+    # Create unique checkpoint directory with timestamp
+    from datetime import datetime
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    checkpoint_dir = Path(f"checkpoints/run_{timestamp}")
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Save config
+    config_path = checkpoint_dir / "config.json"
+    with open(config_path, "w") as f:
+        json.dump(config.__dict__, f, indent=2)
+    print(f"\nSaved config to {config_path}")
+    
     # Phase 1: Pretraining on single cells
     if config.pretrain_epochs > 0:
         print(f"\n=== Phase 1: Pretraining on scRNA data ({config.pretrain_epochs} epochs) ===")
@@ -585,11 +598,11 @@ def main():
                 batch_to_idx=None,  # No batch conditioning for pretraining
                 use_control_sets=False,  # No control sets in pretraining
                 mixed_training=False,
-                max_steps=config.debug_train_max_steps
+                max_steps=config.debug_pretrain_max_steps
             )
             
         # Save checkpoint after pretraining
-        pretrain_checkpoint = 'checkpoint_st_pretrained.pt'
+        pretrain_checkpoint = checkpoint_dir / "checkpoint_st_pretrained.pt"
         torch.save({
             'model_state_dict': model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
@@ -613,7 +626,7 @@ def main():
             batch_to_idx=batch_to_idx,  # Pass batch mapping for conditioning
             use_control_sets=True,
             mixed_training=True,  # Mix conditioned and unconditioned batches
-            max_steps=config.debug_train_max_steps
+            max_steps=config.debug_finetune_max_steps
         )
         
         # Evaluate zero-shot performance
@@ -629,7 +642,7 @@ def main():
             wandb.log(metrics)
     
     # Final save
-    final_checkpoint = 'checkpoint_st_final.pt'
+    final_checkpoint = checkpoint_dir / "checkpoint_st_final.pt"
     torch.save({
         'model_state_dict': model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
