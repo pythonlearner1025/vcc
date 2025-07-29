@@ -37,34 +37,46 @@ def compute_gene_statistics(data_dir: str) -> Tuple[np.ndarray, np.ndarray, np.n
     # Load gene list
     with open(Path(data_dir).parent / "config.json", 'r') as f:
         config = json.load(f)
-    n_genes = len(config['gene_list'])
+    n_genes = len(config['gene_list']) # Gene Count, so 36k?
+    logger.info(f"Total genes: {n_genes}")
     
     # Initialize statistics
     gene_means = np.zeros(n_genes)
-    gene_vars = np.zeros(n_genes)
-    gene_counts = np.zeros(n_genes)
+    gene_m2 = np.zeros(n_genes)  # Sum of squared differences (for Welford's algorithm)
+    gene_counts = np.zeros(n_genes, dtype=int)
     total_cells = 0
-    
+
     # Process each batch
     batch_files = sorted(Path(data_dir).glob("batch_*.h5"))
     logger.info(f"Processing {len(batch_files)} batch files...")
     
     for batch_file in tqdm(batch_files, desc="Computing statistics"):
         with h5py.File(batch_file, 'r') as f:
-            expression = f['X'][:]  # Changed from 'expression' to 'X'
+            expression = f['X'][:]  # Load expression data (cells x genes)
+            batch_n = expression.shape[0]
             
-            # Update statistics
+            # Compute batch statistics
             batch_mean = expression.mean(axis=0)
-            batch_var = expression.var(axis=0)
+            batch_m2 = ((expression - batch_mean) ** 2).sum(axis=0)
             batch_nonzero = (expression > 0).sum(axis=0)
             
-            # Online update for mean and variance
-            n = expression.shape[0]
-            gene_means = (gene_means * total_cells + batch_mean * n) / (total_cells + n)
-            gene_vars = (gene_vars * total_cells + batch_var * n) / (total_cells + n)
+            # Parallel Welford's algorithm - combine batch statistics
+            if total_cells == 0:
+                # First batch
+                gene_means = batch_mean.copy()
+                gene_m2 = batch_m2.copy()
+            else:
+                # Combine with existing statistics
+                delta = batch_mean - gene_means
+                gene_means = (gene_means * total_cells + batch_mean * batch_n) / (total_cells + batch_n)
+                gene_m2 = gene_m2 + batch_m2 + delta**2 * total_cells * batch_n / (total_cells + batch_n)
+            
             gene_counts += batch_nonzero
-            total_cells += n
-    
+            total_cells += batch_n
+
+    # Finalize variance
+    gene_vars = gene_m2 / (total_cells - 1) if total_cells > 1 else np.zeros(n_genes)
+
     return gene_means, gene_vars, gene_counts, total_cells
 
 
