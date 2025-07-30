@@ -58,7 +58,9 @@ class ConditionalModelConfig:
     # Training epochs (replacing step-based training)
     pretrain_epochs: int = 50
     finetune_epochs: int = 20
-    pretrain_data_dir: str = "data/scRNA_1e5"
+    pretrain_data_dir: str = "data/scRNA"
+    finetune_data_path: str = "data/vcc_data/"
+    hvg_info_path: str = ".txt"
     
     # Logging
     log_every: int = 100

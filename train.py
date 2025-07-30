@@ -26,7 +26,7 @@ from models.diffusion import (
 )
 # Updated imports for cross-dataset HVGs
 from dataset.scrna_hvg_dataset import ScRNADatasetWithHVGs, create_scrna_hvg_dataloader
-from dataset.vcc_paired_dataloader import create_train_val_dataloaders, create_zero_shot_dataloader
+from dataset.vcc_paired_dataloader import create_train_val_dataloaders
 
 class TokenizedScRNADataset(Dataset):
     """Wrapper around ScRNADatasetWithHVGs that applies tokenization."""
@@ -167,17 +167,21 @@ def train_epoch_st(
             
             # Tokenize the expression data
             # Note: tokenizer is expected to be passed to train_epoch_st
-            X_pert_tokens = torch.zeros_like(X_pert, dtype=torch.long)
+            # Move to CPU for tokenization to avoid device mismatch
+            X_pert_cpu = X_pert.cpu()
+            X_pert_tokens = torch.zeros_like(X_pert_cpu, dtype=torch.long)
             for b in range(B):
                 for s in range(S):
-                    X_pert_tokens[b, s] = tokenizer(X_pert[b, s])
+                    X_pert_tokens[b, s] = tokenizer(X_pert_cpu[b, s])
+            X_pert_tokens = X_pert_tokens.cuda()
                     
             if X_ctrl is not None:
-                X_ctrl_tokens = torch.zeros_like(X_ctrl, dtype=torch.long)
+                X_ctrl_cpu = X_ctrl.cpu()
+                X_ctrl_tokens = torch.zeros_like(X_ctrl_cpu, dtype=torch.long)
                 for b in range(B):
                     for s in range(S):
-                        X_ctrl_tokens[b, s] = tokenizer(X_ctrl[b, s])
-                X_ctrl = X_ctrl_tokens
+                        X_ctrl_tokens[b, s] = tokenizer(X_ctrl_cpu[b, s])
+                X_ctrl = X_ctrl_tokens.cuda()
             
             X_pert_flat = X_pert_tokens.view(B * S, N)
             
@@ -299,37 +303,33 @@ def train_epoch_st(
     
     return global_step
 
-
-def evaluate_zero_shot(
+def evaluate_validation(
     model: torch.nn.Module,
     diffusion: PartialMaskingDiffusion,
     val_dataloader: torch.utils.data.DataLoader,
+    optimizer: torch.optim.Optimizer,
     config: ConditionalModelConfig,
-    gene_to_idx: Dict[str, int],
     epoch: int,
     tokenizer = None,
     batch_to_idx: Optional[Dict[str, int]] = None,
     max_steps: Optional[int] = None,
 ) -> Dict[str, float]:
     """
-    Evaluate zero-shot perturbation prediction on validation genes.
+    Evaluate validation loss on held-out genes (20% split).
     
     Args:
         model: The diffusion model
         diffusion: The diffusion process handler
         val_dataloader: Validation data loader
+        optimizer: Optimizer (not used, kept for consistency)
         config: Model configuration
-        gene_to_idx: Mapping from gene names to indices
         epoch: Current epoch number
         tokenizer: Tokenizer function to convert expression values to tokens
         batch_to_idx: Mapping from batch names to indices for batch conditioning
         max_steps: Maximum number of batches to evaluate (for debugging), None for full dataset
     """
     model.eval()
-    
-    all_predictions = []
-    all_targets = []
-    all_genes = []
+    val_losses = []
     
     total_batches = len(val_dataloader)
     if max_steps is not None:
@@ -342,26 +342,47 @@ def evaluate_zero_shot(
             if max_steps is not None and batch_idx >= max_steps:
                 print(f"Debug cutoff: stopping evaluation after {max_steps} batches")
                 break
-                
-            # Get control sets
-            X_ctrl = batch['control_expr'].cuda()  # Raw expression data
-            target_genes = batch['target_gene']
-            target_gene_idx = batch['target_gene_idx'].cuda()
-            log2fc = batch['log2fc'].cuda()
             
-            # Tokenize control expression data
-            B, S, N = X_ctrl.shape
+            # Process batch data
+            X_pert = batch['perturbed_expr'].cuda()
+            X_ctrl = batch['control_expr'].cuda()
+            
+            B, S, N = X_pert.shape  # (batch, set_size, n_genes)
+            
+            # Tokenize the expression data
+            X_pert_tokens = torch.zeros_like(X_pert, dtype=torch.long)
             X_ctrl_tokens = torch.zeros_like(X_ctrl, dtype=torch.long)
             for b in range(B):
                 for s in range(S):
+                    X_pert_tokens[b, s] = tokenizer(X_pert[b, s])
                     X_ctrl_tokens[b, s] = tokenizer(X_ctrl[b, s])
-            X_ctrl = X_ctrl_tokens
             
-            # Process batch information for validation
-            if batch_to_idx is not None and 'control_batches' in batch:
-                control_batch_names = batch['control_batches']  # List of lists
+            X_pert_flat = X_pert_tokens.view(B * S, N)
+            
+            # Process conditioning information
+            target_gene_idx = batch['target_gene_idx']
+            if isinstance(target_gene_idx, list):
+                target_gene_idx = torch.tensor(target_gene_idx)
+            target_gene_idx = target_gene_idx.cuda()
+            
+            # Compute perturbation signs
+            log2fc = batch['log2fc'].cuda()
+            if log2fc.dim() > 1:
+                log2fc_avg = log2fc.mean(dim=-1)
+            else:
+                log2fc_avg = log2fc
+            perturb_sign = torch.sign(log2fc_avg).long()
+            
+            # Expand conditioning to match batch
+            target_gene_idx = target_gene_idx.unsqueeze(1).expand(-1, S).reshape(-1)
+            log2fc_avg = log2fc_avg.unsqueeze(1).expand(-1, S).reshape(-1)
+            perturb_sign = perturb_sign.unsqueeze(1).expand(-1, S).reshape(-1)
+            
+            # Process batch information
+            if batch_to_idx is not None and 'pert_batches' in batch:
+                pert_batch_names = batch['pert_batches']
                 batch_indices = []
-                for sample_batches in control_batch_names:
+                for sample_batches in pert_batch_names:
                     for batch_name in sample_batches:
                         batch_idx = batch_to_idx.get(batch_name, 0)
                         batch_indices.append(batch_idx)
@@ -369,41 +390,31 @@ def evaluate_zero_shot(
             else:
                 batch_indices = None
             
-            # Compute perturb_sign from log2fc like in training
-            if log2fc.dim() > 1:
-                log2fc_avg = log2fc.mean(dim=-1)
-            else:
-                log2fc_avg = log2fc
-            perturb_sign = torch.sign(log2fc_avg).long()
+            # Expand control sets to match flattened perturbed cells
+            X_ctrl_expanded = X_ctrl_tokens.unsqueeze(1).expand(-1, S, -1, -1)  # (B, S, S, N)
+            X_ctrl_flat = X_ctrl_expanded.reshape(B * S, S, N)  # (B*S, S, N)
             
-            # Generate perturbed cells
-            generated = diffusion.p_sample_loop(
-                model,
-                shape=(B * S, N),  # Generate S cells per perturbation
-                control_set=X_ctrl,
-                target_gene_idx=target_gene_idx.unsqueeze(1).expand(-1, S).reshape(-1),
-                perturb_magnitude=log2fc_avg.unsqueeze(1).expand(-1, S).reshape(-1),  # Fixed: use log2fc_avg
-                perturb_sign=perturb_sign.unsqueeze(1).expand(-1, S).reshape(-1),
+            # Compute loss
+            loss = diffusion.compute_loss(
+                model, 
+                X_pert_flat,
+                control_set=X_ctrl_flat,
+                target_gene_idx=target_gene_idx,
+                perturb_magnitude=log2fc_avg,
+                perturb_sign=perturb_sign,
                 batch_idx=batch_indices,
-                temperature=1.0,
-                device='cuda'
+                step=epoch  # Use epoch as step for validation
             )
             
-            # Reshape back to sets
-            generated = generated.view(B, S, N)
-            
-            # Store results
-            all_predictions.append(generated.cpu())
-            all_genes.extend(target_genes)
+            val_losses.append(loss.item())
     
     # Compute metrics
-    batches_evaluated = min(len(val_dataloader), max_steps) if max_steps is not None else len(val_dataloader)
+    avg_val_loss = np.mean(val_losses) if val_losses else 0.0
     metrics = {
-        'zero_shot_genes_evaluated': len(set(all_genes)),
-        'zero_shot_batches_evaluated': batches_evaluated,
+        'val_loss': avg_val_loss,
+        'val_batches_evaluated': len(val_losses),
         'epoch': epoch
     }
-    
     return metrics
 
 
@@ -479,8 +490,9 @@ def main():
         warmup_steps=5000,
 
         # Pretrain data dir  
-        pretrain_data_dir = "data/scRNA_1e5/processed",
-        hvg_info_path = "some.txt",
+        pretrain_data_dir = "/scRNA/processed",
+        finetune_data_path = "/vcc_data/adata_Training.h5ad",
+        hvg_info_path = "data/hvg.txt",
         
         # Epochs
         pretrain_epochs=0,
@@ -493,9 +505,9 @@ def main():
         vcc_eval_interval=5000,
         
         # Debug - set to None for full training, or number of steps for quick debugging
-        debug_pretrain_max_steps = 500000,
+        debug_pretrain_max_steps = 10,
         debug_finetune_max_steps = 10,
-        debug_eval_max_steps = 1 # equivalent to validation set's target perturb genes
+        debug_eval_max_steps = 10 # equivalent to validation set's target perturb genes
     )
     
     # Initialize wandb
@@ -551,6 +563,7 @@ def main():
     
     # Create VCC train and validation dataloaders
     (vcc_dataset, vcc_dataloader), (val_dataset, val_dataloader) = create_train_val_dataloaders(
+        adata_path=config.finetune_data_path,
         hvg_gene_ids=hvg_gene_ensemble,
         set_size=config.vcc_set_size,
         batch_size=config.vcc_batch_size,
@@ -621,7 +634,7 @@ def main():
     print("\n=== Phase 2: Fine-tuning with Control Sets ===")
     print(f"Using batch_size={config.pretrain_batch_size} optimized for 2000-gene sequences")
     
-    for epoch in range(config.pretrain_epochs, config.pretrain_epochs + config.finetune_epochs):
+    for epoch in range(config.finetune_epochs):
         global_step = train_epoch_st(
             model, diffusion, vcc_dataloader, optimizer, config,
             epoch, global_step, total_training_steps,
@@ -635,13 +648,13 @@ def main():
         # Evaluate on validation set (20% of training genes)
         if epoch % 5 == 0:
             print("\n=== Validation Set Evaluation ===")
-            val_metrics = evaluate_zero_shot(
-                model, diffusion, val_dataloader, config,
-                vcc_gene_to_idx, epoch, tokenizer, batch_to_idx,
+            val_metrics = evaluate_validation(
+                model, diffusion, val_dataloader, optimizer, config,
+                epoch, tokenizer, batch_to_idx,
                 max_steps=config.debug_eval_max_steps
             )
-            print(f"Validation genes evaluated: {val_metrics['zero_shot_genes_evaluated']}")
-            wandb.log({f"val_{k}": v for k, v in val_metrics.items()})
+            print(f"Validation loss: {val_metrics['val_loss']:.4f} ({val_metrics['val_batches_evaluated']} batches)")
+            wandb.log(val_metrics)
             
             # TODO Evaluate true zero-shot performance on unseen genes
     

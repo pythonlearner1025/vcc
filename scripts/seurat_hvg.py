@@ -271,8 +271,8 @@ def main(args):
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser(description="Unified HVG selection (Seurat v3)")
-    p.add_argument("--scrna_dir", default="/Users/minjunes/vcc/data/scRNA/processed", help="Directory with batch_*.h5")
-    p.add_argument("--finetune_path", default="/Users/minjunes/vcc/data/vcc_data/adata_Training.h5ad", help="Finetune .h5ad file")
+    p.add_argument("--scrna_dir", default="/scRNA/processed", help="Directory with batch_*.h5")
+    p.add_argument("--finetune_path", default="/vcc_data/adata_Training.h5ad", help="Finetune .h5ad file")
     p.add_argument("--output_dir", default=".")
     p.add_argument("--whitelist_path", help="Gene list to force‑include")
     p.add_argument("--n_hvgs", type=int, default=2000, help="#HVGs to keep")
@@ -285,7 +285,7 @@ if __name__ == "__main__":
     p.add_argument(
         "--max_cells_finetune",
         type=int,
-        default=50_000,  # Changed from 1_000_000 to 50_000
+        default=500_000,  # Changed from 1_000_000 to 50_000
         help="Upper bound on sampled fine-tuning cells to load (default: 50k for memory efficiency)",
     )
     main(p.parse_args())

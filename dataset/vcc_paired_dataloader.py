@@ -69,13 +69,18 @@ class VCCPairedDataset(Dataset):
         
         # Create mapping from genes to their HVG indices
         self.gene_to_hvg_idx = {}
-        for i, gene_id in enumerate(self.hvg_gene_ids):
-            if gene_id in self.gene_id_to_name:
-                gene_name = self.gene_id_to_name[gene_id]
-                self.gene_to_hvg_idx[gene_name] = i
+        for idx, gene_id in enumerate(self.hvg_gene_ids):
+            gene_name = self.gene_id_to_name.get(gene_id, None)
+            if gene_name:
+                self.gene_to_hvg_idx[gene_name] = idx
         
-        # Pre-compute samples for each gene
+        # Debug: Check how many target genes are in HVG list
+        genes_in_hvg = [g for g in self.target_genes if g in self.gene_to_hvg_idx]
+        print(f"  -> {len(genes_in_hvg)}/{len(self.target_genes)} target genes are in HVG list")
+        
+        # Prepare samples
         self._prepare_samples()
+        print(f"Created {len(self.samples)} samples from {len(self.target_genes)} genes")
         
     def _filter_to_hvgs(self, hvg_gene_ids: List[str]):
         """Filter adata to only include HVG genes."""
@@ -103,10 +108,12 @@ class VCCPairedDataset(Dataset):
     def _prepare_samples(self):
         """Pre-compute sample indices for each gene."""
         self.samples = []
+        skipped_genes = []
         
         for gene in self.target_genes:
             # Skip if gene not in our HVG list
             if gene not in self.gene_to_hvg_idx:
+                skipped_genes.append((gene, "not in HVG"))
                 continue
                 
             # Get perturbed cells for this gene
@@ -114,6 +121,7 @@ class VCCPairedDataset(Dataset):
             pert_cells = self.adata.obs.index[pert_mask].values
             
             if len(pert_cells) < self.set_size:
+                skipped_genes.append((gene, f"only {len(pert_cells)} perturbed cells"))
                 warnings.warn(f"Gene {gene} has only {len(pert_cells)} cells, skipping")
                 continue
             
@@ -126,6 +134,7 @@ class VCCPairedDataset(Dataset):
             ctrl_cells = self.adata.obs.index[ctrl_mask].values
             
             if len(ctrl_cells) < self.set_size:
+                skipped_genes.append((gene, f"only {len(ctrl_cells)} control cells"))
                 warnings.warn(f"Not enough control cells for gene {gene}, skipping")
                 continue
             
@@ -144,7 +153,12 @@ class VCCPairedDataset(Dataset):
                     'ctrl_batches': self.adata.obs.loc[ctrl_sample, 'batch'].values,
                 })
         
-        print(f"Created {len(self.samples)} samples from {len(self.target_genes)} genes")
+        if skipped_genes:
+            print(f"  -> Skipped {len(skipped_genes)} genes:")
+            for gene, reason in skipped_genes[:5]:  # Show first 5
+                print(f"     - {gene}: {reason}")
+            if len(skipped_genes) > 5:
+                print(f"     ... and {len(skipped_genes) - 5} more")
         
     def __len__(self):
         return len(self.samples)
@@ -177,7 +191,7 @@ class VCCPairedDataset(Dataset):
             'control_expr': ctrl_expr,
             'target_gene': sample['gene'],
             'target_gene_idx': sample['gene_idx'],
-            'log2fc': torch.tensor(log2fc).float(),
+            'log2fc': torch.tensor(float(log2fc), dtype=torch.float32),
             'pert_batches': sample['pert_batches'].tolist(),
             'ctrl_batches': sample['ctrl_batches'].tolist(),
         }

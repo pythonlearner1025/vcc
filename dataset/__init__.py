@@ -7,10 +7,8 @@ from .download import ScRNADownloader
 
 from .vcc_paired_dataloader import (
     VCCPairedDataset,
-    VCCZeroShotDataset,
     create_vcc_paired_dataloader,
     create_train_val_dataloaders,
-    create_zero_shot_dataloader
 )
 from .scrna_hvg_dataset import (
     ScRNADatasetWithHVGs,
@@ -21,10 +19,8 @@ __all__ = [
     'ScRNADataset',
     'ScRNADownloader',
     'VCCPairedDataset',
-    'VCCZeroShotDataset',
     'create_vcc_paired_dataloader',
     'create_train_val_dataloaders',
-    'create_zero_shot_dataloader',
     'ScRNADatasetWithHVGs',
     'create_scrna_hvg_dataloader'
 ]
