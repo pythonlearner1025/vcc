@@ -17,14 +17,14 @@ class ScRNADatasetWithHVGs(Dataset):
     def __init__(
         self, 
         data_dir: str, 
-        hvg_info_path: str,
+        hvg_genes: List[str],
         transform=None,
         use_cache: bool = True
     ):
         """
         Args:
             data_dir: Directory containing preprocessed scRNA batch files
-            hvg_info_path: Path to cross_dataset_hvg_info.json
+            hvg_genes: List of Ensembl IDs for HVGs
             transform: Optional transformation to apply
             use_cache: Whether to cache gene remapping
         """
@@ -32,13 +32,9 @@ class ScRNADatasetWithHVGs(Dataset):
         self.transform = transform
         self.use_cache = use_cache
         
-        # Load HVG info
-        with open(hvg_info_path, 'r') as f:
-            hvg_info = json.load(f)
-        
-        self.hvg_names = hvg_info['hvg_names']
-        self.n_hvgs = len(self.hvg_names)
-        self.scrna_to_hvg = {int(k): v for k, v in hvg_info['scrna_to_hvg'].items()}
+        # Store HVG genes
+        self.hvg_genes = hvg_genes
+        self.n_hvgs = len(hvg_genes)
         
         # Find all batch files
         self.batch_files = sorted(self.data_dir.glob("batch_*.h5"))
@@ -50,6 +46,18 @@ class ScRNADatasetWithHVGs(Dataset):
         with open(config_path, 'r') as f:
             config = json.load(f)
         self.original_genes = config['gene_list']
+        
+        # Create mapping from original gene indices to HVG indices
+        self.scrna_to_hvg = {}
+        hvg_set = set(hvg_genes)
+        for orig_idx, gene_id in enumerate(self.original_genes):
+            if gene_id in hvg_set:
+                hvg_idx = hvg_genes.index(gene_id)
+                self.scrna_to_hvg[orig_idx] = hvg_idx
+        
+        # Extract indices for efficient slicing
+        self.original_indices = sorted(self.scrna_to_hvg.keys())
+        self.hvg_indices = [self.scrna_to_hvg[idx] for idx in self.original_indices]
         
         # Count total cells and build index
         self.batch_starts = [0]
@@ -78,20 +86,19 @@ class ScRNADatasetWithHVGs(Dataset):
         print(f"  HVG genes: {self.n_hvgs}")
         print(f"  Genes mapped to HVGs: {len(self.scrna_to_hvg)}")
     
-    def _remap_genes(self, X: np.ndarray) -> np.ndarray:
-        """Remap gene expression from original indices to HVG indices."""
-        # Create remapped array with zeros
-        X_hvg = np.zeros((X.shape[0], self.n_hvgs), dtype=X.dtype)
+    def _extract_hvg_columns(self, X: np.ndarray) -> np.ndarray:
+        """Extract only HVG columns from the full expression matrix."""
+        # Extract relevant columns
+        X_subset = X[:, self.original_indices]
         
-        # Copy values for genes that are in HVG set
-        for orig_idx, hvg_idx in self.scrna_to_hvg.items():
-            if orig_idx < X.shape[1]:  # Check bounds
-                X_hvg[:, hvg_idx] = X[:, orig_idx]
+        # Create final HVG matrix with proper ordering
+        X_hvg = np.zeros((X.shape[0], self.n_hvgs), dtype=X.dtype)
+        X_hvg[:, self.hvg_indices] = X_subset
         
         return X_hvg
     
     def _load_batch(self, batch_idx: int) -> np.ndarray:
-        """Load and remap a batch of data."""
+        """Load and extract HVG columns from a batch of data."""
         # Check cache
         if self._cache is not None and batch_idx in self._cache:
             return self._cache[batch_idx]
@@ -101,8 +108,8 @@ class ScRNADatasetWithHVGs(Dataset):
         with h5py.File(batch_file, 'r') as f:
             X = f['X'][:]
         
-        # Remap to HVG indices
-        X_hvg = self._remap_genes(X)
+        # Extract HVG columns
+        X_hvg = self._extract_hvg_columns(X)
         
         # Cache if enabled
         if self._cache is not None:
@@ -135,8 +142,8 @@ class ScRNADatasetWithHVGs(Dataset):
         return x
     
     def get_gene_names(self) -> List[str]:
-        """Get HVG gene names in order."""
-        return self.hvg_names
+        """Get HVG gene names (Ensembl IDs) in order."""
+        return self.hvg_genes
     
     def clear_cache(self):
         """Clear the batch cache to free memory."""
@@ -145,8 +152,8 @@ class ScRNADatasetWithHVGs(Dataset):
 
 
 def create_scrna_hvg_dataloader(
-    data_dir: str = "data/scRNA_1e5/processed",
-    hvg_info_path: str = "data/vcc_data/cross_dataset_hvg_info.json",
+    data_dir: str,
+    hvg_genes: List[str],
     batch_size: int = 32,
     shuffle: bool = True,
     num_workers: int = 4,
@@ -157,18 +164,18 @@ def create_scrna_hvg_dataloader(
     
     Args:
         data_dir: Directory containing preprocessed scRNA data
-        hvg_info_path: Path to cross-dataset HVG info file
+        hvg_genes: List of Ensembl IDs for HVGs
         batch_size: Batch size for DataLoader
         shuffle: Whether to shuffle data
         num_workers: Number of workers for DataLoader
         use_cache: Whether to cache remapped batches
         
     Returns:
-        DataLoader instance
+        Tuple of (dataset, dataloader)
     """
     dataset = ScRNADatasetWithHVGs(
         data_dir=data_dir,
-        hvg_info_path=hvg_info_path,
+        hvg_genes=hvg_genes,
         use_cache=use_cache
     )
     

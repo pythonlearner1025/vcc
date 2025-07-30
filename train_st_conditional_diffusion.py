@@ -23,16 +23,10 @@ from models.diffusion import (
     PartialMaskingDiffusion,
     create_optimizer,
     cosine_lr_schedule,
-    prepare_perturbation_conditioning,
-    create_gene_mapping
 )
 # Updated imports for cross-dataset HVGs
 from dataset.scrna_hvg_dataset import ScRNADatasetWithHVGs, create_scrna_hvg_dataloader
-from dataset import (
-    create_vcc_paired_dataloader,
-    create_vcc_validation_dataloader,
-    VCCDataset
-)
+from dataset.vcc_paired_dataloader import create_train_val_dataloaders, create_zero_shot_dataloader
 
 class TokenizedScRNADataset(Dataset):
     """Wrapper around ScRNADatasetWithHVGs that applies tokenization."""
@@ -122,6 +116,7 @@ def train_epoch_st(
     epoch: int,
     global_step: int,
     total_training_steps: int,
+    tokenizer = None,
     batch_to_idx: Optional[Dict[str, int]] = None,
     use_control_sets: bool = True,
     mixed_training: bool = True,
@@ -139,6 +134,7 @@ def train_epoch_st(
         epoch: Current epoch number
         global_step: Global step counter
         total_training_steps: Total training steps for LR scheduling
+        tokenizer: Tokenizer function to convert expression values to tokens (needed for VCC data)
         batch_to_idx: Mapping from batch names to indices for batch conditioning
         use_control_sets: Whether to use control set conditioning
         mixed_training: Whether to mix conditioned and unconditioned batches
@@ -168,7 +164,22 @@ def train_epoch_st(
             X_ctrl = batch['control_expr'].cuda() if use_control_sets else None
             
             B, S, N = X_pert.shape  # (batch, set_size, n_genes)
-            X_pert_flat = X_pert.view(B * S, N)
+            
+            # Tokenize the expression data
+            # Note: tokenizer is expected to be passed to train_epoch_st
+            X_pert_tokens = torch.zeros_like(X_pert, dtype=torch.long)
+            for b in range(B):
+                for s in range(S):
+                    X_pert_tokens[b, s] = tokenizer(X_pert[b, s])
+                    
+            if X_ctrl is not None:
+                X_ctrl_tokens = torch.zeros_like(X_ctrl, dtype=torch.long)
+                for b in range(B):
+                    for s in range(S):
+                        X_ctrl_tokens[b, s] = tokenizer(X_ctrl[b, s])
+                X_ctrl = X_ctrl_tokens
+            
+            X_pert_flat = X_pert_tokens.view(B * S, N)
             
             # Process conditioning information
             target_gene_idx = batch['target_gene_idx']
@@ -296,6 +307,7 @@ def evaluate_zero_shot(
     config: ConditionalModelConfig,
     gene_to_idx: Dict[str, int],
     epoch: int,
+    tokenizer = None,
     batch_to_idx: Optional[Dict[str, int]] = None,
     max_steps: Optional[int] = None,
 ) -> Dict[str, float]:
@@ -303,6 +315,14 @@ def evaluate_zero_shot(
     Evaluate zero-shot perturbation prediction on validation genes.
     
     Args:
+        model: The diffusion model
+        diffusion: The diffusion process handler
+        val_dataloader: Validation data loader
+        config: Model configuration
+        gene_to_idx: Mapping from gene names to indices
+        epoch: Current epoch number
+        tokenizer: Tokenizer function to convert expression values to tokens
+        batch_to_idx: Mapping from batch names to indices for batch conditioning
         max_steps: Maximum number of batches to evaluate (for debugging), None for full dataset
     """
     model.eval()
@@ -324,10 +344,18 @@ def evaluate_zero_shot(
                 break
                 
             # Get control sets
-            X_ctrl = batch['control_expr'].cuda()  # Fixed: was 'X_ctrl_tokens'
+            X_ctrl = batch['control_expr'].cuda()  # Raw expression data
             target_genes = batch['target_gene']
             target_gene_idx = batch['target_gene_idx'].cuda()
             log2fc = batch['log2fc'].cuda()
+            
+            # Tokenize control expression data
+            B, S, N = X_ctrl.shape
+            X_ctrl_tokens = torch.zeros_like(X_ctrl, dtype=torch.long)
+            for b in range(B):
+                for s in range(S):
+                    X_ctrl_tokens[b, s] = tokenizer(X_ctrl[b, s])
+            X_ctrl = X_ctrl_tokens
             
             # Process batch information for validation
             if batch_to_idx is not None and 'control_batches' in batch:
@@ -347,8 +375,6 @@ def evaluate_zero_shot(
             else:
                 log2fc_avg = log2fc
             perturb_sign = torch.sign(log2fc_avg).long()
-            
-            B, S, N = X_ctrl.shape
             
             # Generate perturbed cells
             generated = diffusion.p_sample_loop(
@@ -415,7 +441,7 @@ def main():
         n_head=8,
         n_layer=8,
         ffn_mult=8,
-        vocab_size=64,
+        vocab_size=128,
         n_genes=2000,
         
         # Conditioning
@@ -454,6 +480,7 @@ def main():
 
         # Pretrain data dir  
         pretrain_data_dir = "data/scRNA_1e5/processed",
+        hvg_info_path = "some.txt",
         
         # Epochs
         pretrain_epochs=0,
@@ -487,24 +514,21 @@ def main():
     
     # Create tokenizer
     tokenizer, detokenizer = create_simple_tokenizer(config.vocab_size)
-    
-    # Path to cross-dataset HVG info
-    hvg_info_path = "data/vcc_data/cross_dataset_hvg_info.json"
-    
-    # Check if cross-dataset HVG info exists
-    if not Path(hvg_info_path).exists():
-        print(f"\nERROR: Cross-dataset HVG info not found at {hvg_info_path}")
-        print("Please run: python scripts/compute_cross_dataset_hvgs.py")
-        return
-    
-    # Create dataloaders
+
+    # TODO the hvg should be a single .txt file of ENSEMBLIDs
+    # TODO change scran_hvg.py to output ENSEMBLIDs
+    # TODO normalize counts by UMI before tokenizing in dataloader!
+
+        # Load cross-dataset HVG info to get gene names
+    with open(config.hvg_info_path, 'r') as f:
+        hvg_gene_ensemble = [line.strip() for line in f.readlines()]
+
     print("\n=== Creating Dataloaders ===")
-    
     # Create pretrain dataloader using cross-dataset HVGs
     print("Creating scRNA pretrain dataloader with cross-dataset HVGs...")
     scrna_dataset, _ = create_scrna_hvg_dataloader(
         data_dir=config.pretrain_data_dir,
-        hvg_info_path=hvg_info_path,
+        hvg_genes=hvg_gene_ensemble,
         batch_size=1,  # We'll batch in the wrapper
         shuffle=False,
         num_workers=0,
@@ -525,36 +549,20 @@ def main():
     
     print(f"Pretrain dataset: {len(pretrain_dataset):,} cells, {scrna_dataset.n_hvgs} HVG genes")
     
-    # VCC paired dataloader for fine-tuning (already uses HVGs from hvg_info.json)
-    # MEMORY NOTE: set_size=16 means each batch has batch_size × 16 = total sequences
-    # With batch_size=2, set_size=16: 32 sequences of 2000 tokens each
-    # Attention memory: 32 × 8 × 2000² = ~1GB (manageable)
-    vcc_dataset, vcc_dataloader = create_vcc_paired_dataloader(
+    # Create VCC train and validation dataloaders
+    (vcc_dataset, vcc_dataloader), (val_dataset, val_dataloader) = create_train_val_dataloaders(
+        hvg_gene_ids=hvg_gene_ensemble,
         set_size=config.vcc_set_size,
         batch_size=config.vcc_batch_size,
-        tokenizer=tokenizer,
+        n_samples_per_gene_train=10,  # Multiple samples per gene for training
+        n_samples_per_gene_val=1,      # Single sample per gene for validation
+        train_split=0.8,
         num_workers=4,
-        match_by_batch=True,
-        use_hvgs=True  # Uses hvg_info.json which should now be cross-dataset
+        random_seed=42
     )
-    
-    # VCC validation dataloader
-    val_dataset, val_dataloader = create_vcc_validation_dataloader(
-        set_size=config.vcc_set_size,
-        batch_size=config.vcc_batch_size,
-        tokenizer=tokenizer,
-        n_samples_per_gene=1,
-        use_hvgs=True,  # Uses hvg_info.json which should now be cross-dataset
-        num_workers=0  # Disable multiprocessing to avoid worker issues
-    )
-    
-    # Load cross-dataset HVG info to get gene names
-    with open(hvg_info_path, 'r') as f:
-        hvg_info = json.load(f)
-    hvg_genes = hvg_info['hvg_names']
     
     # Create gene to index mapping
-    vcc_gene_to_idx = {gene: idx for idx, gene in enumerate(hvg_genes)}
+    vcc_gene_to_idx = {gene: idx for idx, gene in enumerate(hvg_gene_ensemble)}
     
     # Create batch name to index mapping for conditioning
     # Get unique batch names from the VCC dataset
@@ -575,8 +583,6 @@ def main():
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     checkpoint_dir = Path(f"checkpoints/run_{timestamp}")
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    
-    # Save config
     config_path = checkpoint_dir / "config.json"
     with open(config_path, "w") as f:
         json.dump(config.__dict__, f, indent=2)
@@ -586,12 +592,12 @@ def main():
     if config.pretrain_epochs > 0:
         print(f"\n=== Phase 1: Pretraining on scRNA data ({config.pretrain_epochs} epochs) ===")
         print(f"Using {len(pretrain_dataset):,} cells for pretraining")
-        print("Gene indices are now consistent with VCC fine-tuning!")
         
         for epoch in range(config.pretrain_epochs):
             global_step = train_epoch_st(
                 model, diffusion, pretrain_dataloader, optimizer, config,
                 epoch, global_step, total_training_steps,
+                tokenizer=None,  # Pretrain data is already tokenized
                 batch_to_idx=None,  # No batch conditioning for pretraining
                 use_control_sets=False,  # No control sets in pretraining
                 mixed_training=False,
@@ -613,30 +619,31 @@ def main():
     
     # Phase 2: Fine-tuning with control sets
     print("\n=== Phase 2: Fine-tuning with Control Sets ===")
-    print("Using same HVG gene indices as pretraining - transfer learning enabled!")
     print(f"Using batch_size={config.pretrain_batch_size} optimized for 2000-gene sequences")
     
     for epoch in range(config.pretrain_epochs, config.pretrain_epochs + config.finetune_epochs):
         global_step = train_epoch_st(
             model, diffusion, vcc_dataloader, optimizer, config,
             epoch, global_step, total_training_steps,
+            tokenizer=tokenizer,  # VCC data needs tokenization
             batch_to_idx=batch_to_idx,  # Pass batch mapping for conditioning
             use_control_sets=True,
             mixed_training=True,  # Mix conditioned and unconditioned batches
             max_steps=config.debug_finetune_max_steps
         )
         
-        # Evaluate zero-shot performance
+        # Evaluate on validation set (20% of training genes)
         if epoch % 5 == 0:
-            print("\n=== Zero-shot Evaluation ===")
-            metrics = evaluate_zero_shot(
+            print("\n=== Validation Set Evaluation ===")
+            val_metrics = evaluate_zero_shot(
                 model, diffusion, val_dataloader, config,
-                vcc_gene_to_idx, epoch, batch_to_idx,
+                vcc_gene_to_idx, epoch, tokenizer, batch_to_idx,
                 max_steps=config.debug_eval_max_steps
             )
+            print(f"Validation genes evaluated: {val_metrics['zero_shot_genes_evaluated']}")
+            wandb.log({f"val_{k}": v for k, v in val_metrics.items()})
             
-            print(f"Zero-shot genes evaluated: {metrics['zero_shot_genes_evaluated']}")
-            wandb.log(metrics)
+            # TODO Evaluate true zero-shot performance on unseen genes
     
     # Final save
     final_checkpoint = checkpoint_dir / "checkpoint_st_final.pt"

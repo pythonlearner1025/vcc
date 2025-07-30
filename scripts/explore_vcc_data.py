@@ -279,7 +279,7 @@ def save_analysis_summary(adata, val_df, output_path: str):
 
 def main():
     # VCC data path
-    vcc_path = Path("/workspace/vcc/data/vcc_data")
+    vcc_path = Path("data/vcc_data")
     
     # Check if path exists
     if not vcc_path.exists():

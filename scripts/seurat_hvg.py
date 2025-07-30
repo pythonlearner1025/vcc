@@ -63,14 +63,27 @@ def load_whitelist(path: str | None) -> Set[str]:
 
 def load_finetune(path: str, max_cells: int = None) -> ad.AnnData:
     logger.info("Loading finetune dataset: %s", path)
-    adata = sc.read_h5ad(path, backed=None)  # fully in‑memory (300k cells)
-    logger.info("Finetune cells: %d  genes: %d", *adata.shape)
     
-    # Subsample if requested
-    if max_cells is not None and adata.n_obs > max_cells:
-        logger.info("Subsampling finetune data from %d to %d cells", adata.n_obs, max_cells)
-        indices = np.random.choice(adata.n_obs, size=max_cells, replace=False)
-        adata = adata[indices, :].copy()
+    # First, check the size of the dataset
+    adata_info = sc.read_h5ad(path, backed='r')
+    n_cells_total = adata_info.n_obs
+    logger.info("Finetune dataset size: %d cells  %d genes", n_cells_total, adata_info.n_vars)
+    
+    # If we need to subsample, do it efficiently
+    if max_cells is not None and n_cells_total > max_cells:
+        logger.info("Subsampling finetune data from %d to %d cells", n_cells_total, max_cells)
+        indices = np.random.choice(n_cells_total, size=max_cells, replace=False)
+        indices = np.sort(indices)  # Sort for efficient h5 access
+        
+        # Load only the sampled cells
+        adata = adata_info[indices, :].to_memory()
+        adata_info.file.close()  # Close the backed file
+    else:
+        # If no subsampling or dataset is small enough, load fully
+        adata_info.file.close()
+        adata = sc.read_h5ad(path, backed=None)
+    
+    logger.info("Loaded finetune cells: %d  genes: %d", *adata.shape)
     
     # Use Ensembl IDs if available for consistent gene matching
     if 'gene_id' in adata.var.columns:
@@ -79,6 +92,10 @@ def load_finetune(path: str, max_cells: int = None) -> ad.AnnData:
         # Use Ensembl IDs as var_names for intersection
         adata.var_names = adata.var['gene_id']
         logger.info("Using Ensembl IDs from 'gene_id' column for gene matching")
+    
+    # Ensure data is in CSR format for memory efficiency
+    if hasattr(adata.X, 'tocsr'):
+        adata.X = adata.X.tocsr()
     
     return adata
 
@@ -139,6 +156,15 @@ def load_pretrain_sample(scrna_dir: str, max_cells: int) -> ad.AnnData:
 
 def compute_hvgs(adata: ad.AnnData, n_top: int) -> List[str]:
     logger.info("Running scanpy.pp.highly_variable_genes (seurat_v3) …")
+    
+    # Ensure we're working with sparse data in CSR format
+    if hasattr(adata.X, 'tocsr'):
+        adata.X = adata.X.tocsr()
+    
+    # Create a copy of just the data we need to avoid modifying views
+    if adata.is_view:
+        adata = adata.copy()
+    
     sc.pp.highly_variable_genes(
         adata,
         n_top_genes=n_top,
@@ -190,6 +216,8 @@ def merge_hvg_lists(
 # ---------------------------------------------------------------------
 
 def main(args):
+    import gc  # Import garbage collector
+    
     whitelist = load_whitelist(args.whitelist_path)
 
     finetune = load_finetune(args.finetune_path, max_cells=args.max_cells_finetune)
@@ -214,8 +242,19 @@ def main(args):
     pretrain = pretrain[:, common_genes]
     finetune = finetune[:, common_genes]
 
+    # Compute HVGs for pretrain
     hvgs_pre = compute_hvgs(pretrain, args.n_hvgs)
+    
+    # Clean up pretrain memory before computing finetune HVGs
+    del pretrain
+    gc.collect()
+    
+    # Compute HVGs for finetune
     hvgs_fine = compute_hvgs(finetune, args.n_hvgs)
+    
+    # Clean up finetune memory
+    del finetune
+    gc.collect()
 
     final_hvgs = merge_hvg_lists(
         hvgs_pre, hvgs_fine, whitelist, n_final=args.n_hvgs
@@ -246,7 +285,7 @@ if __name__ == "__main__":
     p.add_argument(
         "--max_cells_finetune",
         type=int,
-        default=1_000_000,
-        help="Upper bound on sampled fine-tuning cells to load",
+        default=50_000,  # Changed from 1_000_000 to 50_000
+        help="Upper bound on sampled fine-tuning cells to load (default: 50k for memory efficiency)",
     )
     main(p.parse_args())

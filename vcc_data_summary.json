@@ -1,0 +1,16 @@
+{
+  "training_data": {
+    "n_cells": 221273,
+    "n_genes": 18080,
+    "n_control_cells": 38176,
+    "n_perturbed_genes": 150,
+    "n_batches": 48,
+    "sparsity": 0.5169357005795387
+  },
+  "validation_data": {
+    "n_target_genes": 50,
+    "total_cells_to_predict": 60751,
+    "mean_cells_per_gene": 1215.02,
+    "mean_umi_per_cell": 54082.48
+  }
+}
