@@ -60,7 +60,6 @@ def load_whitelist(path: str | None) -> Set[str]:
     logger.info("Whitelist size: %d genes", len(genes))
     return genes
 
-
 def load_finetune(path: str, max_cells: int = None) -> ad.AnnData:
     logger.info("Loading finetune dataset: %s", path)
     

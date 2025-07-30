@@ -11,7 +11,7 @@
 
 # Installation
 
- etup.sh 
+setup.sh 
 
 # Data Download
 

@@ -1,1 +1,1 @@
-pip install numpy pandas scanpy gcsfs pyarrow h5py tqdm torch matplotlib seaborn wandb nvitop
+pip install numpy pandas scanpy[skmisc] gcsfs pyarrow h5py tqdm torch matplotlib seaborn wandb nvitop
