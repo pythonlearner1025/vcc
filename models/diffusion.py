@@ -13,6 +13,13 @@ import torch.nn.functional as F
 from typing import Dict, List, Tuple, Optional
 from dataclasses import dataclass
 
+# Try to import flash_attn
+try:
+    from flash_attn import flash_attn_func
+    HAS_FLASH_ATTN = True
+except ImportError:
+    HAS_FLASH_ATTN = False
+
 @dataclass
 class ConditionalModelConfig:
     """Configuration for conditional diffusion model."""
@@ -27,9 +34,10 @@ class ConditionalModelConfig:
     # Conditioning
     n_total_genes: int = 36601  # Total genes in vocabulary for embedding
     gene_embed_dim: int = 128
-    perturb_sign_dim: int = 3  # Embedding dimension for perturbation direction
-    perturb_magnitude_dim: int = 64  # Hidden dimension for magnitude processing
-    magnitude_clip: float = 5.0  # Clip log2 fold changes to [-5, 5]
+    
+    # ESM2 embeddings
+    esm_matrix_path: str = "esm_all.pt"  # Path to precomputed ESM2 embeddings
+    esm_proj_dim: int = 256  # Projection dimension for ESM2 embeddings
     
     # Batch conditioning
     # TODO get true number of batches in VCC
@@ -45,6 +53,13 @@ class ConditionalModelConfig:
     n_timesteps: int = 10
     mask_ratio: float = 0.30  # Fraction of genes to mask (BERT-style)
     schedule: str = "cosine"
+    
+    # Masking parameters
+    pretrain_mask_ratio: float = 0.20  # Fixed mask ratio for pretraining
+    finetune_mask_ratio_start: float = 0.30  # Starting mask ratio for finetuning
+    finetune_mask_ratio_end: float = 0.90  # End mask ratio for finetuning (curriculum)
+    finetune_mask_ratio_steps: int = 100_000  # Steps to ramp from start to end
+    finetune_full_mask_prob: float = 0.10  # Probability of 100% masking during finetune
     
     # Training parameters
     pretrain_batch_size: int = 32
@@ -68,9 +83,9 @@ class ConditionalModelConfig:
     save_every: int = 5000
     vcc_eval_interval: int = 5000
 
-    debug_pretrain_max_steps: Optional[int] = None 
-    debug_finetune_max_steps: Optional[int] = None
-    debug_eval_max_steps: int = 50
+    debug_pretrain_max_cells: Optional[int] = None 
+    debug_finetune_max_cells: Optional[int] = None
+    debug_eval_max_cells: int = 3200  # ~50 batches with batch_size=64
     
     @property
     def n_params(self) -> int:
@@ -79,8 +94,6 @@ class ConditionalModelConfig:
         params += self.n_genes * self.dim  # Position embedding
         params += self.n_timesteps * self.dim  # Time embedding
         params += self.n_total_genes * self.gene_embed_dim  # Gene embeddings
-        params += 3 * self.perturb_sign_dim  # Sign embeddings (3 values)
-        params += self.perturb_magnitude_dim * self.dim * 3  # Magnitude MLP (3 layers)
         
         # Batch conditioning
         if self.use_batch_conditioning:
@@ -134,6 +147,9 @@ class MultiQueryAttention(nn.Module):
         # Output projection
         self.out_proj = nn.Linear(dim, dim)
         
+        # Use flash attention if available
+        self.use_flash_attn = HAS_FLASH_ATTN
+        
     def forward(self, x: torch.Tensor, kv: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         Args:
@@ -150,23 +166,40 @@ class MultiQueryAttention(nn.Module):
             kv = x
         
         # Project queries for all heads
-        q = self.q_proj(x).view(B, N, self.n_head, self.head_dim).transpose(1, 2)  # (B, H, N, HD)
+        q = self.q_proj(x).view(B, N, self.n_head, self.head_dim)  # (B, N, H, HD)
         
         # Project shared key/value
         kv_proj = self.kv_proj(kv)  # (B, M, 2*HD)
         k, v = kv_proj.chunk(2, dim=-1)  # Each is (B, M, HD)
         
-        # Expand k, v for all heads
-        k = k.unsqueeze(1).expand(-1, self.n_head, -1, -1)  # (B, H, M, HD)
-        v = v.unsqueeze(1).expand(-1, self.n_head, -1, -1)  # (B, H, M, HD)
+        if self.use_flash_attn:
+            # For flash_attn, we need to expand k, v for all heads
+            # flash_attn expects (batch, seq_len, n_heads, head_dim)
+            k_expanded = k.unsqueeze(2).expand(-1, -1, self.n_head, -1)  # (B, M, H, HD)
+            v_expanded = v.unsqueeze(2).expand(-1, -1, self.n_head, -1)  # (B, M, H, HD)
+            
+            # Use flash attention
+            out = flash_attn_func(q, k_expanded, v_expanded, causal=False)  # (B, N, H, HD)
+            
+            # Reshape output
+            out = out.view(B, N, D)
+        else:
+            # Standard attention implementation
+            q = q.transpose(1, 2)  # (B, H, N, HD)
+            
+            # Expand k, v for all heads
+            k = k.unsqueeze(1).expand(-1, self.n_head, -1, -1)  # (B, H, M, HD)
+            v = v.unsqueeze(1).expand(-1, self.n_head, -1, -1)  # (B, H, M, HD)
+            
+            # Attention
+            scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)  # (B, H, N, M)
+            attn = F.softmax(scores, dim=-1)
+            out = torch.matmul(attn, v)  # (B, H, N, HD)
+            
+            # Reshape
+            out = out.transpose(1, 2).contiguous().view(B, N, D)
         
-        # Attention
-        scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)  # (B, H, N, M)
-        attn = F.softmax(scores, dim=-1)
-        out = torch.matmul(attn, v)  # (B, H, N, HD)
-        
-        # Reshape and project output
-        out = out.transpose(1, 2).contiguous().view(B, N, D)
+        # Project output
         out = self.out_proj(out)
         
         return out
@@ -210,6 +243,116 @@ class TransformerBlock(nn.Module):
         x = x + self.mlp(self.ln3(x))
         
         return x
+
+
+class AugmentedGeneEmbedding(nn.Module):
+    """Combines trainable gene ID embeddings with frozen ESM2 protein embeddings."""
+    
+    def __init__(self, n_genes: int, id_dim: int = 128, 
+                 esm_matrix_path: str = "esm_all.pt", proj_dim: int = 256,
+                 use_canonical_only: bool = True):
+        super().__init__()
+        # 1) Existing small, trainable ID embedding
+        self.id_emb = nn.Embedding(n_genes, id_dim)
+        self.use_canonical_only = use_canonical_only
+        
+        # 2) Load frozen ESM table
+        try:
+            obj = torch.load(esm_matrix_path, map_location="cpu")
+            self.esm_emb = nn.Embedding.from_pretrained(obj["emb"], freeze=True)
+            self.esm_dim = obj["emb"].shape[-1]
+            
+            # Load gene list and isoform mapping
+            self.genes = obj.get("genes", [])
+            self.gene_to_idx = {gene: i for i, gene in enumerate(self.genes)}
+            self.gene_to_isoform_indices = obj.get("gene_to_isoform_indices", {})
+            
+            # Create mapping from gene index to ESM embedding index
+            self.gene_idx_to_esm_idx = torch.zeros(n_genes, dtype=torch.long)
+            for gene, esm_indices in self.gene_to_isoform_indices.items():
+                if gene in self.gene_to_idx:
+                    gene_idx = self.gene_to_idx[gene]
+                    if gene_idx < n_genes and esm_indices:
+                        # Use first isoform (canonical) by default
+                        self.gene_idx_to_esm_idx[gene_idx] = esm_indices[0]
+            
+            self.has_esm = True
+            print(f"Loaded ESM2 embeddings from {esm_matrix_path} with shape {obj['emb'].shape}")
+            print(f"Found {len(self.gene_to_isoform_indices)} genes with isoforms")
+            n_multi_isoform = sum(1 for indices in self.gene_to_isoform_indices.values() if len(indices) > 1)
+            print(f"Genes with multiple isoforms: {n_multi_isoform}")
+        except (FileNotFoundError, KeyError) as e:
+            print(f"Warning: Could not load ESM2 embeddings from {esm_matrix_path}: {e}")
+            print("Using only trainable ID embeddings.")
+            self.has_esm = False
+        
+        if self.has_esm:
+            # 3) Projection + gating
+            self.esm_proj = nn.Linear(self.esm_dim, proj_dim)
+            self.gate = nn.Parameter(torch.zeros(1))
+            self.mix = nn.Sequential(
+                nn.Linear(id_dim + proj_dim, proj_dim),
+                nn.GELU(),
+                nn.Linear(proj_dim, id_dim)  # back to id_dim so existing code needn't change
+            )
+        
+    def forward(self, idx: torch.LongTensor) -> torch.Tensor:
+        """
+        Args:
+            idx: Gene indices (B,) or (B, K) 
+            
+        Returns:
+            Gene embeddings (B, id_dim) or (B, K, id_dim)
+        """
+        id_vec = self.id_emb(idx)  # (B, id_dim) or (B, K, id_dim)
+        
+        if not self.has_esm:
+            return id_vec
+        
+        # Handle indices that might be out of range
+        device = id_vec.device
+        shape = idx.shape
+        idx_flat = idx.view(-1)
+        
+        # Map gene indices to ESM embedding indices
+        # Move mapping to device if needed
+        if self.gene_idx_to_esm_idx.device != device:
+            self.gene_idx_to_esm_idx = self.gene_idx_to_esm_idx.to(device)
+        
+        # Create mask for valid gene indices
+        valid_gene_mask = idx_flat < len(self.gene_idx_to_esm_idx)
+        
+        # Initialize seq_vec with zeros
+        seq_vec_flat = torch.zeros(len(idx_flat), self.esm_proj.out_features, device=device)
+        
+        # Get ESM embeddings for valid genes
+        if valid_gene_mask.any():
+            valid_gene_idx = idx_flat[valid_gene_mask]
+            # Map gene indices to ESM indices
+            esm_indices = self.gene_idx_to_esm_idx[valid_gene_idx]
+            
+            # Check which mapped indices are valid in ESM embedding
+            valid_esm_mask = (esm_indices > 0) & (esm_indices < self.esm_emb.num_embeddings)
+            
+            if valid_esm_mask.any():
+                # Get embeddings only for valid ESM indices
+                valid_esm_indices = esm_indices[valid_esm_mask]
+                valid_esm = self.esm_emb(valid_esm_indices)
+                
+                # Project ESM embeddings
+                projected = self.esm_proj(valid_esm)
+                
+                # Place projected embeddings in the right positions
+                valid_positions = valid_gene_mask.nonzero().squeeze(-1)[valid_esm_mask]
+                seq_vec_flat[valid_positions] = projected
+        
+        # Reshape back to original shape
+        seq_vec = seq_vec_flat.view(*shape, -1)
+        
+        # Fuse ID and ESM embeddings
+        fused = self.mix(torch.cat([id_vec, self.gate.tanh() * seq_vec], -1))
+        
+        return fused
 
 
 class ControlSetEncoder(nn.Module):
@@ -288,27 +431,20 @@ class ConditionalDiffusionTransformer(nn.Module):
         )
         
         # Conditioning embeddings
-        self.gene_embed = nn.Embedding(config.n_total_genes, config.gene_embed_dim)
-        
-        # Sign embedding: -1 (knockdown), 0 (control), +1 (activation)
-        self.perturb_sign_embed = nn.Embedding(3, config.perturb_sign_dim)
+        self.gene_embed = AugmentedGeneEmbedding(
+            n_genes=config.n_total_genes,
+            id_dim=config.gene_embed_dim,
+            esm_matrix_path=config.esm_matrix_path,
+            proj_dim=config.esm_proj_dim
+        )
         
         # Batch embedding
         if config.use_batch_conditioning:
             self.batch_embed = nn.Embedding(config.n_batches, config.batch_embed_dim)
         
-        # Magnitude processing: continuous log2 fold change
-        self.perturb_magnitude = nn.Sequential(
-            nn.Linear(1, config.perturb_magnitude_dim),
-            nn.GELU(),
-            nn.Linear(config.perturb_magnitude_dim, config.perturb_magnitude_dim),
-            nn.GELU(),
-            nn.Linear(config.perturb_magnitude_dim, config.dim)
-        )
-        
         # Combine conditioning
         batch_dim = config.batch_embed_dim if config.use_batch_conditioning else 0
-        total_cond_dim = config.gene_embed_dim + config.perturb_sign_dim + config.dim + batch_dim
+        total_cond_dim = config.gene_embed_dim + batch_dim
         self.cond_proj = nn.Sequential(
             nn.Linear(total_cond_dim, config.dim),
             nn.GELU(),
@@ -342,20 +478,16 @@ class ConditionalDiffusionTransformer(nn.Module):
         timesteps: torch.LongTensor,  # (B,)
         control_set: Optional[torch.LongTensor] = None,  # (B, S, N) tokenized control cells
         target_gene_idx: Optional[torch.LongTensor] = None,  # (B,)
-        perturb_magnitude: Optional[torch.FloatTensor] = None,  # (B,) log2 fold change
-        perturb_sign: Optional[torch.LongTensor] = None,  # (B,) -1, 0, +1
         batch_idx: Optional[torch.LongTensor] = None,  # (B,) batch indices
     ) -> torch.Tensor:
         """
-        Forward pass with continuous perturbation conditioning.
+        Forward pass with cross-attention conditioning.
         
         Args:
             tokens: Input tokens of shape (batch_size, n_genes)
             timesteps: Diffusion timesteps of shape (batch_size,)
             control_set: Tokenized control cells (batch_size, set_size, n_genes)
             target_gene_idx: Target gene indices
-            perturb_magnitude: Log2 fold change values (continuous)
-            perturb_sign: Direction of perturbation (-1: down, 0: control, +1: up)
             batch_idx: Batch indices for technical variation conditioning
             
         Returns:
@@ -376,23 +508,13 @@ class ConditionalDiffusionTransformer(nn.Module):
             context = self.control_encoder(control_set.float())  # (B, S, control_set_dim_out)
         
         # Conditioning embedding
-        if target_gene_idx is not None and perturb_magnitude is not None and perturb_sign is not None:
+        if target_gene_idx is not None:
             # Gene embedding - clamp indices to valid range to avoid CUDA assertion errors
             target_gene_idx_clamped = torch.clamp(target_gene_idx, 0, self.config.n_total_genes - 1)
             gene_emb = self.gene_embed(target_gene_idx_clamped)  # (B, gene_embed_dim)
             
-            # Clip and normalize magnitude
-            magnitude_clipped = torch.clamp(perturb_magnitude, -self.config.magnitude_clip, self.config.magnitude_clip)
-            magnitude_normalized = magnitude_clipped / self.config.magnitude_clip  # Normalize to [-1, 1]
-            magnitude_emb = self.perturb_magnitude(magnitude_normalized.unsqueeze(-1))  # (B, D)
-            
-            # Sign embedding (shift to 0, 1, 2 for embedding lookup)
-            sign_idx = perturb_sign + 1  # Convert from [-1, 0, 1] to [0, 1, 2]
-            sign_idx_clamped = torch.clamp(sign_idx, 0, 2)  # Ensure valid range [0, 1, 2]
-            sign_emb = self.perturb_sign_embed(sign_idx_clamped)  # (B, sign_dim)
-            
             # Combine embeddings
-            cond_components = [gene_emb, sign_emb, magnitude_emb]
+            cond_components = [gene_emb]
             
             # Add batch embedding if provided
             if self.config.use_batch_conditioning and batch_idx is not None:
@@ -420,7 +542,6 @@ class ConditionalDiffusionTransformer(nn.Module):
         logits = self.head(x)
         
         return logits
-
 
 class PartialMaskingDiffusion:
     """Discrete diffusion with partial masking strategy."""
@@ -457,17 +578,23 @@ class PartialMaskingDiffusion:
             Mask ratio to use
         """
         if is_conditioned:
-            # Curriculum learning: gradually increase masking difficulty
-            # Start with 30% masking, ramp to 90% (not 100% to avoid trivial cases)
-            max_mask = min(0.9, 0.3 + 0.6 * step / 100_000)
+            # Fine-tuning: check for random 100% masking injection
+            if torch.rand(1).item() < self.config.finetune_full_mask_prob:
+                return 1.0  # 100% masking
+            
+            # Otherwise, use curriculum learning: ramp from start to end ratio
+            progress = min(1.0, step / self.config.finetune_mask_ratio_steps)
+            base_ratio = (self.config.finetune_mask_ratio_start + 
+                         (self.config.finetune_mask_ratio_end - self.config.finetune_mask_ratio_start) * progress)
+            
+            # Sample from beta distribution for variance
+            # Beta(2, 5) gives a right-skewed distribution favoring lower values
+            u = torch.distributions.Beta(2, 5).sample().item()
+            return base_ratio * u
         else:
-            # Pretraining: moderate masking for representation learning
-            max_mask = 0.5
-        
-        # Sample from a beta distribution for more principled randomness
-        # Beta(2, 5) gives a right-skewed distribution favoring lower values
-        u = torch.distributions.Beta(2, 5).sample().item()
-        return max_mask * u
+            # Pretraining: use fixed mask ratio with beta sampling for variance
+            u = torch.distributions.Beta(2, 5).sample().item()
+            return self.config.pretrain_mask_ratio * u
     
     def q_sample(
         self, 
@@ -508,14 +635,12 @@ class PartialMaskingDiffusion:
         x_start: torch.LongTensor,
         control_set: Optional[torch.LongTensor] = None,
         target_gene_idx: Optional[torch.LongTensor] = None,
-        perturb_magnitude: Optional[torch.FloatTensor] = None,
-        perturb_sign: Optional[torch.LongTensor] = None,
         batch_idx: Optional[torch.LongTensor] = None,
         mask_token: int = 63,
         step: int = 0,
     ) -> torch.Tensor:
         """
-        Compute training loss with partial masking and expressive conditioning.
+        Compute training loss with partial masking and cross-attention conditioning.
         """
         B, N = x_start.shape
         device = x_start.device
@@ -535,8 +660,6 @@ class PartialMaskingDiffusion:
             x_noisy, t,
             control_set=control_set,
             target_gene_idx=target_gene_idx,
-            perturb_magnitude=perturb_magnitude,
-            perturb_sign=perturb_sign,
             batch_idx=batch_idx
         )
         
@@ -556,15 +679,13 @@ class PartialMaskingDiffusion:
         shape: Tuple[int, int],
         control_set: Optional[torch.LongTensor] = None,
         target_gene_idx: Optional[torch.LongTensor] = None,
-        perturb_magnitude: Optional[torch.FloatTensor] = None,
-        perturb_sign: Optional[torch.LongTensor] = None,
         batch_idx: Optional[torch.LongTensor] = None,
         mask_token: int = 63,
         temperature: float = 1.0,
         device: str = 'cuda',
     ) -> torch.LongTensor:
         """
-        Generate samples with expressive conditioning and optional partial context.
+        Generate samples with cross-attention conditioning and optional partial context.
         """
         B, N = shape
         
@@ -580,8 +701,6 @@ class PartialMaskingDiffusion:
                 x, t_batch,
                 control_set=control_set,
                 target_gene_idx=target_gene_idx,
-                perturb_magnitude=perturb_magnitude,
-                perturb_sign=perturb_sign,
                 batch_idx=batch_idx
             )
             
@@ -627,48 +746,7 @@ def create_gene_mapping(source_genes: List[str], target_genes: List[str]) -> Dic
     return mapping
 
 
-def prepare_perturbation_conditioning(
-    target_gene: str,
-    gene_to_idx: Dict[str, int],
-    magnitude: float,
-    batch_size: int = 1,
-    device: str = 'cuda'
-) -> Tuple[torch.LongTensor, torch.FloatTensor, torch.LongTensor]:
-    """
-    Prepare conditioning tensors for perturbation generation.
-    
-    The perturbation type is inferred from the magnitude and sign of the expression change.
-    This is more general than using explicit perturbation types.
-    
-    Args:
-        target_gene: Gene name to perturb
-        gene_to_idx: Mapping from gene names to indices
-        magnitude: Log2 fold change value (negative for knockdown, positive for activation)
-        batch_size: Number of samples to generate
-        device: Device to place tensors on
-        
-    Returns:
-        Tuple of (gene_indices, magnitudes, signs)
-    """
-    # Get gene index
-    if target_gene in gene_to_idx:
-        gene_idx = gene_to_idx[target_gene]
-    else:
-        print(f"Warning: Gene {target_gene} not found in vocabulary, using random index")
-        gene_idx = torch.randint(0, len(gene_to_idx), (1,)).item()
-    
-    gene_idx_tensor = torch.full((batch_size,), gene_idx, device=device, dtype=torch.long)
-    
-    # Infer perturbation type from magnitude
-    magnitude_tensor = torch.full((batch_size,), magnitude, device=device)
-    
-    # Sign is simply the sign of the magnitude
-    # -1 for knockdown (negative magnitude)
-    # 0 for control (zero magnitude)
-    # +1 for activation (positive magnitude)
-    sign_tensor = torch.sign(magnitude_tensor).long()
-    
-    return gene_idx_tensor, magnitude_tensor, sign_tensor
+
 
 
 def create_optimizer(model: nn.Module, config: ConditionalModelConfig):
@@ -708,342 +786,3 @@ def cosine_lr_schedule(optimizer, step: int, total_steps: int, config: Condition
         param_group['lr'] = lr
     return lr
 
-
-class AuxiliaryLosses:
-    """Additional loss functions for diffusion training."""
-    
-    @staticmethod
-    def mmd_loss(x_real: torch.Tensor, x_fake: torch.Tensor, sigma: float = 1.0) -> torch.Tensor:
-        """
-        Maximum Mean Discrepancy loss for distribution matching.
-        
-        Args:
-            x_real: Real samples (B1, D)
-            x_fake: Generated samples (B2, D)
-            sigma: Bandwidth parameter for RBF kernel
-            
-        Returns:
-            MMD loss value
-        """
-        def rbf_kernel(x, y, sigma):
-            """RBF kernel for MMD."""
-            pairwise_dists = torch.cdist(x, y) ** 2
-            return torch.exp(-pairwise_dists / (2 * sigma ** 2))
-        
-        # Kernel matrices
-        k_xx = rbf_kernel(x_real, x_real, sigma)
-        k_yy = rbf_kernel(x_fake, x_fake, sigma)
-        k_xy = rbf_kernel(x_real, x_fake, sigma)
-        
-        # MMD^2 estimator
-        m, n = x_real.size(0), x_fake.size(0)
-        mmd = (k_xx.sum() - k_xx.diag().sum()) / (m * (m - 1))
-        mmd += (k_yy.sum() - k_yy.diag().sum()) / (n * (n - 1))
-        mmd -= 2 * k_xy.sum() / (m * n)
-        
-        return mmd
-    
-    @staticmethod
-    def wasserstein_loss(x_real: torch.Tensor, x_fake: torch.Tensor) -> torch.Tensor:
-        """
-        Approximate Wasserstein distance using sorted samples.
-        
-        Args:
-            x_real: Real samples (B, D)
-            x_fake: Generated samples (B, D)
-            
-        Returns:
-            Wasserstein distance approximation
-        """
-        # Flatten and sort samples
-        real_sorted, _ = torch.sort(x_real.flatten())
-        fake_sorted, _ = torch.sort(x_fake.flatten())
-        
-        # Ensure same length for comparison
-        min_len = min(len(real_sorted), len(fake_sorted))
-        real_sorted = real_sorted[:min_len]
-        fake_sorted = fake_sorted[:min_len]
-        
-        return torch.mean(torch.abs(real_sorted - fake_sorted))
-    
-    @staticmethod
-    def sparsity_regularization(x: torch.Tensor, target_sparsity: float = 0.9) -> torch.Tensor:
-        """
-        Regularization term to encourage sparsity in generated samples.
-        
-        Args:
-            x: Generated samples (B, N)
-            target_sparsity: Target fraction of zeros
-            
-        Returns:
-            Sparsity loss
-        """
-        actual_sparsity = (x == 0).float().mean()
-        return torch.abs(actual_sparsity - target_sparsity)
-
-
-class ImprovedPartialMaskingDiffusion(PartialMaskingDiffusion):
-    """Enhanced diffusion with auxiliary losses and better sampling."""
-    
-    def __init__(self, config: ConditionalModelConfig, aux_loss_weight: float = 0.1):
-        super().__init__(config)
-        self.aux_loss_weight = aux_loss_weight
-        self.aux_losses = AuxiliaryLosses()
-    
-    def compute_loss_with_aux(
-        self,
-        model: nn.Module,
-        x_start: torch.LongTensor,
-        control_set: Optional[torch.LongTensor] = None,
-        target_gene_idx: Optional[torch.LongTensor] = None,
-        perturb_magnitude: Optional[torch.FloatTensor] = None,
-        perturb_sign: Optional[torch.LongTensor] = None,
-        batch_idx: Optional[torch.LongTensor] = None,
-        mask_token: int = 63,
-        step: int = 0,
-        use_aux_losses: bool = True,
-    ) -> Dict[str, torch.Tensor]:
-        """
-        Compute training loss with optional auxiliary losses.
-        
-        Returns:
-            Dictionary with 'main_loss', 'aux_loss', and 'total_loss'
-        """
-        # Standard diffusion loss
-        main_loss = self.compute_loss(
-            model, x_start, control_set, target_gene_idx, 
-            perturb_magnitude, perturb_sign, batch_idx, mask_token, step
-        )
-        
-        losses = {'main_loss': main_loss}
-        
-        if use_aux_losses and step > 1000:  # Start aux losses after warmup
-            # Generate samples for auxiliary losses
-            with torch.no_grad():
-                B, N = x_start.shape
-                generated = self.p_sample_loop(
-                    model, (B, N),
-                    control_set=control_set,
-                    target_gene_idx=target_gene_idx,
-                    perturb_magnitude=perturb_magnitude,
-                    perturb_sign=perturb_sign,
-                    batch_idx=batch_idx,
-                    device=x_start.device
-                )
-            
-            # Convert to continuous values for comparison
-            x_real_continuous = x_start.float()
-            x_fake_continuous = generated.float()
-            
-            # Compute auxiliary losses
-            aux_loss = 0.0
-            
-            # Distribution matching
-            if B > 1:  # Need multiple samples for MMD
-                mmd_loss = self.aux_losses.mmd_loss(x_real_continuous, x_fake_continuous)
-                aux_loss += mmd_loss
-                losses['mmd_loss'] = mmd_loss
-            
-            # Sparsity regularization (important for scRNA-seq)
-            sparsity_loss = self.aux_losses.sparsity_regularization(x_fake_continuous)
-            aux_loss += sparsity_loss
-            losses['sparsity_loss'] = sparsity_loss
-            
-            aux_loss *= self.aux_loss_weight
-            losses['aux_loss'] = aux_loss
-        else:
-            losses['aux_loss'] = torch.tensor(0.0, device=main_loss.device)
-        
-        losses['total_loss'] = losses['main_loss'] + losses['aux_loss']
-        return losses
-class DiffusionEvaluator:
-    """Comprehensive evaluation utilities for diffusion models."""
-    
-    def __init__(self, tokenizer, detokenizer):
-        self.tokenizer = tokenizer
-        self.detokenizer = detokenizer
-    
-    def evaluate_generation_quality(
-        self, 
-        generated_tokens: torch.Tensor, 
-        real_tokens: torch.Tensor
-    ) -> Dict[str, float]:
-        """
-        Evaluate quality of generated samples.
-        
-        Args:
-            generated_tokens: Generated token sequences (B, N)
-            real_tokens: Real token sequences (B, N)
-            
-        Returns:
-            Dictionary of evaluation metrics
-        """
-        # Convert to continuous values
-        generated_expr = self.detokenizer(generated_tokens)
-        real_expr = self.detokenizer(real_tokens)
-        
-        metrics = {}
-        
-        # Basic statistics
-        metrics['mean_expression_real'] = real_expr.mean().item()
-        metrics['mean_expression_gen'] = generated_expr.mean().item()
-        metrics['std_expression_real'] = real_expr.std().item()
-        metrics['std_expression_gen'] = generated_expr.std().item()
-        
-        # Sparsity (important for scRNA-seq)
-        metrics['sparsity_real'] = (real_expr == 0).float().mean().item()
-        metrics['sparsity_gen'] = (generated_expr == 0).float().mean().item()
-        
-        # Distribution comparison
-        if generated_tokens.numel() > 0 and real_tokens.numel() > 0:
-            # KL divergence between token distributions
-            real_dist = torch.bincount(real_tokens.flatten(), minlength=64).float()
-            gen_dist = torch.bincount(generated_tokens.flatten(), minlength=64).float()
-            
-            real_dist = real_dist / real_dist.sum()
-            gen_dist = gen_dist / gen_dist.sum()
-            
-            # Add small epsilon to avoid log(0)
-            eps = 1e-8
-            kl_div = F.kl_div(
-                torch.log(gen_dist + eps), 
-                real_dist + eps, 
-                reduction='sum'
-            ).item()
-            metrics['kl_divergence'] = kl_div
-            
-            # Jensen-Shannon divergence (symmetric)
-            m = (real_dist + gen_dist) / 2
-            js_div = 0.5 * F.kl_div(torch.log(real_dist + eps), m + eps, reduction='sum').item()
-            js_div += 0.5 * F.kl_div(torch.log(gen_dist + eps), m + eps, reduction='sum').item()
-            metrics['js_divergence'] = js_div
-        
-        # Correlation analysis
-        if generated_expr.shape[0] > 1:  # Need multiple samples
-            # Gene-gene correlation preservation
-            real_corr = torch.corrcoef(real_expr.T)
-            gen_corr = torch.corrcoef(generated_expr.T)
-            
-            # Remove NaN values (can occur with constant genes)
-            mask = ~(torch.isnan(real_corr) | torch.isnan(gen_corr))
-            if mask.sum() > 0:
-                corr_preservation = torch.corrcoef(torch.stack([
-                    real_corr[mask], gen_corr[mask]
-                ]))[0, 1].item()
-                metrics['correlation_preservation'] = corr_preservation
-        
-        return metrics
-    
-    def evaluate_perturbation_effects(
-        self,
-        control_expr: torch.Tensor,
-        perturbed_expr: torch.Tensor,
-        target_gene_idx: int,
-        expected_log2fc: float
-    ) -> Dict[str, float]:
-        """
-        Evaluate how well the model captures perturbation effects.
-        
-        Args:
-            control_expr: Control expression values (B, N)
-            perturbed_expr: Perturbed expression values (B, N)
-            target_gene_idx: Index of perturbed gene
-            expected_log2fc: Expected log2 fold change
-            
-        Returns:
-            Perturbation evaluation metrics
-        """
-        metrics = {}
-        
-        # Convert to continuous if needed
-        if control_expr.dtype == torch.long:
-            control_expr = self.detokenizer(control_expr)
-        if perturbed_expr.dtype == torch.long:
-            perturbed_expr = self.detokenizer(perturbed_expr)
-        
-        # Compute actual log2 fold change
-        control_mean = control_expr.mean(dim=0)
-        perturbed_mean = perturbed_expr.mean(dim=0)
-        
-        # Add pseudocount to avoid log(0)
-        log2fc = torch.log2((perturbed_mean + 0.1) / (control_mean + 0.1))
-        
-        # Target gene effect
-        target_log2fc = log2fc[target_gene_idx].item()
-        metrics['target_log2fc_actual'] = target_log2fc
-        metrics['target_log2fc_expected'] = expected_log2fc
-        metrics['target_log2fc_error'] = abs(target_log2fc - expected_log2fc)
-        
-        # Direction correctness
-        expected_direction = 1 if expected_log2fc > 0 else -1 if expected_log2fc < 0 else 0
-        actual_direction = 1 if target_log2fc > 0.1 else -1 if target_log2fc < -0.1 else 0
-        metrics['direction_correct'] = int(expected_direction == actual_direction)
-        
-        # Off-target effects (should be minimal)
-        off_target_effects = torch.abs(log2fc)
-        off_target_effects[target_gene_idx] = 0  # Exclude target gene
-        metrics['off_target_mean'] = off_target_effects.mean().item()
-        metrics['off_target_max'] = off_target_effects.max().item()
-        
-        # Specificity score (ratio of on-target to off-target effect)
-        if off_target_effects.mean() > 0:
-            metrics['specificity_score'] = abs(target_log2fc) / off_target_effects.mean().item()
-        else:
-            metrics['specificity_score'] = float('inf')
-        
-        return metrics
-    
-    def compute_biological_metrics(
-        self, 
-        generated_expr: torch.Tensor,
-        real_expr: torch.Tensor,
-        gene_names: Optional[List[str]] = None
-    ) -> Dict[str, float]:
-        """
-        Compute biologically relevant metrics.
-        
-        Args:
-            generated_expr: Generated expression (B, N)
-            real_expr: Real expression (B, N)
-            gene_names: Optional gene names for interpretation
-            
-        Returns:
-            Biological evaluation metrics
-        """
-        metrics = {}
-        
-        # Convert to continuous if needed
-        if generated_expr.dtype == torch.long:
-            generated_expr = self.detokenizer(generated_expr)
-        if real_expr.dtype == torch.long:
-            real_expr = self.detokenizer(real_expr)
-        
-        # Expression magnitude distribution
-        real_total_counts = real_expr.sum(dim=1)
-        gen_total_counts = generated_expr.sum(dim=1)
-        
-        metrics['total_count_mean_real'] = real_total_counts.mean().item()
-        metrics['total_count_mean_gen'] = gen_total_counts.mean().item()
-        metrics['total_count_std_real'] = real_total_counts.std().item()
-        metrics['total_count_std_gen'] = gen_total_counts.std().item()
-        
-        # Gene expression distribution
-        real_gene_means = real_expr.mean(dim=0)
-        gen_gene_means = generated_expr.mean(dim=0)
-        
-        # Correlation of gene means
-        if len(real_gene_means) > 1:
-            gene_mean_corr = torch.corrcoef(torch.stack([real_gene_means, gen_gene_means]))[0, 1]
-            if not torch.isnan(gene_mean_corr):
-                metrics['gene_mean_correlation'] = gene_mean_corr.item()
-        
-        # Highly expressed gene preservation
-        top_k = min(100, len(real_gene_means))
-        real_top_genes = torch.topk(real_gene_means, top_k).indices.cpu()
-        gen_top_genes = torch.topk(gen_gene_means, top_k).indices.cpu()
-        
-        # Overlap in top genes
-        overlap = len(set(real_top_genes.tolist()) & set(gen_top_genes.tolist()))
-        metrics[f'top_{top_k}_gene_overlap'] = overlap / top_k
-        
-        return metrics
