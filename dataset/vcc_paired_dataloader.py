@@ -1,574 +1,261 @@
 #!/usr/bin/env python3
 """
-VCC Paired DataLoader that loads control and perturbed cell sets together.
-This is designed for training models that use control cells as conditioning.
+VCC Paired DataLoader for creating matched control-perturbation cell sets.
+
+This module creates paired sets of perturbed and control cells from the VCC dataset,
+with batch matching and HVG gene filtering.
 """
 
 import torch
-from torch.utils.data import Dataset, DataLoader
-import scanpy as sc
 import numpy as np
-from pathlib import Path
-from typing import Dict, List, Optional, Tuple
-import pandas as pd
-import os
-import json
-from .vcc_dataloader import load_hvg_info_with_cache
-
+import scanpy as sc
+from torch.utils.data import Dataset, DataLoader
+from typing import List, Tuple
+import warnings
 
 class VCCPairedDataset(Dataset):
     """
-    Dataset that returns paired control and perturbed cell sets.
-    Each item contains a set of control cells and a set of perturbed cells
-    for the same target gene.
+    Dataset for VCC paired control-perturbation experiments.
+    
+    Creates matched sets of perturbed and control cells with batch 
+    matching between control and perturbed cells
     """
     
     def __init__(
         self,
-        data_path: str,
-        set_size: int = 16,  # Number of cells per set
-        tokenizer=None,  # Tokenizer for converting expressions to tokens
-        max_cells: Optional[int] = None,
-        match_by_batch: bool = True,  # Whether to match controls from same batch
-        use_hvgs: bool = True,  # Whether to use only HVG genes
-    ):
-        """
-        Args:
-            data_path: Path to adata_Training.h5ad
-            set_size: Number of cells to sample per set
-            tokenizer: Optional tokenizer for discretizing expression values
-            max_cells: Maximum cells to load (for debugging)
-            match_by_batch: Whether to match controls from the same batch
-            use_hvgs: Whether to use only highly variable genes
-        """
-        print(f"Loading VCC paired data from: {data_path}")
-        self.set_size = set_size
-        self.tokenizer = tokenizer
-        self.match_by_batch = match_by_batch
-        self.use_hvgs = use_hvgs
-        self.data_path = data_path
-        
-        # Load HVG information if requested
-        self.hvg_indices = None
-        self.hvg_names = None
-        self.gene_name_to_hvg_idx = None
-        self.expression_data = None
-        
-        if use_hvgs:
-            hvg_info = load_hvg_info_with_cache(data_path)
-            
-            self.hvg_indices = hvg_info['hvg_indices']
-            self.hvg_names = hvg_info['hvg_names']
-            self.gene_name_to_hvg_idx = hvg_info['gene_name_to_hvg_idx']
-            
-            print(f"Using {len(self.hvg_indices)} HVG genes")
-            
-            # Try to load dense arrays from cache if all HVG keys are present
-            if all(key in hvg_info for key in ['hvg_indices', 'hvg_names', 'gene_name_to_hvg_idx']):
-                from .vcc_dataloader import load_dense_arrays_with_cache, save_dense_arrays_to_cache
-                self.expression_data = load_dense_arrays_with_cache(data_path, self.hvg_indices, max_cells)
-        
-        # Load adata only if we don't have cached dense arrays
-        if self.expression_data is None:
-            self.adata = sc.read_h5ad(data_path)
-            
-            if use_hvgs:
-                # Filter genes to only HVGs
-                self.adata = self.adata[:, self.hvg_indices]
-                self.gene_names = self.hvg_names
-            else:
-                self.gene_names = self.adata.var.index.tolist()
-                
-            if max_cells is not None and len(self.adata) > max_cells:
-                self.adata = self.adata[:max_cells]
-                
-            # Convert to dense array ONCE during initialization for fast access
-            print("Converting expression data to dense array...")
-            if hasattr(self.adata.X, 'toarray'):
-                self.expression_data = self.adata.X.toarray()
-            else:
-                self.expression_data = self.adata.X.copy()
-            print(f"Expression data shape: {self.expression_data.shape}")
-            
-            # Cache the dense arrays if using HVGs
-            if use_hvgs and all(key in hvg_info for key in ['hvg_indices', 'hvg_names', 'gene_name_to_hvg_idx']):
-                from .vcc_dataloader import save_dense_arrays_to_cache
-                save_dense_arrays_to_cache(data_path, self.hvg_indices, self.expression_data, max_cells)
-        else:
-            # We have cached data, still need to set up gene names and adata metadata
-            print(f"Using cached dense arrays, shape: {self.expression_data.shape}")
-            if use_hvgs:
-                self.gene_names = self.hvg_names
-            
-            # Load minimal adata for metadata (obs) without expression data
-            self.adata = sc.read_h5ad(data_path)
-            if max_cells is not None and len(self.adata) > max_cells:
-                self.adata = self.adata[:max_cells]
-            
-            # Verify shapes match
-            if self.expression_data.shape[0] != len(self.adata):
-                print(f"Warning: Cached data shape {self.expression_data.shape} doesn't match adata {len(self.adata)}. Recomputing...")
-                # Fall back to normal loading
-                if use_hvgs:
-                    self.adata = self.adata[:, self.hvg_indices]
-                
-                if hasattr(self.adata.X, 'toarray'):
-                    self.expression_data = self.adata.X.toarray()
-                else:
-                    self.expression_data = self.adata.X.copy()
-                print(f"Recomputed expression data shape: {self.expression_data.shape}")
-            
-        # Build indices
-        self._build_indices()
-        self._build_perturbation_groups()
-        
-    def _build_indices(self):
-        """Build indices for fast access to control and perturbed cells."""
-        self.control_indices = []
-        self.perturbed_indices = []
-        self.batch_control_indices = {}  # batch -> list of control indices
-        
-        for idx in range(len(self.adata)):
-            if self.adata.obs.iloc[idx]['target_gene'] == 'non-targeting':
-                self.control_indices.append(idx)
-                batch = self.adata.obs.iloc[idx]['batch']
-                if batch not in self.batch_control_indices:
-                    self.batch_control_indices[batch] = []
-                self.batch_control_indices[batch].append(idx)
-            else:
-                self.perturbed_indices.append(idx)
-                
-        print(f"Found {len(self.control_indices)} control cells and "
-              f"{len(self.perturbed_indices)} perturbed cells")
-        
-    def _build_perturbation_groups(self):
-        """Group perturbed cells by target gene."""
-        self.perturbation_groups = {}
-        self.perturbation_batches = {}
-        
-        for idx in self.perturbed_indices:
-            target_gene = self.adata.obs.iloc[idx]['target_gene']
-            batch = self.adata.obs.iloc[idx]['batch']
-            
-            if target_gene not in self.perturbation_groups:
-                self.perturbation_groups[target_gene] = []
-                self.perturbation_batches[target_gene] = {}
-                
-            self.perturbation_groups[target_gene].append(idx)
-            
-            if batch not in self.perturbation_batches[target_gene]:
-                self.perturbation_batches[target_gene][batch] = []
-            self.perturbation_batches[target_gene][batch].append(idx)
-            
-        # Filter out genes with too few cells
-        min_cells = self.set_size * 2  # Need at least 2 sets worth
-        self.valid_genes = [
-            gene for gene, indices in self.perturbation_groups.items()
-            if len(indices) >= min_cells
-        ]
-        
-        print(f"Found {len(self.valid_genes)} genes with enough perturbed cells")
-        
-    def __len__(self):
-        return len(self.valid_genes)
-    
-    def __getitem__(self, idx):
-        """
-        Return a paired set of control and perturbed cells.
-        
-        Returns:
-            dict with:
-                - control_expr: (set_size, n_genes) control cell expressions
-                - perturbed_expr: (set_size, n_genes) perturbed cell expressions
-                - target_gene: Name of the perturbed gene
-                - target_gene_idx: Index of target gene in expression matrix
-                - control_mean: Mean expression of control set
-                - log2fc: Log2 fold change (perturbed_mean / control_mean)
-                - perturbation_magnitude: L2 norm of the perturbation effect
-        """
-        target_gene = self.valid_genes[idx]
-        
-        # Get perturbed cells
-        pert_indices = self.perturbation_groups[target_gene]
-        if len(pert_indices) >= self.set_size:
-            selected_pert = np.random.choice(pert_indices, self.set_size, replace=False)
-        else:
-            selected_pert = np.random.choice(pert_indices, self.set_size, replace=True)
-            
-        # Get control cells (preferably from same batches)
-        if self.match_by_batch:
-            # Try to get controls from the same batches as perturbed cells
-            control_pool = []
-            for pidx in selected_pert:
-                batch = self.adata.obs.iloc[pidx]['batch']
-                if batch in self.batch_control_indices:
-                    control_pool.extend(self.batch_control_indices[batch])
-            
-            # If not enough batch-matched controls, use all controls
-            if len(control_pool) < self.set_size:
-                control_pool = self.control_indices
-        else:
-            control_pool = self.control_indices
-            
-        if len(control_pool) >= self.set_size:
-            selected_ctrl = np.random.choice(control_pool, self.set_size, replace=False)
-        else:
-            selected_ctrl = np.random.choice(control_pool, self.set_size, replace=True)
-            
-        # Extract expressions
-        control_expr = self.expression_data[selected_ctrl]
-        pert_expr = self.expression_data[selected_pert]
-            
-        # Compute statistics
-        control_mean = control_expr.mean(axis=0)
-        pert_mean = pert_expr.mean(axis=0)
-        log2fc = np.log2((pert_mean + 1) / (control_mean + 1))
-        
-        # Get target gene index
-        if self.use_hvgs and self.gene_name_to_hvg_idx:
-            target_idx = self.gene_name_to_hvg_idx.get(target_gene, -1)
-        else:
-            try:
-                target_idx = self.gene_names.index(target_gene)
-            except ValueError:
-                target_idx = -1
-        
-        # Get batch information for selected cells
-        control_batches = [self.adata.obs.iloc[idx]['batch'] for idx in selected_ctrl]
-        pert_batches = [self.adata.obs.iloc[idx]['batch'] for idx in selected_pert]
-        
-        # Apply tokenizer if provided
-        if self.tokenizer is not None:
-            control_expr = self.tokenizer(control_expr)
-            pert_expr = self.tokenizer(pert_expr)
-            # Tokenized data should be long tensors
-            control_tensor = torch.LongTensor(control_expr) if isinstance(control_expr, np.ndarray) else control_expr
-            pert_tensor = torch.LongTensor(pert_expr) if isinstance(pert_expr, np.ndarray) else pert_expr
-        else:
-            # Non-tokenized data should be float tensors
-            control_tensor = torch.FloatTensor(control_expr)
-            pert_tensor = torch.FloatTensor(pert_expr)
-            
-        result = {
-            'control_expr': control_tensor,
-            'perturbed_expr': pert_tensor,
-            'target_gene': target_gene,
-            'target_gene_idx': target_idx,
-            'control_mean': torch.FloatTensor(control_mean),
-            'log2fc': torch.FloatTensor(log2fc),
-            'perturbation_magnitude': float(np.linalg.norm(log2fc)),
-            'control_batches': control_batches,  # List of batch names for control cells
-            'pert_batches': pert_batches,        # List of batch names for perturbed cells
-        }
-        
-        return result
-    
-    def get_control_mean(self):
-        """Get overall mean of control cells."""
-        return self.expression_data[self.control_indices].mean(axis=0)
-
-
-class VCCValidationDataset(Dataset):
-    """
-    Dataset for validation that focuses on specific genes from a CSV file.
-    """
-    
-    def __init__(
-        self,
-        vcc_dataset,  # VCCDataset instance
-        validation_csv: str,
+        adata_path: str = "data/vcc_data/adata_Training.h5ad",
+        hvg_gene_ids: List[str] = None,
         set_size: int = 16,
-        tokenizer=None,
-        n_samples_per_gene: int = 100,  # How many samples to generate per gene
+        n_samples_per_gene: int = 10,
+        train_split: float = 0.8,
+        is_train: bool = True, # Train or val
+        random_seed: int = 42,
     ):
-        """
-        Args:
-            vcc_dataset: Base VCCDataset instance (should use HVGs)
-            validation_csv: Path to CSV with validation genes
-            set_size: Number of cells per set
-            tokenizer: Optional tokenizer
-            n_samples_per_gene: Number of samples to generate per gene
-        """
-        from .vcc_dataloader import VCCDataset
-        self.vcc_dataset = vcc_dataset
+  
         self.set_size = set_size
-        self.tokenizer = tokenizer
         self.n_samples_per_gene = n_samples_per_gene
+        self.random_seed = random_seed
+        self.is_train = is_train
         
-        # Load validation genes
-        self.val_df = pd.read_csv(validation_csv)
-        self.validation_genes = self.val_df['target_gene'].tolist()
+        np.random.seed(random_seed)
         
-        # Build control indices
-        self.control_indices = self.vcc_dataset.get_control_cells()
+        # Load data
+        print(f"Loading VCC data from {adata_path}...")
+        self.adata = sc.read_h5ad(adata_path)
         
-        # For validation, we use control cells since these genes were never perturbed
-        # This is for zero-shot evaluation
-        if len(self.control_indices) < self.set_size:
-            raise ValueError(f"Not enough control cells ({len(self.control_indices)}) for validation")
+        # Create gene name <-> ID mappings
+        self.gene_name_to_id = dict(zip(self.adata.var.index, self.adata.var['gene_id']))
+        self.gene_id_to_name = dict(zip(self.adata.var['gene_id'], self.adata.var.index))
         
-        print(f"Creating synthetic validation samples for {len(self.validation_genes)} held-out genes")
+        # Filter to HVG genes if provided
+        if hvg_gene_ids is not None:
+            self._filter_to_hvgs(hvg_gene_ids)
         
-        # Create fixed indices for reproducible validation
+        # Get all perturbed genes (excluding non-targeting)
+        all_perturbed_genes = [g for g in self.adata.obs['target_gene'].unique() 
+                               if g != 'non-targeting']
+        
+        # Perform 80:20 split on all perturbed genes
+        np.random.seed(random_seed)
+        np.random.shuffle(all_perturbed_genes)
+        split_idx = int(len(all_perturbed_genes) * train_split)
+        
+        if is_train:
+            self.target_genes = all_perturbed_genes[:split_idx]
+        else:
+            self.target_genes = all_perturbed_genes[split_idx:]
+        
+        print(f"{'Training' if is_train else 'Validation'} dataset: {len(self.target_genes)} genes")
+        
+        # Create mapping from genes to their HVG indices
+        self.gene_to_hvg_idx = {}
+        for i, gene_id in enumerate(self.hvg_gene_ids):
+            if gene_id in self.gene_id_to_name:
+                gene_name = self.gene_id_to_name[gene_id]
+                self.gene_to_hvg_idx[gene_name] = i
+        
+        # Pre-compute samples for each gene
+        self._prepare_samples()
+        
+    def _filter_to_hvgs(self, hvg_gene_ids: List[str]):
+        """Filter adata to only include HVG genes."""
+        # Find which HVG genes are in our data
+        hvg_in_data = []
+        hvg_names = []
+        
+        for gene_id in hvg_gene_ids:
+            if gene_id in self.gene_id_to_name:
+                gene_name = self.gene_id_to_name[gene_id]
+                hvg_in_data.append(gene_id)
+                hvg_names.append(gene_name)
+        
+        print(f"Found {len(hvg_in_data)}/{len(hvg_gene_ids)} HVG genes in data")
+        
+        # Filter adata to only these genes
+        self.adata = self.adata[:, hvg_names]
+        self.hvg_gene_ids = hvg_in_data
+        self.hvg_gene_names = hvg_names
+        
+        # Update gene mappings
+        self.gene_name_to_id = dict(zip(self.adata.var.index, self.adata.var['gene_id']))
+        self.gene_id_to_name = dict(zip(self.adata.var['gene_id'], self.adata.var.index))
+        
+    def _prepare_samples(self):
+        """Pre-compute sample indices for each gene."""
         self.samples = []
-        for gene in self.validation_genes:
-            for _ in range(self.n_samples_per_gene):
-                self.samples.append(gene)
+        
+        for gene in self.target_genes:
+            # Skip if gene not in our HVG list
+            if gene not in self.gene_to_hvg_idx:
+                continue
                 
+            # Get perturbed cells for this gene
+            pert_mask = self.adata.obs['target_gene'] == gene
+            pert_cells = self.adata.obs.index[pert_mask].values
+            
+            if len(pert_cells) < self.set_size:
+                warnings.warn(f"Gene {gene} has only {len(pert_cells)} cells, skipping")
+                continue
+            
+            # Get batches where this gene was perturbed
+            pert_batches = self.adata.obs.loc[pert_mask, 'batch'].unique()
+            
+            # Get control cells from same batches
+            ctrl_mask = (self.adata.obs['target_gene'] == 'non-targeting') & \
+                        (self.adata.obs['batch'].isin(pert_batches))
+            ctrl_cells = self.adata.obs.index[ctrl_mask].values
+            
+            if len(ctrl_cells) < self.set_size:
+                warnings.warn(f"Not enough control cells for gene {gene}, skipping")
+                continue
+            
+            # Create n_samples_per_gene different sets
+            for _ in range(self.n_samples_per_gene):
+                # Sample cells
+                pert_sample = np.random.choice(pert_cells, self.set_size, replace=False)
+                ctrl_sample = np.random.choice(ctrl_cells, self.set_size, replace=False)
+                
+                self.samples.append({
+                    'gene': gene,
+                    'gene_idx': self.gene_to_hvg_idx[gene],
+                    'pert_cells': pert_sample,
+                    'ctrl_cells': ctrl_sample,
+                    'pert_batches': self.adata.obs.loc[pert_sample, 'batch'].values,
+                    'ctrl_batches': self.adata.obs.loc[ctrl_sample, 'batch'].values,
+                })
+        
+        print(f"Created {len(self.samples)} samples from {len(self.target_genes)} genes")
+        
     def __len__(self):
         return len(self.samples)
     
     def __getitem__(self, idx):
-        """Get a validation sample with synthetic perturbation."""
-        try:
-            target_gene = self.samples[idx]
-            
-            # For validation, we use control cells since these are held-out genes
-            # Sample two sets of control cells - one for "control" and one for "perturbed"
-            if len(self.control_indices) < self.set_size:
-                # Use replacement if not enough control cells
-                selected_ctrl1 = np.random.choice(self.control_indices, self.set_size, replace=True)
-                selected_ctrl2 = np.random.choice(self.control_indices, self.set_size, replace=True)
-            else:
-                selected_ctrl1 = np.random.choice(self.control_indices, self.set_size, replace=False)
-                selected_ctrl2 = np.random.choice(self.control_indices, self.set_size, replace=False)
-            
-            # Extract expressions
-            control_expr = self.vcc_dataset.expression[selected_ctrl1]
-            # For zero-shot evaluation, we use control cells as "perturbed" 
-            # The model should predict what the perturbation would look like
-            pert_expr = self.vcc_dataset.expression[selected_ctrl2]
-            
-            # Since these are validation genes, we don't have real perturbation effects
-            # Create synthetic statistics for evaluation
-            control_mean = control_expr.mean(axis=0)
-            pert_mean = pert_expr.mean(axis=0)
-            # For held-out genes, log2fc should be close to 0 (no real perturbation)
-            log2fc = np.zeros_like(control_mean)
-            
-            # Get target gene index
-            target_idx = self.vcc_dataset.get_gene_index(target_gene)
-            if target_idx is None:
-                target_idx = -1
-            
-            # Get batch information for selected cells (validation uses VCCDataset)
-            control_batches = [self.vcc_dataset.batches[idx] for idx in selected_ctrl1]
-            pert_batches = [self.vcc_dataset.batches[idx] for idx in selected_ctrl2]
-                
-            # Apply tokenizer if provided
-            if self.tokenizer is not None:
-                control_expr = self.tokenizer(control_expr)
-                pert_expr = self.tokenizer(pert_expr)
-                # Tokenized data should be long tensors
-                control_tensor = torch.LongTensor(control_expr) if isinstance(control_expr, np.ndarray) else control_expr
-                pert_tensor = torch.LongTensor(pert_expr) if isinstance(pert_expr, np.ndarray) else pert_expr
-            else:
-                # Non-tokenized data should be float tensors
-                control_tensor = torch.FloatTensor(control_expr)
-                pert_tensor = torch.FloatTensor(pert_expr)
-                
-            return {
-                'control_expr': control_tensor,
-                'perturbed_expr': pert_tensor,
-                'target_gene': target_gene,
-                'target_gene_idx': target_idx,
-                'control_mean': torch.FloatTensor(control_mean),
-                'log2fc': torch.FloatTensor(log2fc),
-                'perturbation_magnitude': 0.0,  # No perturbation for validation genes
-                'control_batches': control_batches,  # List of batch names for control cells
-                'pert_batches': pert_batches,        # List of batch names for perturbed cells
-            }
-        except Exception as e:
-            print(f"Error in validation dataset __getitem__ at idx {idx}: {e}")
-            print(f"Target gene: {target_gene if 'target_gene' in locals() else 'unknown'}")
-            print(f"Control indices length: {len(self.control_indices)}")
-            print(f"Set size: {self.set_size}")
-            raise e
+        sample = self.samples[idx]
+        
+        # Get expression data
+        pert_expr = self.adata[sample['pert_cells'], :].X
+        ctrl_expr = self.adata[sample['ctrl_cells'], :].X
+        
+        # Convert to dense if sparse
+        if hasattr(pert_expr, 'toarray'):
+            pert_expr = pert_expr.toarray()
+        if hasattr(ctrl_expr, 'toarray'):
+            ctrl_expr = ctrl_expr.toarray()
+        
+        # Convert to torch tensors
+        pert_expr = torch.from_numpy(pert_expr).float()
+        ctrl_expr = torch.from_numpy(ctrl_expr).float()
+        
+        # Calculate log2 fold change for the target gene
+        gene_idx_in_adata = self.adata.var.index.get_loc(sample['gene'])
+        pert_gene_expr = pert_expr[:, gene_idx_in_adata].mean() + 1e-6
+        ctrl_gene_expr = ctrl_expr[:, gene_idx_in_adata].mean() + 1e-6
+        log2fc = np.log2(pert_gene_expr / ctrl_gene_expr)
+        
+        return {
+            'perturbed_expr': pert_expr,
+            'control_expr': ctrl_expr,
+            'target_gene': sample['gene'],
+            'target_gene_idx': sample['gene_idx'],
+            'log2fc': torch.tensor(log2fc).float(),
+            'pert_batches': sample['pert_batches'].tolist(),
+            'ctrl_batches': sample['ctrl_batches'].tolist(),
+        }
 
 
 def create_vcc_paired_dataloader(
-    data_dir: Optional[str] = None,
+    adata_path: str = "data/vcc_data/adata_Training.h5ad",
+    hvg_gene_ids: List[str] = None,
     set_size: int = 16,
-    batch_size: int = 32,
-    tokenizer=None,
+    batch_size: int = 4,
+    n_samples_per_gene: int = 10,
+    train_split: float = 0.8,
+    is_train: bool = True,
     num_workers: int = 4,
-    max_cells: Optional[int] = None,
-    match_by_batch: bool = True,
-    use_hvgs: bool = True,
+    shuffle: bool = True,
+    random_seed: int = 42,
 ) -> Tuple[VCCPairedDataset, DataLoader]:
-    """
-    Create a paired dataloader for VCC data.
-    
-    Args:
-        data_dir: Directory containing VCC data
-        set_size: Number of cells per set
-        batch_size: Batch size for DataLoader
-        tokenizer: Optional tokenizer for discretizing expressions
-        num_workers: Number of workers for DataLoader
-        max_cells: Maximum cells to load (for debugging)
-        match_by_batch: Whether to match controls from same batch
-        use_hvgs: Whether to use only HVG genes
-        
-    Returns:
-        dataset: VCCPairedDataset instance
-        dataloader: DataLoader instance
-    """
-    # Find data directory if not provided
-    if data_dir is None:
-        from .vcc_dataloader import find_vcc_data_dir
-        data_dir = find_vcc_data_dir()
-        if data_dir is None:
-            raise FileNotFoundError(
-                "Could not find VCC data directory. Please provide data_dir or "
-                "set VCC_DATA_DIR environment variable."
-            )
-    
-    data_path = Path(data_dir) / "adata_Training.h5ad"
-    
+   
     dataset = VCCPairedDataset(
-        str(data_path),
+        adata_path=adata_path,
+        hvg_gene_ids=hvg_gene_ids,
         set_size=set_size,
-        tokenizer=tokenizer,
-        max_cells=max_cells,
-        match_by_batch=match_by_batch,
-        use_hvgs=use_hvgs,
+        n_samples_per_gene=n_samples_per_gene,
+        train_split=train_split,
+        is_train=is_train,
+        random_seed=random_seed,
     )
     
     dataloader = DataLoader(
         dataset,
         batch_size=batch_size,
-        shuffle=True,
+        shuffle=shuffle and is_train,  # Only shuffle training data
         num_workers=num_workers,
-        pin_memory=torch.cuda.is_available()
+        pin_memory=True,
+        drop_last=True,
     )
     
     return dataset, dataloader
 
 
-def create_vcc_validation_dataloader(
-    data_dir: Optional[str] = None,
+def create_train_val_dataloaders(
+    adata_path: str = "data/vcc_data/adata_Training.h5ad",
+    hvg_gene_ids: List[str] = None,
     set_size: int = 16,
-    batch_size: int = 32,
-    tokenizer=None,
-    n_samples_per_gene: int = 100,
-    max_cells: Optional[int] = None,
-    use_hvgs: bool = True,
+    batch_size: int = 4,
+    n_samples_per_gene_train: int = 10,
+    n_samples_per_gene_val: int = 1,
+    train_split: float = 0.8,
     num_workers: int = 4,
-) -> Tuple[VCCValidationDataset, DataLoader]:
-    """
-    Create a validation dataloader for VCC data.
-    
-    Args:
-        data_dir: Directory containing VCC data
-        set_size: Number of cells per set
-        batch_size: Batch size for DataLoader
-        tokenizer: Optional tokenizer
-        n_samples_per_gene: Number of samples per validation gene
-        max_cells: Maximum cells to load (for debugging)
-        use_hvgs: Whether to use only HVG genes
-        
-    Returns:
-        dataset: VCCValidationDataset instance
-        dataloader: DataLoader instance
-    """
-    from .vcc_dataloader import VCCDataset, find_vcc_data_dir
-    
-    # Find data directory
-    if data_dir is None:
-        data_dir = find_vcc_data_dir()
-        if data_dir is None:
-            raise FileNotFoundError("Could not find VCC data directory")
-            
-    # Load base dataset
-    data_path = Path(data_dir) / "adata_Training.h5ad"
-    vcc_dataset = VCCDataset(str(data_path), max_cells=max_cells, use_hvgs=use_hvgs)
-    
-    # Create validation dataset
-    validation_csv = Path(data_dir) / "pert_counts_Validation.csv"
-    if not validation_csv.exists():
-        raise FileNotFoundError(f"Validation CSV not found: {validation_csv}")
-        
-    dataset = VCCValidationDataset(
-        vcc_dataset,
-        str(validation_csv),
+    random_seed: int = 42,
+) -> Tuple[Tuple[VCCPairedDataset, DataLoader], Tuple[VCCPairedDataset, DataLoader]]:
+
+    # Training dataloader
+    train_dataset, train_dataloader = create_vcc_paired_dataloader(
+        adata_path=adata_path,
+        hvg_gene_ids=hvg_gene_ids,
         set_size=set_size,
-        tokenizer=tokenizer,
-        n_samples_per_gene=n_samples_per_gene
-    )
-    
-    dataloader = DataLoader(
-        dataset,
         batch_size=batch_size,
-        shuffle=False,  # Keep validation order consistent
+        n_samples_per_gene=n_samples_per_gene_train,
+        train_split=train_split,
+        is_train=True,
         num_workers=num_workers,
-        pin_memory=torch.cuda.is_available()
+        shuffle=True,
+        random_seed=random_seed,
     )
     
-    return dataset, dataloader
-
-
-if __name__ == "__main__":
-    # Test the paired dataloader
-    print("Testing VCC Paired DataLoader...")
+    # Validation dataloader
+    val_dataset, val_dataloader = create_vcc_paired_dataloader(
+        adata_path=adata_path,
+        hvg_gene_ids=hvg_gene_ids,
+        set_size=set_size,
+        batch_size=batch_size,
+        n_samples_per_gene=n_samples_per_gene_val,
+        train_split=train_split,
+        is_train=False,
+        num_workers=0,  # Disable multiprocessing for validation
+        shuffle=False,
+        random_seed=random_seed,
+    )
     
-    try:
-        # Create dummy tokenizer for testing
-        class DummyTokenizer:
-            def __call__(self, x):
-                # Simple binning tokenizer
-                return (x * 10).long().clamp(0, 63)
-        
-        tokenizer = [DummyTokenizer()]
-        
-        # Test paired dataset
-        dataset, dataloader = create_vcc_paired_dataloader(
-            set_size=8,
-            batch_size=4,
-            tokenizer=tokenizer,
-            max_cells=10000
-        )
-        
-        print(f"\nDataset info:")
-        print(f"  Total perturbation groups: {len(dataset)}")
-        
-        # Test single sample
-        sample = dataset[0]
-        print(f"\nSample:")
-        print(f"  Target gene: {sample['target_gene']}")
-        print(f"  Control shape: {sample['control_expr'].shape}")
-        print(f"  Perturbed shape: {sample['perturbed_expr'].shape}")
-        print(f"  Log2FC mean: {sample['log2fc'].mean():.3f}")
-        print(f"  Perturbation magnitude: {sample['perturbation_magnitude']:.3f}")
-        
-        # Test batch
-        for batch in dataloader:
-            print(f"\nBatch:")
-            print(f"  Control shape: {batch['control_expr'].shape}")
-            print(f"  Perturbed shape: {batch['perturbed_expr'].shape}")
-            print(f"  Target genes: {batch['target_gene']}")
-            print(f"  Log2FC: {batch['log2fc']}")
-            break
-        
-        # Test validation dataset
-        print("\n" + "="*50)
-        print("Testing validation dataset...")
-        
-        val_dataset, val_dataloader = create_vcc_validation_dataloader(
-            set_size=8,
-            batch_size=4,
-            tokenizer=tokenizer,
-            n_samples_per_gene=10,
-            max_cells=5000
-        )
-        
-        val_sample = val_dataset[0]
-        print(f"\nValidation sample:")
-        print(f"  Target gene: {val_sample['target_gene']}")
-        print(f"  Control shape: {val_sample['control_expr'].shape}")
-        print(f"  Perturbed shape: {val_sample['perturbed_expr'].shape}")
-        print(f"  Perturbation magnitude: {val_sample['perturbation_magnitude']:.3f}")
-        
-    except Exception as e:
-        print(f"\nError: {e}")
-        import traceback
-        traceback.print_exc() 
+    return (train_dataset, train_dataloader), (val_dataset, val_dataloader)
