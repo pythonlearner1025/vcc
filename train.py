@@ -492,7 +492,7 @@ def main():
         # Pretrain data dir  
         pretrain_data_dir = "/scRNA/processed",
         finetune_data_path = "/vcc_data/adata_Training.h5ad",
-        hvg_info_path = "data/hvg.txt",
+        hvg_info_path = "hvg_seuratv3_2000.txt",
         
         # Epochs
         pretrain_epochs=0,

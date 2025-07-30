@@ -34,8 +34,14 @@ from pathlib import Path
 import logging
 import random
 from typing import List, Set
+import sys
+import os
+
+# Add scripts directory to Python path to import fast_hvg
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import numpy as np
+import fast_hvg
 import scanpy as sc
 import anndata as ad
 import h5py
@@ -59,7 +65,6 @@ def load_whitelist(path: str | None) -> Set[str]:
         genes = {ln.strip() for ln in fh if ln.strip()}
     logger.info("Whitelist size: %d genes", len(genes))
     return genes
-
 
 def load_finetune(path: str, max_cells: int = None) -> ad.AnnData:
     logger.info("Loading finetune dataset: %s", path)
@@ -157,20 +162,16 @@ def load_pretrain_sample(scrna_dir: str, max_cells: int) -> ad.AnnData:
 def compute_hvgs(adata: ad.AnnData, n_top: int) -> List[str]:
     logger.info("Running scanpy.pp.highly_variable_genes (seurat_v3) …")
     
-    # Ensure we're working with sparse data in CSR format
-    if hasattr(adata.X, 'tocsr'):
-        adata.X = adata.X.tocsr()
-    
     # Create a copy of just the data we need to avoid modifying views
+    print("copying...")
     if adata.is_view:
         adata = adata.copy()
     
+    print("entering...")
     sc.pp.highly_variable_genes(
         adata,
         n_top_genes=n_top,
-        flavor="seurat_v3",
-        subset=False,
-        inplace=True,
+        flavor="seurat_v3"
     )
     hvgs = adata.var.index[adata.var["highly_variable"]].tolist()
     logger.info("Detected %d HVGs", len(hvgs))
@@ -274,18 +275,18 @@ if __name__ == "__main__":
     p.add_argument("--scrna_dir", default="/scRNA/processed", help="Directory with batch_*.h5")
     p.add_argument("--finetune_path", default="/vcc_data/adata_Training.h5ad", help="Finetune .h5ad file")
     p.add_argument("--output_dir", default=".")
-    p.add_argument("--whitelist_path", help="Gene list to force‑include")
+    p.add_argument("--whitelist_path", default="data/vcc_perturbed_genes.txt",help="Gene list to force‑include")
     p.add_argument("--n_hvgs", type=int, default=2000, help="#HVGs to keep")
     p.add_argument(
         "--max_cells_pretrain",
         type=int,
-        default=1_000_000,
+        default=1e6,
         help="Upper bound on sampled pre‑training cells to load",
     )
     p.add_argument(
         "--max_cells_finetune",
         type=int,
-        default=500_000,  # Changed from 1_000_000 to 50_000
+        default=1e6,  # Changed from 1_000_000 to 50_000
         help="Upper bound on sampled fine-tuning cells to load (default: 50k for memory efficiency)",
     )
     main(p.parse_args())
