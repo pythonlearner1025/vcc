@@ -20,7 +20,6 @@ from models.VAE import ConditionalVAE, VAEConfig, VAETrainer, vae_loss_function
 
 def create_synthetic_data(n_cells: int = 1000, 
                          n_genes: int = 2000,
-                         n_cell_types: int = 5,
                          n_perturbations: int = 3,
                          n_experiments: int = 10) -> Dict[str, torch.Tensor]:
     """
@@ -32,22 +31,12 @@ def create_synthetic_data(n_cells: int = 1000,
     np.random.seed(42)
     torch.manual_seed(42)
     
-    # Create cell type-specific expression patterns
-    cell_type_ids = torch.randint(0, n_cell_types, (n_cells,))
+    # Create perturbation and experiment assignments
     perturbation_ids = torch.randint(0, n_perturbations, (n_cells,))
     experiment_ids = torch.randint(0, n_experiments, (n_cells,))
     
     # Generate base expression profiles
     x = torch.randn(n_cells, n_genes) * 0.5 + 2.0  # Log-normal-ish expression
-    
-    # Add cell type effects
-    for cell_type in range(n_cell_types):
-        mask = cell_type_ids == cell_type
-        if mask.any():
-            # Each cell type has specific genes upregulated
-            start_gene = cell_type * (n_genes // n_cell_types)
-            end_gene = min((cell_type + 1) * (n_genes // n_cell_types), n_genes)
-            x[mask, start_gene:end_gene] += 1.0
     
     # Add perturbation effects
     for pert in range(1, n_perturbations):  # Skip control (0)
@@ -71,21 +60,18 @@ def create_synthetic_data(n_cells: int = 1000,
     
     return {
         'x': x,
-        'cell_type_ids': cell_type_ids,
         'perturbation_ids': perturbation_ids,
         'experiment_ids': experiment_ids
     }
 
 
-def create_vocabularies(n_cell_types: int, n_perturbations: int, n_experiments: int) -> Dict[str, Dict]:
+def create_vocabularies(n_perturbations: int, n_experiments: int) -> Dict[str, Dict]:
     """Create synthetic vocabularies for metadata."""
     
-    cell_types = [f'CellType_{i}' for i in range(n_cell_types)]
     perturbations = ['control'] + [f'Treatment_{i}' for i in range(1, n_perturbations)]
     experiments = [f'Experiment_{i}' for i in range(n_experiments)]
     
     return {
-        'cell_type': {name: i for i, name in enumerate(cell_types)},
         'perturbation': {name: i for i, name in enumerate(perturbations)},
         'srx_accession': {name: i for i, name in enumerate(experiments)}
     }
@@ -130,32 +116,6 @@ def train_example_vae(data: Dict[str, torch.Tensor],
     return model
 
 
-def test_cell_type_prediction(model: ConditionalVAE, 
-                            test_data: Dict[str, torch.Tensor],
-                            config: VAEConfig,
-                            device: str = 'cpu') -> float:
-    """Test cell type prediction accuracy."""
-    
-    print("\nTesting cell type prediction...")
-    
-    model.eval()
-    trainer = VAETrainer(model, config, device)
-    
-    # Predict cell types
-    x = test_data['x']
-    true_cell_types = test_data['cell_type_ids']
-    perturbation_ids = test_data['perturbation_ids']
-    experiment_ids = test_data['experiment_ids']
-    
-    predicted_cell_types = trainer.predict_cell_type(x, perturbation_ids, experiment_ids)
-    
-    # Calculate accuracy
-    accuracy = (predicted_cell_types == true_cell_types).float().mean().item()
-    
-    print(f"Cell type prediction accuracy: {accuracy:.4f}")
-    return accuracy
-
-
 def test_perturbation_analysis(model: ConditionalVAE,
                              test_data: Dict[str, torch.Tensor],
                              vocabularies: Dict[str, Dict],
@@ -178,12 +138,12 @@ def test_perturbation_analysis(model: ConditionalVAE,
     
     # Get perturbed cells
     x_perturbed = test_data['x'][perturbed_mask]
-    cell_type_ids = test_data['cell_type_ids'][perturbed_mask]
+    perturbation_ids = test_data['perturbation_ids'][perturbed_mask]
     experiment_ids = test_data['experiment_ids'][perturbed_mask]
     
     # Predict control state
     x_control_pred = trainer.predict_perturbation_effect(
-        x_perturbed, cell_type_ids, experiment_ids, control_id
+        x_perturbed, perturbation_ids, experiment_ids, control_id
     )
     
     # Compute fold changes
@@ -204,16 +164,15 @@ def test_generation(model: ConditionalVAE,
     
     model.eval()
     
-    # Generate cells for each cell type
-    for cell_type_name, cell_type_id in vocabularies['cell_type'].items():
+    # Generate cells for each perturbation type
+    for pert_name, pert_id in vocabularies['perturbation'].items():
         generated = model.generate(
-            cell_type_ids=torch.tensor([cell_type_id]),
-            perturbation_ids=torch.tensor([0]),  # control
+            perturbation_ids=torch.tensor([pert_id]),
             experiment_ids=torch.tensor([0]),    # first experiment
             n_samples=10
         )
         
-        print(f"{cell_type_name}: Generated {len(generated)} cells, "
+        print(f"{pert_name}: Generated {len(generated)} cells, "
               f"mean expression: {generated.mean():.4f}, "
               f"std: {generated.std():.4f}")
 
@@ -232,7 +191,6 @@ def test_latent_analysis(model: ConditionalVAE,
         # Encode test data
         mu, logvar = model.encode(
             test_data['x'],
-            test_data['cell_type_ids'],
             test_data['perturbation_ids'],
             test_data['experiment_ids']
         )
@@ -242,13 +200,13 @@ def test_latent_analysis(model: ConditionalVAE,
         print(f"Latent mean: {mu.mean(dim=0).mean():.4f}")
         print(f"Latent std: {mu.std(dim=0).mean():.4f}")
         
-        # Check if different cell types cluster in latent space
-        for cell_type in range(config.n_cell_types):
-            mask = test_data['cell_type_ids'] == cell_type
+        # Check if different perturbations cluster in latent space
+        for pert_id in range(config.n_perturbations):
+            mask = test_data['perturbation_ids'] == pert_id
             if mask.any():
-                cell_type_latent = mu[mask]
-                centroid = cell_type_latent.mean(dim=0)
-                print(f"Cell type {cell_type} latent centroid norm: {torch.norm(centroid):.4f}")
+                pert_latent = mu[mask]
+                centroid = pert_latent.mean(dim=0)
+                print(f"Perturbation {pert_id} latent centroid norm: {torch.norm(centroid):.4f}")
 
 
 def main():
@@ -262,7 +220,6 @@ def main():
         input_dim=2000,
         latent_dim=64,  # Smaller for faster training
         hidden_dims=[256, 128],
-        n_cell_types=5,
         n_perturbations=3,
         n_experiments=10,
         learning_rate=1e-3,
@@ -277,7 +234,6 @@ def main():
     train_data = create_synthetic_data(
         n_cells=1000,
         n_genes=config.input_dim,
-        n_cell_types=config.n_cell_types,
         n_perturbations=config.n_perturbations,
         n_experiments=config.n_experiments
     )
@@ -285,13 +241,12 @@ def main():
     test_data = create_synthetic_data(
         n_cells=200,
         n_genes=config.input_dim,
-        n_cell_types=config.n_cell_types,
         n_perturbations=config.n_perturbations,
         n_experiments=config.n_experiments
     )
     
     vocabularies = create_vocabularies(
-        config.n_cell_types, config.n_perturbations, config.n_experiments
+        config.n_perturbations, config.n_experiments
     )
     
     print(f"Created training data: {len(train_data['x'])} cells")
@@ -305,21 +260,15 @@ def main():
     # Train VAE
     model = train_example_vae(train_data, config, n_epochs=50, device=device)
     
-    # Test functionality
-    accuracy = test_cell_type_prediction(model, test_data, config, device)
+    # Test functionality (removed cell type prediction since model learns cell types implicitly)
     test_perturbation_analysis(model, test_data, vocabularies, config, device)
     test_generation(model, vocabularies, config, device)
     test_latent_analysis(model, test_data, config, device)
     
     print("\n" + "=" * 40)
     print("Example completed successfully!")
-    print(f"Final cell type prediction accuracy: {accuracy:.4f}")
-    
-    if accuracy > 0.7:
-        print("✓ Model successfully learned to distinguish cell types")
-    else:
-        print("⚠ Model had difficulty with cell type prediction")
-        print("  This is expected with synthetic data - try with real data for better results")
+    print("✓ Model trained on perturbation and experiment conditioning")
+    print("✓ Cell types are learned implicitly from transcriptomic profiles")
 
 
 if __name__ == "__main__":

@@ -2,9 +2,22 @@
 """
 Variational Autoencoder (VAE) for single-cell RNA-seq data.
 
-This module implements a conditional VAE that can predict cell type and perturbation effects
+This module implements a conditional VAE that can predict perturbation effects
 from single-cell gene expression data. The model is designed to work with the batch file
 format produced by download.py.
+
+Key Features:
+- Encoder: Takes gene expression + experiment ID (no perturbation info)
+- Decoder: Takes latent + experiment ID + optional perturbation ID
+- Can train on general scRNA-seq data without perturbation labels (pretraining)
+- Can inject perturbations at latent space to predict perturbed profiles
+- Can predict control profiles from perturbed profiles
+- Cell types emerge naturally in latent space without explicit conditioning
+
+Training Paradigms:
+1. Pretraining: Train on general scRNA-seq data without perturbation labels
+2. Fine-tuning: Train on paired control/perturbation data
+3. Inference: Inject perturbations into control cells or predict controls from perturbed cells
 """
 
 import math
@@ -20,16 +33,16 @@ from dataclasses import dataclass
 class VAEConfig:
     """Configuration for the VAE model."""
     # Architecture
-    input_dim: int = 2000  # Number of HVG genes
-    latent_dim: int = 128  # Latent space dimension
+    input_dim: int = 1808  # Number of genes in VCC
+    latent_dim: int = 2000  # Latent space dimension # HVG-like?
     hidden_dims: List[int] = None  # Hidden layer dimensions for encoder/decoder
     
     # Conditioning
-    n_cell_types: int = 50  # Number of unique cell types (estimate)
+    # n_cell_types: int = 50  # Number of unique cell types (estimate)
     n_perturbations: int = 100  # Number of unique perturbations (estimate)
     n_experiments: int = 500  # Number of unique SRX accessions (estimate)
     
-    cell_type_embed_dim: int = 32
+    # cell_type_embed_dim: int = 32
     perturbation_embed_dim: int = 32
     experiment_embed_dim: int = 16
     
@@ -53,10 +66,9 @@ class VAEEncoder(nn.Module):
         super().__init__()
         self.config = config
         
-        # Input dimension includes gene expression + conditioning embeddings
-        conditioning_dim = (config.cell_type_embed_dim + 
-                          config.perturbation_embed_dim + 
-                          config.experiment_embed_dim)
+        # Input dimension includes gene expression + experiment embedding only
+        # No perturbation information goes into the encoder
+        conditioning_dim = config.experiment_embed_dim
         input_dim = config.input_dim + conditioning_dim
         
         # Build encoder layers
@@ -84,7 +96,7 @@ class VAEEncoder(nn.Module):
         
         Args:
             x: Gene expression data [batch_size, input_dim]
-            conditioning: Concatenated conditioning embeddings [batch_size, conditioning_dim]
+            conditioning: Experiment embedding only [batch_size, experiment_embed_dim]
             
         Returns:
             mu: Mean of latent distribution [batch_size, latent_dim]
@@ -110,9 +122,9 @@ class VAEDecoder(nn.Module):
         super().__init__()
         self.config = config
         
-        # Input dimension includes latent + conditioning embeddings
-        conditioning_dim = (config.cell_type_embed_dim + 
-                          config.perturbation_embed_dim + 
+        # Input dimension includes latent + experiment + perturbation embeddings
+        # Perturbation is only added at decode time
+        conditioning_dim = (config.perturbation_embed_dim + 
                           config.experiment_embed_dim)
         input_dim = config.latent_dim + conditioning_dim
         
@@ -134,19 +146,40 @@ class VAEDecoder(nn.Module):
         
         self.decoder = nn.Sequential(*layers)
         
-    def forward(self, z: torch.Tensor, conditioning: torch.Tensor) -> torch.Tensor:
+    def forward(self, z: torch.Tensor, 
+                conditioning: torch.Tensor = None,
+                experiment_emb: torch.Tensor = None,
+                perturbation_emb: torch.Tensor = None) -> torch.Tensor:
         """
         Decode latent representation to gene expression.
         
         Args:
             z: Latent representation [batch_size, latent_dim]
-            conditioning: Concatenated conditioning embeddings [batch_size, conditioning_dim]
+            conditioning: Concatenated perturbation + experiment embeddings [batch_size, conditioning_dim]
+                         OR None to use experiment_emb and perturbation_emb separately
+            experiment_emb: Experiment embeddings [batch_size, experiment_embed_dim] (if conditioning is None)
+            perturbation_emb: Perturbation embeddings [batch_size, perturbation_embed_dim] (if conditioning is None)
+                             If None, uses zero perturbation (control condition)
             
         Returns:
             reconstructed: Reconstructed gene expression [batch_size, input_dim]
         """
-        # Concatenate latent with conditioning
-        z_cond = torch.cat([z, conditioning], dim=1)
+        if conditioning is not None:
+            # Use pre-concatenated conditioning
+            z_cond = torch.cat([z, conditioning], dim=1)
+        else:
+            # Build conditioning from components
+            if experiment_emb is None:
+                raise ValueError("Either conditioning or experiment_emb must be provided")
+            
+            if perturbation_emb is None:
+                # No perturbation - use zero embedding (control condition)
+                batch_size = z.size(0)
+                device = z.device
+                perturbation_emb = torch.zeros(batch_size, self.config.perturbation_embed_dim, device=device)
+            
+            conditioning = torch.cat([perturbation_emb, experiment_emb], dim=1)
+            z_cond = torch.cat([z, conditioning], dim=1)
         
         # Decode
         reconstructed = self.decoder(z_cond)
@@ -158,10 +191,16 @@ class ConditionalVAE(nn.Module):
     """
     Conditional Variational Autoencoder for single-cell RNA-seq data.
     
-    This model can be conditioned on:
-    - Cell type (inferred or provided)
-    - Perturbation type (control, knockout, overexpression, etc.)
-    - Experiment source (SRX accession)
+    Architecture:
+    - Encoder: Takes gene expression + experiment (SRX) embedding → latent space
+    - Decoder: Takes latent + experiment + perturbation embeddings → reconstructed expression
+    
+    Training paradigm:
+    - Control cells: encode → decode with control perturbation
+    - Perturbed cells: encode → decode with target perturbation
+    - The model learns to predict perturbation effects in the latent space
+    
+    Cell types emerge naturally in the latent space without explicit conditioning.
     """
     
     def __init__(self, config: VAEConfig):
@@ -169,7 +208,6 @@ class ConditionalVAE(nn.Module):
         self.config = config
         
         # Embedding layers for conditioning
-        self.cell_type_embedding = nn.Embedding(config.n_cell_types, config.cell_type_embed_dim)
         self.perturbation_embedding = nn.Embedding(config.n_perturbations, config.perturbation_embed_dim)
         self.experiment_embedding = nn.Embedding(config.n_experiments, config.experiment_embed_dim)
         
@@ -199,28 +237,30 @@ class ConditionalVAE(nn.Module):
         eps = torch.randn_like(std)
         return mu + eps * std
     
-    def get_conditioning(self, cell_type_ids: torch.Tensor, 
-                        perturbation_ids: torch.Tensor, 
-                        experiment_ids: torch.Tensor) -> torch.Tensor:
-        """Get concatenated conditioning embeddings."""
-        cell_type_emb = self.cell_type_embedding(cell_type_ids)
+    def get_encoder_conditioning(self, experiment_ids: torch.Tensor) -> torch.Tensor:
+        """Get experiment embedding for encoder (no perturbation info)."""
+        experiment_emb = self.experiment_embedding(experiment_ids)
+        return experiment_emb
+    
+    def get_decoder_conditioning(self, 
+                               perturbation_ids: torch.Tensor, 
+                               experiment_ids: torch.Tensor) -> torch.Tensor:
+        """Get concatenated perturbation + experiment embeddings for decoder."""
         perturbation_emb = self.perturbation_embedding(perturbation_ids)
         experiment_emb = self.experiment_embedding(experiment_ids)
-        
-        return torch.cat([cell_type_emb, perturbation_emb, experiment_emb], dim=1)
+        return torch.cat([perturbation_emb, experiment_emb], dim=1)
     
     def forward(self, x: torch.Tensor, 
-                cell_type_ids: torch.Tensor,
-                perturbation_ids: torch.Tensor,
-                experiment_ids: torch.Tensor) -> Dict[str, torch.Tensor]:
+                experiment_ids: torch.Tensor,
+                perturbation_ids: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
         """
         Forward pass through the VAE.
         
         Args:
             x: Gene expression data [batch_size, input_dim]
-            cell_type_ids: Cell type IDs [batch_size]
-            perturbation_ids: Perturbation type IDs [batch_size]
-            experiment_ids: Experiment IDs [batch_size]
+            experiment_ids: Experiment IDs (SRX accessions) [batch_size]
+            perturbation_ids: Perturbation type IDs [batch_size] (for decoder only)
+                             If None, uses control condition (no perturbation)
             
         Returns:
             Dictionary containing:
@@ -230,72 +270,139 @@ class ConditionalVAE(nn.Module):
             - z: Sampled latent representation
         """
         # Get conditioning embeddings
-        conditioning = self.get_conditioning(cell_type_ids, perturbation_ids, experiment_ids)
+        encoder_conditioning = self.get_encoder_conditioning(experiment_ids)
         
-        # Encode
-        mu, logvar = self.encoder(x, conditioning)
+        # Encode (without perturbation information)
+        mu, logvar = self.encoder(x, encoder_conditioning)
         
         # Sample from latent distribution
         z = self.reparameterize(mu, logvar)
         
-        # Decode
-        reconstructed = self.decoder(z, conditioning)
+        # Decode (with optional perturbation information)
+        experiment_emb = self.experiment_embedding(experiment_ids)
+        
+        if perturbation_ids is not None:
+            perturbation_emb = self.perturbation_embedding(perturbation_ids)
+            reconstructed = self.decoder(z, experiment_emb=experiment_emb, perturbation_emb=perturbation_emb)
+        else:
+            # No perturbation provided - use control condition (zero perturbation)
+            reconstructed = self.decoder(z, experiment_emb=experiment_emb, perturbation_emb=None)
         
         return {
             'reconstructed': reconstructed,
             'mu': mu,
             'logvar': logvar,
-            'z': z,
-            'conditioning': conditioning
+            'z': z
         }
     
     def encode(self, x: torch.Tensor, 
-               cell_type_ids: torch.Tensor,
-               perturbation_ids: torch.Tensor,
                experiment_ids: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Encode input to latent parameters."""
-        conditioning = self.get_conditioning(cell_type_ids, perturbation_ids, experiment_ids)
-        return self.encoder(x, conditioning)
+        """Encode input to latent parameters (experiment conditioning only)."""
+        encoder_conditioning = self.get_encoder_conditioning(experiment_ids)
+        return self.encoder(x, encoder_conditioning)
     
     def decode(self, z: torch.Tensor,
-               cell_type_ids: torch.Tensor,
-               perturbation_ids: torch.Tensor,
-               experiment_ids: torch.Tensor) -> torch.Tensor:
-        """Decode latent representation to gene expression."""
-        conditioning = self.get_conditioning(cell_type_ids, perturbation_ids, experiment_ids)
-        return self.decoder(z, conditioning)
+               experiment_ids: torch.Tensor,
+               perturbation_ids: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Decode latent representation to gene expression (with optional perturbation conditioning)."""
+        experiment_emb = self.experiment_embedding(experiment_ids)
+        
+        if perturbation_ids is not None:
+            perturbation_emb = self.perturbation_embedding(perturbation_ids)
+            return self.decoder(z, experiment_emb=experiment_emb, perturbation_emb=perturbation_emb)
+        else:
+            # No perturbation - control condition
+            return self.decoder(z, experiment_emb=experiment_emb, perturbation_emb=None)
     
-    def generate(self, cell_type_ids: torch.Tensor,
-                 perturbation_ids: torch.Tensor,
-                 experiment_ids: torch.Tensor,
+    def inject_perturbation(self, 
+                           control_expression: torch.Tensor,
+                           experiment_ids: torch.Tensor,
+                           target_perturbation_ids: torch.Tensor) -> torch.Tensor:
+        """
+        Generate perturbed profiles from control profiles by injecting perturbation at latent space.
+        
+        This is the key functionality for predicting perturbation effects:
+        1. Encode control cell with only experiment conditioning (no perturbation)
+        2. Decode the latent representation with target perturbation conditioning
+        
+        Args:
+            control_expression: Control cell gene expression [batch_size, input_dim]
+            experiment_ids: Experiment IDs (SRX accessions) [batch_size]
+            target_perturbation_ids: Target perturbation IDs [batch_size]
+            
+        Returns:
+            Predicted perturbed gene expression [batch_size, input_dim]
+        """
+        self.eval()
+        with torch.no_grad():
+            # Encode control expression (no perturbation information)
+            mu, logvar = self.encode(control_expression, experiment_ids)
+            
+            # Sample from latent distribution (or use mean for deterministic prediction)
+            z = mu  # Use mean for deterministic prediction
+            # z = self.reparameterize(mu, logvar)  # Use for stochastic prediction
+            
+            # Decode with target perturbation
+            perturbed_expression = self.decode(z, experiment_ids, target_perturbation_ids)
+        
+        return perturbed_expression
+    
+    def predict_control_from_perturbed(self,
+                                     perturbed_expression: torch.Tensor,
+                                     experiment_ids: torch.Tensor) -> torch.Tensor:
+        """
+        Predict control profiles from perturbed profiles by removing perturbation conditioning.
+        
+        Args:
+            perturbed_expression: Perturbed cell gene expression [batch_size, input_dim]
+            experiment_ids: Experiment IDs (SRX accessions) [batch_size]
+            
+        Returns:
+            Predicted control gene expression [batch_size, input_dim]
+        """
+        self.eval()
+        with torch.no_grad():
+            # Encode perturbed expression (no perturbation information in encoder)
+            mu, logvar = self.encode(perturbed_expression, experiment_ids)
+            
+            # Sample from latent distribution
+            z = mu  # Use mean for deterministic prediction
+            
+            # Decode without perturbation (control condition)
+            control_expression = self.decode(z, experiment_ids, perturbation_ids=None)
+        
+        return control_expression
+    
+    def generate(self, experiment_ids: torch.Tensor,
+                 perturbation_ids: Optional[torch.Tensor] = None,
                  n_samples: int = 1) -> torch.Tensor:
         """
         Generate new samples by sampling from prior and decoding.
         
         Args:
-            cell_type_ids: Cell type IDs [batch_size]
-            perturbation_ids: Perturbation type IDs [batch_size]
-            experiment_ids: Experiment IDs [batch_size]
+            experiment_ids: Experiment IDs (SRX accessions) [batch_size]
+            perturbation_ids: Perturbation type IDs [batch_size] (optional)
+                             If None, generates control samples
             n_samples: Number of samples to generate per condition
             
         Returns:
             Generated gene expression data [batch_size * n_samples, input_dim]
         """
         device = next(self.parameters()).device
-        batch_size = len(cell_type_ids)
+        batch_size = len(experiment_ids)
         
         # Repeat condition IDs for multiple samples
         if n_samples > 1:
-            cell_type_ids = cell_type_ids.repeat_interleave(n_samples)
-            perturbation_ids = perturbation_ids.repeat_interleave(n_samples)
             experiment_ids = experiment_ids.repeat_interleave(n_samples)
+            if perturbation_ids is not None:
+                perturbation_ids = perturbation_ids.repeat_interleave(n_samples)
         
         # Sample from standard normal distribution
         z = torch.randn(batch_size * n_samples, self.config.latent_dim, device=device)
         
         # Decode
         with torch.no_grad():
-            generated = self.decode(z, cell_type_ids, perturbation_ids, experiment_ids)
+            generated = self.decode(z, experiment_ids, perturbation_ids)
         
         return generated
 
@@ -365,12 +472,15 @@ class VAETrainer:
         
         # Move batch to device
         x = batch['x'].to(self.device)
-        cell_type_ids = batch['cell_type_ids'].to(self.device)
-        perturbation_ids = batch['perturbation_ids'].to(self.device)
         experiment_ids = batch['experiment_ids'].to(self.device)
         
+        # Handle optional perturbation IDs
+        perturbation_ids = None
+        if 'perturbation_ids' in batch and batch['perturbation_ids'] is not None:
+            perturbation_ids = batch['perturbation_ids'].to(self.device)
+        
         # Forward pass
-        outputs = self.model(x, cell_type_ids, perturbation_ids, experiment_ids)
+        outputs = self.model(x, experiment_ids, perturbation_ids)
         
         # Compute loss
         losses = vae_loss_function(outputs, x, self.config)
@@ -394,12 +504,15 @@ class VAETrainer:
         with torch.no_grad():
             # Move batch to device
             x = batch['x'].to(self.device)
-            cell_type_ids = batch['cell_type_ids'].to(self.device)
-            perturbation_ids = batch['perturbation_ids'].to(self.device)
             experiment_ids = batch['experiment_ids'].to(self.device)
             
+            # Handle optional perturbation IDs
+            perturbation_ids = None
+            if 'perturbation_ids' in batch and batch['perturbation_ids'] is not None:
+                perturbation_ids = batch['perturbation_ids'].to(self.device)
+            
             # Forward pass
-            outputs = self.model(x, cell_type_ids, perturbation_ids, experiment_ids)
+            outputs = self.model(x, experiment_ids, perturbation_ids)
             
             # Compute loss
             losses = vae_loss_function(outputs, x, self.config)
@@ -407,42 +520,42 @@ class VAETrainer:
         # Return scalar losses
         return {k: v.item() for k, v in losses.items()}
     
-    def predict_cell_type(self, x: torch.Tensor, 
-                         perturbation_ids: torch.Tensor,
-                         experiment_ids: torch.Tensor) -> torch.Tensor:
-        """
-        Predict cell type by trying all possible cell types and choosing the one
-        that gives the best reconstruction.
-        """
-        self.model.eval()
-        batch_size = x.size(0)
-        device = x.device
+    # def predict_cell_type(self, x: torch.Tensor, 
+    #                      perturbation_ids: torch.Tensor,
+    #                      experiment_ids: torch.Tensor) -> torch.Tensor:
+    #     """
+    #     Predict cell type by trying all possible cell types and choosing the one
+    #     that gives the best reconstruction.
+    #     """
+    #     self.model.eval()
+    #     batch_size = x.size(0)
+    #     device = x.device
         
-        best_cell_types = []
+    #     best_cell_types = []
         
-        with torch.no_grad():
-            for i in range(batch_size):
-                x_single = x[i:i+1].expand(self.config.n_cell_types, -1)
-                pert_single = perturbation_ids[i:i+1].expand(self.config.n_cell_types)
-                exp_single = experiment_ids[i:i+1].expand(self.config.n_cell_types)
+    #     with torch.no_grad():
+    #         for i in range(batch_size):
+    #             x_single = x[i:i+1].expand(self.config.n_cell_types, -1)
+    #             pert_single = perturbation_ids[i:i+1].expand(self.config.n_cell_types)
+    #             exp_single = experiment_ids[i:i+1].expand(self.config.n_cell_types)
                 
-                # Try all possible cell types
-                all_cell_types = torch.arange(self.config.n_cell_types, device=device)
+    #             # Try all possible cell types
+    #             all_cell_types = torch.arange(self.config.n_cell_types, device=device)
                 
-                # Get reconstructions for all cell types
-                outputs = self.model(x_single, all_cell_types, pert_single, exp_single)
+    #             # Get reconstructions for all cell types
+    #             outputs = self.model(x_single, all_cell_types, pert_single, exp_single)
                 
-                # Compute reconstruction errors
-                recon_errors = F.mse_loss(outputs['reconstructed'], x_single, reduction='none').sum(dim=1)
+    #             # Compute reconstruction errors
+    #             recon_errors = F.mse_loss(outputs['reconstructed'], x_single, reduction='none').sum(dim=1)
                 
-                # Choose cell type with minimum reconstruction error
-                best_cell_type = torch.argmin(recon_errors)
-                best_cell_types.append(best_cell_type)
+    #             # Choose cell type with minimum reconstruction error
+    #             best_cell_type = torch.argmin(recon_errors)
+    #             best_cell_types.append(best_cell_type)
         
-        return torch.stack(best_cell_types)
+    #     return torch.stack(best_cell_types)
     
     def predict_perturbation_effect(self, x: torch.Tensor,
-                                  cell_type_ids: torch.Tensor,
+                                  perturbation_ids: torch.Tensor,
                                   experiment_ids: torch.Tensor,
                                   control_perturbation_id: int = 0) -> torch.Tensor:
         """
@@ -450,8 +563,8 @@ class VAETrainer:
         
         Args:
             x: Perturbed gene expression
-            cell_type_ids: Cell type IDs
-            experiment_ids: Experiment IDs
+            perturbation_ids: Current perturbation IDs
+            experiment_ids: Experiment IDs (SRX accessions)
             control_perturbation_id: ID for control/untreated condition
             
         Returns:
@@ -466,16 +579,13 @@ class VAETrainer:
         
         with torch.no_grad():
             # Encode the perturbed state
-            mu, logvar = self.model.encode(x, cell_type_ids, 
-                                         torch.zeros_like(cell_type_ids),  # Use any perturbation for encoding
-                                         experiment_ids)
+            mu, logvar = self.model.encode(x, perturbation_ids, experiment_ids)
             
             # Sample from latent distribution
             z = self.model.reparameterize(mu, logvar)
             
             # Decode with control condition
-            control_expression = self.model.decode(z, cell_type_ids, 
-                                                 control_perturbation_ids, experiment_ids)
+            control_expression = self.model.decode(z, control_perturbation_ids, experiment_ids)
         
         return control_expression
 
@@ -493,7 +603,7 @@ def create_metadata_vocabularies(metadata_df) -> Dict[str, Dict]:
     """
     vocabularies = {}
     
-    categorical_columns = ['cell_type', 'perturbation', 'srx_accession']
+    categorical_columns = ['perturbation', 'srx_accession']
     
     for col in categorical_columns:
         if col in metadata_df.columns:
@@ -533,7 +643,6 @@ if __name__ == "__main__":
         input_dim=2000,
         latent_dim=128,
         hidden_dims=[512, 256],
-        n_cell_types=50,
         n_perturbations=100,
         n_experiments=500
     )
@@ -541,17 +650,41 @@ if __name__ == "__main__":
     # Create model
     model = ConditionalVAE(config)
     
-    # Test forward pass
+    # Test forward pass with perturbation
     batch_size = 32
     x = torch.randn(batch_size, config.input_dim)
-    cell_type_ids = torch.randint(0, config.n_cell_types, (batch_size,))
     perturbation_ids = torch.randint(0, config.n_perturbations, (batch_size,))
     experiment_ids = torch.randint(0, config.n_experiments, (batch_size,))
     
-    outputs = model(x, cell_type_ids, perturbation_ids, experiment_ids)
+    outputs = model(x, experiment_ids, perturbation_ids)
     
     print(f"Model created successfully!")
     print(f"Input shape: {x.shape}")
     print(f"Reconstructed shape: {outputs['reconstructed'].shape}")
     print(f"Latent shape: {outputs['z'].shape}")
     print(f"Total parameters: {sum(p.numel() for p in model.parameters()):,}")
+    
+    # Test forward pass without perturbation (control condition)
+    print("\nTesting control condition (no perturbation):")
+    outputs_control = model(x, experiment_ids, perturbation_ids=None)
+    print(f"Control reconstructed shape: {outputs_control['reconstructed'].shape}")
+    
+    # Test perturbation injection
+    print("\nTesting perturbation injection:")
+    control_x = torch.randn(16, config.input_dim)
+    control_exp_ids = torch.randint(0, config.n_experiments, (16,))
+    target_pert_ids = torch.randint(1, config.n_perturbations, (16,))
+    
+    perturbed_pred = model.inject_perturbation(control_x, control_exp_ids, target_pert_ids)
+    print(f"Predicted perturbed shape: {perturbed_pred.shape}")
+    
+    # Test control prediction from perturbed
+    print("\nTesting control prediction from perturbed:")
+    control_pred = model.predict_control_from_perturbed(perturbed_pred, control_exp_ids)
+    print(f"Predicted control shape: {control_pred.shape}")
+    
+    print("\nKey functionality verified:")
+    print("✓ Standard VAE forward pass with perturbation")
+    print("✓ Control condition (no perturbation)")
+    print("✓ Perturbation injection into control cells")
+    print("✓ Control prediction from perturbed cells")

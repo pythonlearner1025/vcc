@@ -1,26 +1,27 @@
 # VAE for Single-Cell RNA-seq Data
 
-This directory contains a Conditional Variational Autoencoder (VAE) implementation for single-cell RNA-seq data analysis. The VAE can predict cell types and perturbation effects using the batch file format produced by `download.py`.
+This directory contains a Conditional Variational Autoencoder (VAE) implementation for single-cell RNA-seq data analysis. The VAE can predict perturbation effects using the batch file format produced by `download.py`.
 
 ## Overview
 
 The Conditional VAE consists of:
 
 1. **ConditionalVAE** (`models/VAE.py`): The main model that can be conditioned on:
-   - Cell type (inferred or provided)
    - Perturbation type (control, treatment, knockout, etc.)
-   - Experiment source (SRX accession from scBaseCount)
+   - Experiment source (SRX accession) to account for technical confounding effects
 
 2. **Training Script** (`train_vae.py`): Complete training pipeline with data loading, model training, and evaluation
 
-3. **Inference Script** (`inference_vae.py`): Analysis tools for trained models including cell type prediction and perturbation effect analysis
+3. **Inference Script** (`inference_vae.py`): Analysis tools for trained models including perturbation effect analysis
+
+**Important Note**: Cell types are NOT explicitly modeled as conditioning variables. Instead, the model learns cell type representations implicitly from transcriptomic profiles in the latent space. This allows the model to discover cell types naturally without requiring pre-defined labels.
 
 ## Key Features
 
-- **Conditional Generation**: Generate synthetic cells with specific cell types and perturbation conditions
-- **Cell Type Prediction**: Predict cell types based on gene expression profiles
-- **Perturbation Effect Analysis**: Compare perturbed vs control conditions
-- **Latent Space Analysis**: Analyze learned representations with PCA and t-SNE
+- **Conditional Generation**: Generate synthetic cells with specific perturbation conditions and experiment contexts
+- **Perturbation Effect Analysis**: Compare perturbed vs control conditions in a controlled manner
+- **Latent Space Analysis**: Analyze learned representations where cell types emerge naturally
+- **Experiment Conditioning**: Account for technical batch effects through SRX accession embedding
 - **Scalable Data Loading**: Efficient handling of large datasets using HDF5 batch files
 
 ## Installation
@@ -161,9 +162,8 @@ The ConditionalVAE consists of:
 - Output: Reconstructed gene expression
 
 ### Conditioning
-- **Cell Type Embedding**: Maps cell type IDs to dense vectors
 - **Perturbation Embedding**: Maps perturbation IDs to dense vectors
-- **Experiment Embedding**: Maps experiment IDs to dense vectors
+- **Experiment Embedding**: Maps SRX accession IDs to dense vectors (for batch effect correction)
 
 ### Loss Function
 - **Reconstruction Loss**: MSE between input and reconstructed expression
@@ -178,17 +178,15 @@ The `VAEConfig` class controls model hyperparameters:
 @dataclass
 class VAEConfig:
     # Architecture
-    input_dim: int = 2000  # Number of HVG genes
+    input_dim: int = 1808  # Number of genes in VCC dataset
     latent_dim: int = 128  # Latent space dimension
     hidden_dims: List[int] = [512, 256]  # Encoder/decoder hidden layers
     
     # Conditioning vocabularies (automatically determined from data)
-    n_cell_types: int = 50
-    n_perturbations: int = 100
-    n_experiments: int = 500
+    n_perturbations: int = 100  # Number of unique perturbations
+    n_experiments: int = 500    # Number of unique SRX accessions
     
     # Embedding dimensions
-    cell_type_embed_dim: int = 32
     perturbation_embed_dim: int = 32
     experiment_embed_dim: int = 16
     
@@ -221,24 +219,13 @@ class VAEConfig:
 
 ## Applications
 
-### 1. Cell Type Classification
-The VAE can predict cell types by finding the cell type condition that gives the best reconstruction:
-
-```python
-predicted_cell_types = trainer.predict_cell_type(
-    x=gene_expression,
-    perturbation_ids=perturbation_ids,
-    experiment_ids=experiment_ids
-)
-```
-
-### 2. Perturbation Effect Prediction
+### 1. Perturbation Effect Prediction
 Compare gene expression under different perturbation conditions:
 
 ```python
 control_expression = trainer.predict_perturbation_effect(
     x=perturbed_expression,
-    cell_type_ids=cell_type_ids,
+    perturbation_ids=current_perturbation_ids,
     experiment_ids=experiment_ids,
     control_perturbation_id=0
 )
@@ -247,24 +234,32 @@ control_expression = trainer.predict_perturbation_effect(
 fold_change = perturbed_expression / (control_expression + 1e-8)
 ```
 
-### 3. Data Augmentation
+### 2. Data Augmentation
 Generate synthetic cells to augment training datasets:
 
 ```python
 synthetic_cells = model.generate(
-    cell_type_ids=desired_cell_types,
     perturbation_ids=desired_perturbations,
     experiment_ids=experiment_contexts,
     n_samples=1000
 )
 ```
 
-### 4. Latent Space Analysis
-Explore cell relationships in the learned latent space:
+### 3. Latent Space Analysis
+Explore cell relationships in the learned latent space where cell types emerge naturally:
 
 ```python
-mu, logvar = model.encode(x, cell_type_ids, perturbation_ids, experiment_ids)
+mu, logvar = model.encode(x, perturbation_ids, experiment_ids)
 # Analyze mu using PCA, t-SNE, clustering, etc.
+# Cell types will cluster naturally without explicit supervision
+```
+
+### 4. Batch Effect Correction
+Use experiment conditioning to account for technical confounding:
+
+```python
+# Model learns to separate biological signal from technical batch effects
+# through experiment embeddings
 ```
 
 ## Best Practices
