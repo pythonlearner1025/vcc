@@ -14,6 +14,7 @@ import logging
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 import warnings
+import time
 
 import numpy as np
 import pandas as pd
@@ -22,6 +23,7 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
+import wandb
 
 # Add project root to path
 sys.path.append(str(Path(__file__).parent))
@@ -32,6 +34,16 @@ from models.VAE import ConditionalVAE, VAEConfig, VAETrainer, create_metadata_vo
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+wdblog = wandb.init(
+    entity="agreic",
+    # Set the wandb project where this run will be logged.
+    project=f"VAE_Training",
+    name=f"VAE_Training_{time.strftime('%Y%m%d_%H%M%S')}",
+    # Track hyperparameters and run metadata.
+    config={
+        ...
+    },
+)
 
 class ScRNAVAEDataset(Dataset):
     """
@@ -126,17 +138,16 @@ class ScRNAVAEDataset(Dataset):
         # Combine all metadata
         metadata_df = pd.concat(all_metadata, ignore_index=True)
         
-        # Create synthetic cell types and perturbations for demonstration
         # In practice, you would have this information in your metadata
         np.random.seed(42)
         n_cells = len(metadata_df)
         
-        # Simulate cell types (could be inferred from clustering)
-        metadata_df['cell_type'] = np.random.choice(
-            ['T_cell', 'B_cell', 'NK_cell', 'Monocyte', 'Dendritic', 'Other'], 
-            size=n_cells, 
-            p=[0.3, 0.2, 0.1, 0.2, 0.1, 0.1]
-        )
+        # Simulate cell types (could be inferred from clustering) # Cell type = transcriptomic profile
+        # metadata_df['cell_type'] = np.random.choice(
+        #     ['T_cell', 'B_cell', 'NK_cell', 'Monocyte', 'Dendritic', 'Other'], 
+        #     size=n_cells, 
+        #     p=[0.3, 0.2, 0.1, 0.2, 0.1, 0.1]
+        # )
         
         # Simulate perturbations (control vs various treatments)
         metadata_df['perturbation'] = np.random.choice(
@@ -166,7 +177,7 @@ class ScRNAVAEDataset(Dataset):
             x = f['X'][local_idx][self.gene_indices]
             
             # Metadata
-            gene_count = f['obs/gene_count'][local_idx]
+            # gene_count = f['obs/gene_count'][local_idx]
             umi_count = f['obs/umi_count'][local_idx]
             srx_accession = f['obs/SRX_accession'][local_idx].decode()
         
@@ -178,16 +189,16 @@ class ScRNAVAEDataset(Dataset):
             x = self.transform(x)
         
         # Get encoded metadata
-        cell_type_id = self.encoded_metadata['cell_type_ids'][idx]
+        # cell_type_id = self.encoded_metadata['cell_type_ids'][idx]
         perturbation_id = self.encoded_metadata['perturbation_ids'][idx]
         experiment_id = self.encoded_metadata['srx_accession_ids'][idx]
         
         return {
             'x': x,
-            'cell_type_ids': cell_type_id,
+            # 'cell_type_ids': cell_type_id,
             'perturbation_ids': perturbation_id,
             'experiment_ids': experiment_id,
-            'gene_count': torch.tensor(gene_count, dtype=torch.float),
+            # 'gene_count': torch.tensor(gene_count, dtype=torch.float),
             'umi_count': torch.tensor(umi_count, dtype=torch.float),
             'srx_accession': srx_accession
         }
@@ -307,6 +318,18 @@ def train_vae(config: VAEConfig,
     logger.info(f"  Perturbations: {config.n_perturbations}")
     logger.info(f"  Experiments: {config.n_experiments}")
     
+    logger.info(f"Training configuration: {config.__dict__}")
+    wdblog.config.update(config.__dict__)
+    # Log config to wandb
+    wdblog.config.update({
+        'n_epochs': n_epochs,
+        'batch_size': batch_size,
+        'val_split': val_split,
+        'max_cells_per_batch': max_cells_per_batch
+    })
+    wdblog.config.update(vocabularies)
+    wdblog.log({"vocabularies": vocabularies})
+
     # Create model and trainer
     model = ConditionalVAE(config)
     trainer = VAETrainer(model, config, device)
@@ -344,6 +367,15 @@ def train_vae(config: VAEConfig,
                 'recon': f"{losses['reconstruction_loss']:.4f}",
                 'kld': f"{losses['kld_loss']:.4f}"
             })
+
+            # Log to wandb
+            wdblog.log({
+                'train_loss': losses['total_loss'],
+                'reconstruction_loss': losses['reconstruction_loss'],
+                'kld_loss': losses['kld_loss'],
+                # 'epoch': epoch,
+                'global_step': global_step
+            })
             
             global_step += 1
         
@@ -361,7 +393,12 @@ def train_vae(config: VAEConfig,
                 'recon': f"{losses['reconstruction_loss']:.4f}",
                 'kld': f"{losses['kld_loss']:.4f}"
             })
-        
+            wdblog.log({
+                'val_loss': losses['total_loss'],
+                'val_reconstruction_loss': losses['reconstruction_loss'],
+                'val_kld_loss': losses['kld_loss'],
+            })
+
         # Compute epoch averages
         avg_train_loss = np.mean([l['total_loss'] for l in train_losses])
         avg_val_loss = np.mean([l['total_loss'] for l in val_losses])
@@ -370,6 +407,13 @@ def train_vae(config: VAEConfig,
         writer.add_scalar('epoch/train_loss', avg_train_loss, epoch)
         writer.add_scalar('epoch/val_loss', avg_val_loss, epoch)
         writer.add_scalar('epoch/learning_rate', trainer.optimizer.param_groups[0]['lr'], epoch)
+
+        wdblog.log({
+            'epoch': epoch,
+            'epoch_avg_train_loss': avg_train_loss,
+            'epoch_avg_val_loss': avg_val_loss,
+            'epoch_learning_rate': trainer.optimizer.param_groups[0]['lr']
+        })
         
         logger.info(f"Epoch {epoch+1}: Train Loss = {avg_train_loss:.4f}, Val Loss = {avg_val_loss:.4f}")
         
@@ -427,27 +471,27 @@ def evaluate_model(model: ConditionalVAE,
         for key in all_losses[0].keys()
     }
     
-    # Cell type prediction evaluation
-    correct_predictions = 0
-    total_predictions = 0
+    # # Cell type prediction evaluation
+    # correct_predictions = 0
+    # total_predictions = 0
     
-    with torch.no_grad():
-        for batch in tqdm(data_loader, desc="Evaluating cell type prediction"):
-            x = batch['x'].to(device)
-            true_cell_types = batch['cell_type_ids'].to(device)
-            perturbation_ids = batch['perturbation_ids'].to(device)
-            experiment_ids = batch['experiment_ids'].to(device)
+    # with torch.no_grad():
+    #     for batch in tqdm(data_loader, desc="Evaluating cell type prediction"):
+    #         x = batch['x'].to(device)
+    #         true_cell_types = batch['cell_type_ids'].to(device)
+    #         perturbation_ids = batch['perturbation_ids'].to(device)
+    #         experiment_ids = batch['experiment_ids'].to(device)
             
-            predicted_cell_types = trainer.predict_cell_type(x, perturbation_ids, experiment_ids)
+    #         predicted_cell_types = trainer.predict_cell_type(x, perturbation_ids, experiment_ids)
             
-            correct_predictions += (predicted_cell_types == true_cell_types).sum().item()
-            total_predictions += len(true_cell_types)
+    #         correct_predictions += (predicted_cell_types == true_cell_types).sum().item()
+    #         total_predictions += len(true_cell_types)
     
-    cell_type_accuracy = correct_predictions / total_predictions
+    # cell_type_accuracy = correct_predictions / total_predictions
     
     results = {
         **avg_losses,
-        'cell_type_accuracy': cell_type_accuracy
+        # 'cell_type_accuracy': cell_type_accuracy
     }
     
     return results
