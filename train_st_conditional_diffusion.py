@@ -26,7 +26,8 @@ from models.diffusion import (
     prepare_perturbation_conditioning,
     create_gene_mapping
 )
-from dataset import ScRNADataset
+# Updated imports for cross-dataset HVGs
+from dataset.scrna_hvg_dataset import ScRNADatasetWithHVGs, create_scrna_hvg_dataloader
 from dataset import (
     create_vcc_paired_dataloader,
     create_vcc_validation_dataloader,
@@ -37,17 +38,17 @@ from eval import evaluate_on_vcc_validation, log_vcc_metrics, create_vcc_evaluat
 
 
 class TokenizedScRNADataset(Dataset):
-    """Wrapper around ScRNADataset that applies tokenization."""
+    """Wrapper around ScRNADatasetWithHVGs that applies tokenization."""
     
-    def __init__(self, data_dir: str, tokenizer, max_genes: Optional[int] = None):
-        self.dataset = ScRNADataset(data_dir, max_genes=max_genes)
+    def __init__(self, scrna_dataset: ScRNADatasetWithHVGs, tokenizer):
+        self.dataset = scrna_dataset
         self.tokenizer = tokenizer
         
     def __len__(self):
         return len(self.dataset)
     
     def __getitem__(self, idx):
-        x, meta = self.dataset[idx]
+        x = self.dataset[idx]  # Already returns tensor with HVG genes
         # Apply tokenizer to convert continuous expression to discrete tokens
         tokens = self.tokenizer(x)
         return tokens
@@ -124,8 +125,10 @@ def train_epoch_st(
     epoch: int,
     global_step: int,
     total_training_steps: int,
+    batch_to_idx: Optional[Dict[str, int]] = None,
     use_control_sets: bool = True,
     mixed_training: bool = True,
+    max_steps: Optional[int] = None,
 ) -> int:
     """
     Train for one epoch using ST-style conditioning.
@@ -138,83 +141,99 @@ def train_epoch_st(
         config: Model configuration
         epoch: Current epoch number
         global_step: Global step counter
+        total_training_steps: Total training steps for LR scheduling
+        batch_to_idx: Mapping from batch names to indices for batch conditioning
         use_control_sets: Whether to use control set conditioning
         mixed_training: Whether to mix conditioned and unconditioned batches
+        max_steps: Maximum number of steps to run (for debugging), None for full epoch
         
     Returns:
         Updated global step
     """
-    print("Setting model to train mode")
     model.train()
     epoch_start = time.time()
     epoch_losses = []
     
     total_steps = len(dataloader)
-    print(f"Starting epoch with {total_steps} total steps")
+    if max_steps is not None:
+        total_steps = min(total_steps, max_steps)
+        print(f"Debug mode: limiting epoch to {max_steps} steps")
     
     for batch_idx, batch in enumerate(dataloader):
-        print(f"\nProcessing batch {batch_idx+1}/{total_steps}")
+        # Early cutoff for debugging
+        if max_steps is not None and batch_idx >= max_steps:
+            print(f"Debug cutoff: stopping after {max_steps} steps")
+            break
         
         if isinstance(batch, dict) and 'perturbed_expr' in batch:
-            print("Processing VCC paired data")
+            # Processing VCC paired data
             X_pert = batch['perturbed_expr'].cuda()
             X_ctrl = batch['control_expr'].cuda() if use_control_sets else None
             
             B, S, N = X_pert.shape  # (batch, set_size, n_genes)
-            print(f"Batch shape: {B} batches, {S} cells per set, {N} genes")
-            
-            print("Flattening perturbed expression")
             X_pert_flat = X_pert.view(B * S, N)
             
-            print("Processing conditioning information")
+            # Process conditioning information
             target_gene_idx = batch['target_gene_idx']
             if isinstance(target_gene_idx, list):
                 target_gene_idx = torch.tensor(target_gene_idx)
             target_gene_idx = target_gene_idx.cuda()
             
-            print("Computing perturbation signs")
+            # Compute perturbation signs
             log2fc = batch['log2fc'].cuda()
             if log2fc.dim() > 1:
-                print("Averaging log2fc across genes")
                 log2fc_avg = log2fc.mean(dim=-1)
             else:
                 log2fc_avg = log2fc
             perturb_sign = torch.sign(log2fc_avg).long()
             
-            print("Expanding conditioning to match batch")
+            # Expand conditioning to match batch
             target_gene_idx = target_gene_idx.unsqueeze(1).expand(-1, S).reshape(-1)
             log2fc_avg = log2fc_avg.unsqueeze(1).expand(-1, S).reshape(-1)
             perturb_sign = perturb_sign.unsqueeze(1).expand(-1, S).reshape(-1)
             
+            # Process batch information
+            if batch_to_idx is not None and 'pert_batches' in batch:
+                pert_batch_names = batch['pert_batches']  # List of lists: [batch_per_sample][cell_in_set]
+                batch_indices = []
+                for sample_batches in pert_batch_names:
+                    for batch_name in sample_batches:
+                        batch_idx = batch_to_idx.get(batch_name, 0)  # Default to 0 if not found
+                        batch_indices.append(batch_idx)
+                batch_indices = torch.tensor(batch_indices, device='cuda')
+            else:
+                batch_indices = None
+            
             if mixed_training and torch.rand(1).item() < 0.5:
-                print("Using unconditioned batch")
+                # Unconditioned batch
                 X_ctrl = None
                 target_gene_idx = None
                 log2fc = None
                 perturb_sign = None
+                batch_indices = None  # No batch conditioning for unconditioned training
                 tokens = X_pert_flat
             else:
-                print("Using conditioned batch")
+                # Conditioned batch
                 tokens = X_pert_flat
                 log2fc = log2fc_avg
+                # batch_indices already computed above
                 
                 if X_ctrl is not None:
-                    print("Using control sets for cross-attention")
                     # X_ctrl shape: (B, S, N)
                     # We need to repeat each control set S times to match flattened perturbed cells
                     # Each of the S perturbed cells from a batch should see the same control set
                     X_ctrl_expanded = X_ctrl.unsqueeze(1).expand(-1, S, -1, -1)  # (B, S, S, N)
                     X_ctrl = X_ctrl_expanded.reshape(B * S, S, N)  # (B*S, S, N)
         else:
-            print("Processing regular pretraining data")
+            # Processing regular pretraining data
             tokens = batch.cuda()
             B = tokens.shape[0]
             X_ctrl = None
             target_gene_idx = None
             log2fc = None
             perturb_sign = None
+            batch_indices = None  # No batch conditioning for pretraining data
         
-        print("Computing diffusion loss")
         loss = diffusion.compute_loss(
             model, 
             tokens,
@@ -222,25 +241,22 @@ def train_epoch_st(
             target_gene_idx=target_gene_idx,
             perturb_magnitude=log2fc,
             perturb_sign=perturb_sign,
+            batch_idx=batch_indices,
             step=global_step
         )
         
-        print("Performing backward pass")
         optimizer.zero_grad()
         loss.backward()
-        print("Clipping gradients")
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        print("Optimizer step")
         optimizer.step()
         
-        print("Updating learning rate")
         total_training_steps = config.pretrain_epochs * len(dataloader) + config.finetune_epochs * len(dataloader)
         lr = cosine_lr_schedule(optimizer, global_step, total_training_steps, config)
         
         epoch_losses.append(loss.item())
         
-        if global_step % config.log_every == 0:
-            print("Logging metrics")
+        # Log every 10 steps
+        if global_step % 10 == 0:
             avg_loss = np.mean(epoch_losses[-100:]) if len(epoch_losses) > 100 else np.mean(epoch_losses)
             print(f"Epoch {epoch:3d} [{batch_idx+1:4d}/{total_steps:4d}] | "
                   f"Step {global_step:6d} | Loss: {loss.item():.4f} | "
@@ -256,7 +272,6 @@ def train_epoch_st(
             })
         
         if global_step % config.save_every == 0 and global_step > 0:
-            print("Saving checkpoint")
             checkpoint_path = f'checkpoint_st_epoch_{epoch}_step_{global_step}.pt'
             torch.save({
                 'model_state_dict': model.state_dict(),
@@ -271,7 +286,8 @@ def train_epoch_st(
     
     epoch_time = time.time() - epoch_start
     avg_epoch_loss = np.mean(epoch_losses)
-    print(f"\nEpoch {epoch} completed in {epoch_time:.1f}s | Avg Loss: {avg_epoch_loss:.4f}")
+    steps_completed = min(len(dataloader), max_steps) if max_steps is not None else len(dataloader)
+    print(f"Epoch {epoch} completed in {epoch_time:.1f}s | Steps: {steps_completed} | Avg Loss: {avg_epoch_loss:.4f}")
     
     return global_step
 
@@ -283,23 +299,50 @@ def evaluate_zero_shot(
     config: ConditionalModelConfig,
     gene_to_idx: Dict[str, int],
     epoch: int,
+    batch_to_idx: Optional[Dict[str, int]] = None,
+    max_steps: Optional[int] = None,
 ) -> Dict[str, float]:
     """
     Evaluate zero-shot perturbation prediction on validation genes.
+    
+    Args:
+        max_steps: Maximum number of batches to evaluate (for debugging), None for full dataset
     """
     model.eval()
     
     all_predictions = []
     all_targets = []
     all_genes = []
+    
+    total_batches = len(val_dataloader)
+    if max_steps is not None:
+        total_batches = min(total_batches, max_steps)
+        print(f"Debug mode: limiting evaluation to {max_steps} batches")
+    
     with torch.no_grad():
-        for batch in val_dataloader:
+        for batch_idx, batch in enumerate(val_dataloader):
+            # Early cutoff for debugging
+            if max_steps is not None and batch_idx >= max_steps:
+                print(f"Debug cutoff: stopping evaluation after {max_steps} batches")
+                break
+                
             # Get control sets
-            print(batch.keys())
             X_ctrl = batch['control_expr'].cuda()  # Fixed: was 'X_ctrl_tokens'
             target_genes = batch['target_gene']
             target_gene_idx = batch['target_gene_idx'].cuda()
             log2fc = batch['log2fc'].cuda()
+            
+            # Process batch information for validation
+            if batch_to_idx is not None and 'control_batches' in batch:
+                control_batch_names = batch['control_batches']  # List of lists
+                batch_indices = []
+                for sample_batches in control_batch_names:
+                    for batch_name in sample_batches:
+                        batch_idx = batch_to_idx.get(batch_name, 0)
+                        batch_indices.append(batch_idx)
+                batch_indices = torch.tensor(batch_indices, device='cuda')
+            else:
+                batch_indices = None
             
             # Compute perturb_sign from log2fc like in training
             if log2fc.dim() > 1:
@@ -318,6 +361,7 @@ def evaluate_zero_shot(
                 target_gene_idx=target_gene_idx.unsqueeze(1).expand(-1, S).reshape(-1),
                 perturb_magnitude=log2fc_avg.unsqueeze(1).expand(-1, S).reshape(-1),  # Fixed: use log2fc_avg
                 perturb_sign=perturb_sign.unsqueeze(1).expand(-1, S).reshape(-1),
+                batch_idx=batch_indices,
                 temperature=1.0,
                 device='cuda'
             )
@@ -330,8 +374,10 @@ def evaluate_zero_shot(
             all_genes.extend(target_genes)
     
     # Compute metrics
+    batches_evaluated = min(len(val_dataloader), max_steps) if max_steps is not None else len(val_dataloader)
     metrics = {
         'zero_shot_genes_evaluated': len(set(all_genes)),
+        'zero_shot_batches_evaluated': batches_evaluated,
         'epoch': epoch
     }
     
@@ -339,13 +385,39 @@ def evaluate_zero_shot(
 
 
 def main():
+    """
+    MEMORY OPTIMIZATION STRATEGY:
+    
+    This model faces unique memory challenges due to:
+    1. Large sequence length: 2000 genes per cell (vs typical 512-2048 in language models)
+    2. Set-based training: Each batch contains batch_size × set_size sequences
+    3. Cross-attention: Control sets add additional memory overhead
+    
+    Memory scaling for self-attention: O(batch_size × set_size × n_heads × seq_len²)
+    With seq_len=2000: each sequence pair requires 4M attention operations per head
+    
+    Current settings:
+    - batch_size=2, set_size=16 → 32 total sequences per batch
+    - 8 attention heads, 2000 sequence length
+    - Memory per batch: ~1GB for attention matrices (manageable)
+    
+    If you get OOM errors:
+    1. Reduce batch_size further (to 1 if needed)
+    2. Reduce set_size (but may hurt model performance)
+    3. Consider gradient checkpointing
+    4. Use multi-query attention (already implemented)
+    
+    DEBUG MODE:
+    For quick testing, set config.debug_max_steps to a small number (e.g., 10-50)
+    This will limit both training and evaluation to the specified number of steps.
+    """
     # Configuration
     config = ConditionalModelConfig(
         # Model architecture
-        dim=128,
-        n_head=4,
-        n_layer=4,
-        ffn_mult=4,
+        dim=256,
+        n_head=8,
+        n_layer=8,
+        ffn_mult=8,
         vocab_size=64,
         n_genes=2000,
         
@@ -356,31 +428,50 @@ def main():
         perturb_magnitude_dim=64,
         magnitude_clip=5.0,
         
+        # Batch conditioning - ENABLED with correct number of batches
+        use_batch_conditioning=True,
+        n_batches=48,  # From VCC data exploration: 48 unique batches
+        batch_embed_dim=64,
+        
         # Control set encoder
         control_set_encoder_layers=2,
         control_set_dim_hidden=128,
-        control_set_dim_out=128,  # Must match model dim for cross-attention
+        # LEGACY, this is now just config.dim
+        #control_set_dim_out=128,  # Must match model dim for cross-attention
         
         # Diffusion
         n_timesteps=10,
         mask_ratio=0.30,
         schedule="cosine",
         
-        # Training
-        batch_size=1,  # Smaller batch size due to sets
+        # Training - MEMORY OPTIMIZED
+        # Note: With 2000-gene sequences, attention is O(N²) = 4M operations per head per sequence
+        # Each batch processes batch_size × set_size = total sequences
+        # Memory scales as: total_sequences × n_heads × sequence_length²
+        pretrain_batch_size=32,  # Very small due to 2000-token sequences and cross-attention
+        vcc_batch_size=1,
+        vcc_set_size=32,
         learning_rate=1e-4,
         weight_decay=0.01,
         warmup_steps=5000,
+
+        # Pretrain data dir  
+        pretrain_data_dir = "data/scRNA_1e5/processed",
         
         # Epochs
         pretrain_epochs=0,
         finetune_epochs=1,
         
         # Logging
-        log_every=50,
+        log_every=10,  # Updated to match hardcoded logging frequency
         eval_every=1000,
         save_every=5000,
         vcc_eval_interval=5000,
+        
+        # Debug - set to None for full training, or number of steps for quick debugging
+        debug_pretrain_max_steps = 500000,
+        debug_finetune_max_steps = 10,
+        debug_eval_max_steps = 1 # equivalent to validation set's target perturb genes
     )
     
     # Initialize wandb
@@ -400,57 +491,79 @@ def main():
     # Create tokenizer
     tokenizer, detokenizer = create_simple_tokenizer(config.vocab_size)
     
+    # Path to cross-dataset HVG info
+    hvg_info_path = "data/vcc_data/cross_dataset_hvg_info.json"
+    
+    # Check if cross-dataset HVG info exists
+    if not Path(hvg_info_path).exists():
+        print(f"\nERROR: Cross-dataset HVG info not found at {hvg_info_path}")
+        print("Please run: python scripts/compute_cross_dataset_hvgs.py")
+        return
+    
     # Create dataloaders
     print("\n=== Creating Dataloaders ===")
     
-    # Create pretrain dataloader from HVG-filtered scRNA data
-    print("Creating scRNA pretrain dataloader...")
-    pretrain_dataset = TokenizedScRNADataset(
-        data_dir="data/scRNA/processed",
-        tokenizer=tokenizer,
-        max_genes=config.n_genes  # Use 2000 HVG genes
+    # Create pretrain dataloader using cross-dataset HVGs
+    print("Creating scRNA pretrain dataloader with cross-dataset HVGs...")
+    scrna_dataset, _ = create_scrna_hvg_dataloader(
+        data_dir=config.pretrain_data_dir,
+        hvg_info_path=hvg_info_path,
+        batch_size=1,  # We'll batch in the wrapper
+        shuffle=False,
+        num_workers=0,
+        use_cache=True
     )
+    
+    # Wrap with tokenizer
+    pretrain_dataset = TokenizedScRNADataset(scrna_dataset, tokenizer)
     
     pretrain_dataloader = DataLoader(
         pretrain_dataset,
-        batch_size=config.batch_size,  # Fixed: use batch_size instead of pretrain_batch_size
+        batch_size=config.pretrain_batch_size,
         shuffle=True,
         num_workers=4,
         pin_memory=True,
         drop_last=True
     )
     
-    print(f"Pretrain dataset: {len(pretrain_dataset):,} cells, {pretrain_dataset.dataset.n_genes} genes")
+    print(f"Pretrain dataset: {len(pretrain_dataset):,} cells, {scrna_dataset.n_hvgs} HVG genes")
     
-    # VCC paired dataloader for fine-tuning
+    # VCC paired dataloader for fine-tuning (already uses HVGs from hvg_info.json)
+    # MEMORY NOTE: set_size=16 means each batch has batch_size × 16 = total sequences
+    # With batch_size=2, set_size=16: 32 sequences of 2000 tokens each
+    # Attention memory: 32 × 8 × 2000² = ~1GB (manageable)
     vcc_dataset, vcc_dataloader = create_vcc_paired_dataloader(
-        set_size=16,
-        batch_size=config.batch_size,
+        set_size=config.vcc_set_size,
+        batch_size=config.vcc_batch_size,
         tokenizer=tokenizer,
         num_workers=4,
         match_by_batch=True,
-        use_hvgs=True  # Use HVG genes
+        use_hvgs=True  # Uses hvg_info.json which should now be cross-dataset
     )
     
     # VCC validation dataloader
     val_dataset, val_dataloader = create_vcc_validation_dataloader(
-        set_size=16,
-        batch_size=config.batch_size,
+        set_size=config.vcc_set_size,
+        batch_size=config.vcc_batch_size,
         tokenizer=tokenizer,
-        n_samples_per_gene=10,
-        use_hvgs=True,  # Use HVG genes
+        n_samples_per_gene=1,
+        use_hvgs=True,  # Uses hvg_info.json which should now be cross-dataset
         num_workers=0  # Disable multiprocessing to avoid worker issues
     )
     
-    # Load HVG info to get gene names
-    hvg_info_path = Path("data/vcc_data/hvg_info.json")
+    # Load cross-dataset HVG info to get gene names
     with open(hvg_info_path, 'r') as f:
         hvg_info = json.load(f)
     hvg_genes = hvg_info['hvg_names']
     
-    # VCC dataset already uses HVG genes, so mapping is identity
-    hvg_to_vcc_mapping = {i: i for i in range(len(hvg_genes))}
+    # Create gene to index mapping
     vcc_gene_to_idx = {gene: idx for idx, gene in enumerate(hvg_genes)}
+    
+    # Create batch name to index mapping for conditioning
+    # Get unique batch names from the VCC dataset
+    unique_batches = sorted(list(set(vcc_dataset.adata.obs['batch'].values)))
+    batch_to_idx = {batch_name: idx for idx, batch_name in enumerate(unique_batches)}
+    print(f"Found {len(unique_batches)} unique batches for batch conditioning")
     
     global_step = 0
     
@@ -460,21 +573,36 @@ def main():
     total_training_steps = pretrain_steps + finetune_steps
     print(f"\nTotal training steps: {total_training_steps:,} (pretrain: {pretrain_steps:,}, finetune: {finetune_steps:,})")
     
+    # Create unique checkpoint directory with timestamp
+    from datetime import datetime
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    checkpoint_dir = Path(f"checkpoints/run_{timestamp}")
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Save config
+    config_path = checkpoint_dir / "config.json"
+    with open(config_path, "w") as f:
+        json.dump(config.__dict__, f, indent=2)
+    print(f"\nSaved config to {config_path}")
+    
     # Phase 1: Pretraining on single cells
     if config.pretrain_epochs > 0:
         print(f"\n=== Phase 1: Pretraining on scRNA data ({config.pretrain_epochs} epochs) ===")
         print(f"Using {len(pretrain_dataset):,} cells for pretraining")
+        print("Gene indices are now consistent with VCC fine-tuning!")
         
         for epoch in range(config.pretrain_epochs):
             global_step = train_epoch_st(
                 model, diffusion, pretrain_dataloader, optimizer, config,
                 epoch, global_step, total_training_steps,
+                batch_to_idx=None,  # No batch conditioning for pretraining
                 use_control_sets=False,  # No control sets in pretraining
-                mixed_training=False
+                mixed_training=False,
+                max_steps=config.debug_pretrain_max_steps
             )
             
         # Save checkpoint after pretraining
-        pretrain_checkpoint = 'checkpoint_st_pretrained.pt'
+        pretrain_checkpoint = checkpoint_dir / "checkpoint_st_pretrained.pt"
         torch.save({
             'model_state_dict': model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
@@ -488,12 +616,17 @@ def main():
     
     # Phase 2: Fine-tuning with control sets
     print("\n=== Phase 2: Fine-tuning with Control Sets ===")
+    print("Using same HVG gene indices as pretraining - transfer learning enabled!")
+    print(f"Using batch_size={config.pretrain_batch_size} optimized for 2000-gene sequences")
+    
     for epoch in range(config.pretrain_epochs, config.pretrain_epochs + config.finetune_epochs):
         global_step = train_epoch_st(
             model, diffusion, vcc_dataloader, optimizer, config,
             epoch, global_step, total_training_steps,
+            batch_to_idx=batch_to_idx,  # Pass batch mapping for conditioning
             use_control_sets=True,
-            mixed_training=True  # Mix conditioned and unconditioned batches
+            mixed_training=True,  # Mix conditioned and unconditioned batches
+            max_steps=config.debug_finetune_max_steps
         )
         
         # Evaluate zero-shot performance
@@ -501,14 +634,15 @@ def main():
             print("\n=== Zero-shot Evaluation ===")
             metrics = evaluate_zero_shot(
                 model, diffusion, val_dataloader, config,
-                vcc_gene_to_idx, epoch
+                vcc_gene_to_idx, epoch, batch_to_idx,
+                max_steps=config.debug_eval_max_steps
             )
             
             print(f"Zero-shot genes evaluated: {metrics['zero_shot_genes_evaluated']}")
             wandb.log(metrics)
     
     # Final save
-    final_checkpoint = 'checkpoint_st_final.pt'
+    final_checkpoint = checkpoint_dir / "checkpoint_st_final.pt"
     torch.save({
         'model_state_dict': model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),

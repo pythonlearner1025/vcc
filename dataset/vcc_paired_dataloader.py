@@ -42,16 +42,17 @@ class VCCPairedDataset(Dataset):
             use_hvgs: Whether to use only highly variable genes
         """
         print(f"Loading VCC paired data from: {data_path}")
-        self.adata = sc.read_h5ad(data_path)
         self.set_size = set_size
         self.tokenizer = tokenizer
         self.match_by_batch = match_by_batch
         self.use_hvgs = use_hvgs
+        self.data_path = data_path
         
         # Load HVG information if requested
         self.hvg_indices = None
         self.hvg_names = None
         self.gene_name_to_hvg_idx = None
+        self.expression_data = None
         
         if use_hvgs:
             hvg_info = load_hvg_info_with_cache(data_path)
@@ -62,22 +63,60 @@ class VCCPairedDataset(Dataset):
             
             print(f"Using {len(self.hvg_indices)} HVG genes")
             
-            # Filter genes to only HVGs
-            self.adata = self.adata[:, self.hvg_indices]
-            self.gene_names = self.hvg_names
-        else:
-            self.gene_names = self.adata.var.index.tolist()
+            # Try to load dense arrays from cache if all HVG keys are present
+            if all(key in hvg_info for key in ['hvg_indices', 'hvg_names', 'gene_name_to_hvg_idx']):
+                from .vcc_dataloader import load_dense_arrays_with_cache, save_dense_arrays_to_cache
+                self.expression_data = load_dense_arrays_with_cache(data_path, self.hvg_indices, max_cells)
+        
+        # Load adata only if we don't have cached dense arrays
+        if self.expression_data is None:
+            self.adata = sc.read_h5ad(data_path)
             
-        if max_cells is not None and len(self.adata) > max_cells:
-            self.adata = self.adata[:max_cells]
+            if use_hvgs:
+                # Filter genes to only HVGs
+                self.adata = self.adata[:, self.hvg_indices]
+                self.gene_names = self.hvg_names
+            else:
+                self.gene_names = self.adata.var.index.tolist()
+                
+            if max_cells is not None and len(self.adata) > max_cells:
+                self.adata = self.adata[:max_cells]
+                
+            # Convert to dense array ONCE during initialization for fast access
+            print("Converting expression data to dense array...")
+            if hasattr(self.adata.X, 'toarray'):
+                self.expression_data = self.adata.X.toarray()
+            else:
+                self.expression_data = self.adata.X.copy()
+            print(f"Expression data shape: {self.expression_data.shape}")
             
-        # Convert to dense array ONCE during initialization for fast access
-        print("Converting expression data to dense array...")
-        if hasattr(self.adata.X, 'toarray'):
-            self.expression_data = self.adata.X.toarray()
+            # Cache the dense arrays if using HVGs
+            if use_hvgs and all(key in hvg_info for key in ['hvg_indices', 'hvg_names', 'gene_name_to_hvg_idx']):
+                from .vcc_dataloader import save_dense_arrays_to_cache
+                save_dense_arrays_to_cache(data_path, self.hvg_indices, self.expression_data, max_cells)
         else:
-            self.expression_data = self.adata.X.copy()
-        print(f"Expression data shape: {self.expression_data.shape}")
+            # We have cached data, still need to set up gene names and adata metadata
+            print(f"Using cached dense arrays, shape: {self.expression_data.shape}")
+            if use_hvgs:
+                self.gene_names = self.hvg_names
+            
+            # Load minimal adata for metadata (obs) without expression data
+            self.adata = sc.read_h5ad(data_path)
+            if max_cells is not None and len(self.adata) > max_cells:
+                self.adata = self.adata[:max_cells]
+            
+            # Verify shapes match
+            if self.expression_data.shape[0] != len(self.adata):
+                print(f"Warning: Cached data shape {self.expression_data.shape} doesn't match adata {len(self.adata)}. Recomputing...")
+                # Fall back to normal loading
+                if use_hvgs:
+                    self.adata = self.adata[:, self.hvg_indices]
+                
+                if hasattr(self.adata.X, 'toarray'):
+                    self.expression_data = self.adata.X.toarray()
+                else:
+                    self.expression_data = self.adata.X.copy()
+                print(f"Recomputed expression data shape: {self.expression_data.shape}")
             
         # Build indices
         self._build_indices()
@@ -194,6 +233,10 @@ class VCCPairedDataset(Dataset):
             except ValueError:
                 target_idx = -1
         
+        # Get batch information for selected cells
+        control_batches = [self.adata.obs.iloc[idx]['batch'] for idx in selected_ctrl]
+        pert_batches = [self.adata.obs.iloc[idx]['batch'] for idx in selected_pert]
+        
         # Apply tokenizer if provided
         if self.tokenizer is not None:
             control_expr = self.tokenizer(control_expr)
@@ -214,6 +257,8 @@ class VCCPairedDataset(Dataset):
             'control_mean': torch.FloatTensor(control_mean),
             'log2fc': torch.FloatTensor(log2fc),
             'perturbation_magnitude': float(np.linalg.norm(log2fc)),
+            'control_batches': control_batches,  # List of batch names for control cells
+            'pert_batches': pert_batches,        # List of batch names for perturbed cells
         }
         
         return result
@@ -305,6 +350,10 @@ class VCCValidationDataset(Dataset):
             target_idx = self.vcc_dataset.get_gene_index(target_gene)
             if target_idx is None:
                 target_idx = -1
+            
+            # Get batch information for selected cells (validation uses VCCDataset)
+            control_batches = [self.vcc_dataset.batches[idx] for idx in selected_ctrl1]
+            pert_batches = [self.vcc_dataset.batches[idx] for idx in selected_ctrl2]
                 
             # Apply tokenizer if provided
             if self.tokenizer is not None:
@@ -326,6 +375,8 @@ class VCCValidationDataset(Dataset):
                 'control_mean': torch.FloatTensor(control_mean),
                 'log2fc': torch.FloatTensor(log2fc),
                 'perturbation_magnitude': 0.0,  # No perturbation for validation genes
+                'control_batches': control_batches,  # List of batch names for control cells
+                'pert_batches': pert_batches,        # List of batch names for perturbed cells
             }
         except Exception as e:
             print(f"Error in validation dataset __getitem__ at idx {idx}: {e}")

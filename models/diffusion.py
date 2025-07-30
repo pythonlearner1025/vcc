@@ -13,7 +13,6 @@ import torch.nn.functional as F
 from typing import Dict, List, Tuple, Optional
 from dataclasses import dataclass
 
-
 @dataclass
 class ConditionalModelConfig:
     """Configuration for conditional diffusion model."""
@@ -32,10 +31,15 @@ class ConditionalModelConfig:
     perturb_magnitude_dim: int = 64  # Hidden dimension for magnitude processing
     magnitude_clip: float = 5.0  # Clip log2 fold changes to [-5, 5]
     
+    # Batch conditioning
+    # TODO get true number of batches in VCC
+    n_batches: int = 100  # Estimate of unique batches across datasets
+    batch_embed_dim: int = 64  # Batch embedding dimension
+    use_batch_conditioning: bool = True
+    
     # Control set conditioning
     control_set_encoder_layers: int = 2
     control_set_dim_hidden: int = 128
-    control_set_dim_out: int = 512
     
     # Diffusion parameters
     n_timesteps: int = 10
@@ -43,20 +47,28 @@ class ConditionalModelConfig:
     schedule: str = "cosine"
     
     # Training parameters
-    batch_size: int = 32
+    pretrain_batch_size: int = 32
     learning_rate: float = 3e-4
     weight_decay: float = 0.01
     warmup_steps: int = 1000
+
+    vcc_batch_size: int = 1
+    vcc_set_size: int = 64
     
     # Training epochs (replacing step-based training)
     pretrain_epochs: int = 50
     finetune_epochs: int = 20
+    pretrain_data_dir: str = "data/scRNA_1e5"
     
     # Logging
     log_every: int = 100
     eval_every: int = 1000
     save_every: int = 5000
     vcc_eval_interval: int = 5000
+
+    debug_pretrain_max_steps: Optional[int] = None 
+    debug_finetune_max_steps: Optional[int] = None
+    debug_eval_max_steps: int = 50
     
     @property
     def n_params(self) -> int:
@@ -67,6 +79,10 @@ class ConditionalModelConfig:
         params += self.n_total_genes * self.gene_embed_dim  # Gene embeddings
         params += 3 * self.perturb_sign_dim  # Sign embeddings (3 values)
         params += self.perturb_magnitude_dim * self.dim * 3  # Magnitude MLP (3 layers)
+        
+        # Batch conditioning
+        if self.use_batch_conditioning:
+            params += self.n_batches * self.batch_embed_dim  # Batch embeddings
         
         # Transformer layers
         per_layer = (
@@ -265,7 +281,7 @@ class ConditionalDiffusionTransformer(nn.Module):
         self.control_encoder = ControlSetEncoder(
             n_genes=config.n_genes,  # Control sets have n_genes dimensions (after tokenization)
             d_hidden=config.control_set_dim_hidden,
-            d_out=config.control_set_dim_out,
+            d_out=config.dim,
             n_layers=config.control_set_encoder_layers
         )
         
@@ -274,6 +290,10 @@ class ConditionalDiffusionTransformer(nn.Module):
         
         # Sign embedding: -1 (knockdown), 0 (control), +1 (activation)
         self.perturb_sign_embed = nn.Embedding(3, config.perturb_sign_dim)
+        
+        # Batch embedding
+        if config.use_batch_conditioning:
+            self.batch_embed = nn.Embedding(config.n_batches, config.batch_embed_dim)
         
         # Magnitude processing: continuous log2 fold change
         self.perturb_magnitude = nn.Sequential(
@@ -285,7 +305,8 @@ class ConditionalDiffusionTransformer(nn.Module):
         )
         
         # Combine conditioning
-        total_cond_dim = config.gene_embed_dim + config.perturb_sign_dim + config.dim
+        batch_dim = config.batch_embed_dim if config.use_batch_conditioning else 0
+        total_cond_dim = config.gene_embed_dim + config.perturb_sign_dim + config.dim + batch_dim
         self.cond_proj = nn.Sequential(
             nn.Linear(total_cond_dim, config.dim),
             nn.GELU(),
@@ -321,6 +342,7 @@ class ConditionalDiffusionTransformer(nn.Module):
         target_gene_idx: Optional[torch.LongTensor] = None,  # (B,)
         perturb_magnitude: Optional[torch.FloatTensor] = None,  # (B,) log2 fold change
         perturb_sign: Optional[torch.LongTensor] = None,  # (B,) -1, 0, +1
+        batch_idx: Optional[torch.LongTensor] = None,  # (B,) batch indices
     ) -> torch.Tensor:
         """
         Forward pass with continuous perturbation conditioning.
@@ -332,6 +354,7 @@ class ConditionalDiffusionTransformer(nn.Module):
             target_gene_idx: Target gene indices
             perturb_magnitude: Log2 fold change values (continuous)
             perturb_sign: Direction of perturbation (-1: down, 0: control, +1: up)
+            batch_idx: Batch indices for technical variation conditioning
             
         Returns:
             Logits of shape (batch_size, n_genes, vocab_size)
@@ -367,7 +390,15 @@ class ConditionalDiffusionTransformer(nn.Module):
             sign_emb = self.perturb_sign_embed(sign_idx_clamped)  # (B, sign_dim)
             
             # Combine embeddings
-            cond_emb = torch.cat([gene_emb, sign_emb, magnitude_emb], dim=-1)
+            cond_components = [gene_emb, sign_emb, magnitude_emb]
+            
+            # Add batch embedding if provided
+            if self.config.use_batch_conditioning and batch_idx is not None:
+                batch_idx_clamped = torch.clamp(batch_idx, 0, self.config.n_batches - 1)
+                batch_emb = self.batch_embed(batch_idx_clamped)  # (B, batch_embed_dim)
+                cond_components.append(batch_emb)
+            
+            cond_emb = torch.cat(cond_components, dim=-1)
             cond_emb = self.cond_proj(cond_emb)  # (B, D)
             
             # Combine time and conditioning
@@ -477,6 +508,7 @@ class PartialMaskingDiffusion:
         target_gene_idx: Optional[torch.LongTensor] = None,
         perturb_magnitude: Optional[torch.FloatTensor] = None,
         perturb_sign: Optional[torch.LongTensor] = None,
+        batch_idx: Optional[torch.LongTensor] = None,
         mask_token: int = 63,
         step: int = 0,
     ) -> torch.Tensor:
@@ -502,7 +534,8 @@ class PartialMaskingDiffusion:
             control_set=control_set,
             target_gene_idx=target_gene_idx,
             perturb_magnitude=perturb_magnitude,
-            perturb_sign=perturb_sign
+            perturb_sign=perturb_sign,
+            batch_idx=batch_idx
         )
         
         # Compute loss only on masked positions
@@ -523,6 +556,7 @@ class PartialMaskingDiffusion:
         target_gene_idx: Optional[torch.LongTensor] = None,
         perturb_magnitude: Optional[torch.FloatTensor] = None,
         perturb_sign: Optional[torch.LongTensor] = None,
+        batch_idx: Optional[torch.LongTensor] = None,
         mask_token: int = 63,
         temperature: float = 1.0,
         device: str = 'cuda',
@@ -545,7 +579,8 @@ class PartialMaskingDiffusion:
                 control_set=control_set,
                 target_gene_idx=target_gene_idx,
                 perturb_magnitude=perturb_magnitude,
-                perturb_sign=perturb_sign
+                perturb_sign=perturb_sign,
+                batch_idx=batch_idx
             )
             
             logits = logits / temperature
@@ -761,6 +796,7 @@ class ImprovedPartialMaskingDiffusion(PartialMaskingDiffusion):
         target_gene_idx: Optional[torch.LongTensor] = None,
         perturb_magnitude: Optional[torch.FloatTensor] = None,
         perturb_sign: Optional[torch.LongTensor] = None,
+        batch_idx: Optional[torch.LongTensor] = None,
         mask_token: int = 63,
         step: int = 0,
         use_aux_losses: bool = True,
@@ -774,7 +810,7 @@ class ImprovedPartialMaskingDiffusion(PartialMaskingDiffusion):
         # Standard diffusion loss
         main_loss = self.compute_loss(
             model, x_start, control_set, target_gene_idx, 
-            perturb_magnitude, perturb_sign, mask_token, step
+            perturb_magnitude, perturb_sign, batch_idx, mask_token, step
         )
         
         losses = {'main_loss': main_loss}
@@ -789,6 +825,7 @@ class ImprovedPartialMaskingDiffusion(PartialMaskingDiffusion):
                     target_gene_idx=target_gene_idx,
                     perturb_magnitude=perturb_magnitude,
                     perturb_sign=perturb_sign,
+                    batch_idx=batch_idx,
                     device=x_start.device
                 )
             
