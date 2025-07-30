@@ -45,9 +45,9 @@ python dataset/download.py --cell-count 1000000 --output-dir data/scRNA
 
 # Download with custom batch size (number of samples processed together)
 python dataset/download.py \
-    --cell-count 2000000 \
+    --cell-count 2000 \
     --output-dir data/scRNA \
-    --batch-size 20
+    --batch-size 1000
 ```
 
 **Available Parameters:**
@@ -644,7 +644,7 @@ python dataset/download.py --cell-count 10000000 --batch-size 25 --output-dir /s
 ```
 
 ### Basic Training Example
-See `train.py` for a complete training example with:
+See `train.py` for a complete training example with:  ## NON EXISTING?
 - HVG preprocessing integration
 - Custom tokenization strategies (direct, binned, log-scale)
 - Simple transformer architecture
@@ -670,6 +670,29 @@ python train_mini_diffusion.py
 - 3072 hidden dim, 24 attention heads
 - Perturbation conditioning with LoRA adapters
 - Optimized for distributed training with DeepSpeed
+
+## Model Architecture Visualization
+
+Generate comprehensive visualizations of the diffusion transformer architecture:
+
+```bash
+# Create model visualizations without loading weights
+python scripts/visualize_model.py --output-dir ./model_viz
+
+# Use different model size configurations
+python scripts/visualize_model.py --config-preset large --output-dir ./large_model_viz
+```
+
+The visualization script generates:
+- **Architecture diagrams**: High-level model structure and component relationships
+- **Forward pass flow**: Step-by-step computation through the model
+- **Parameter breakdown**: Distribution of parameters across components (~25M total)
+- **Attention mechanism**: Multi-Query Attention and Cross-Attention details
+- **Conditioning pipeline**: How perturbation context is integrated
+- **Diffusion process**: Forward masking and reverse denoising visualization
+- **Computational analysis**: FLOP counts, memory usage, and hardware requirements
+
+All visualizations are saved as PNG files with detailed configuration summaries in JSON and text formats. See the generated `README.md` in the output directory for a complete guide.
 
 ## Citation
 

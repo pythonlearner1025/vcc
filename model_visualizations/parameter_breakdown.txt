@@ -1,0 +1,19 @@
+Detailed Parameter Breakdown
+========================================
+
+Token Embedding          :     32,768 (  0.1%)
+Position Embedding       :  1,024,000 (  3.9%)
+Time Embedding           :      1,024 (  0.0%)
+Gene Embedding           :  4,684,928 ( 17.9%)
+Sign Embedding           :          9 (  0.0%)
+Magnitude MLP            :     98,304 (  0.4%)
+Conditioning Proj        :    658,432 (  2.5%)
+Control Set Encoder      :    768,000 (  2.9%)
+Transformer Layers       : 18,874,368 ( 72.1%)
+Output Head              :     32,768 (  0.1%)
+
+----------------------------------------
+TOTAL                    : 26,174,601 (100.0%)
+
+Model size (FP32): 99.8 MB
+Model size (FP16): 49.9 MB

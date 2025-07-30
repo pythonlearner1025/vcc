@@ -1,0 +1,22 @@
+Computational Requirements Analysis
+==================================================
+
+FLOP ANALYSIS (per forward pass):
+  Total FLOPs: 1,427,148,800,000 (1427.1 GFLOPs)
+  Embeddings: 36,864,000 (0.0 GFLOPs)
+  Attention (all layers): 619,708,416,000 (619.7 GFLOPs)
+  FFN (all layers): 805,306,368,000 (805.3 GFLOPs)
+  Output Head: 2,097,152,000 (2.1 GFLOPs)
+
+MEMORY ANALYSIS:
+  Model parameters: 0.09 GB
+  Activation memory: 0.73 GB
+  Total memory: 0.82 GB
+
+SCALING PROPERTIES:
+  Attention complexity: O(N²) where N = 2000
+  FFN complexity: O(N)
+  Memory scales linearly with batch size
+
+HARDWARE RECOMMENDATIONS:
+  GPU: RTX 4090 (24GB) or similar

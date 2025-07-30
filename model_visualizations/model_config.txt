@@ -1,0 +1,37 @@
+Conditional Diffusion Transformer Configuration
+==================================================
+
+ARCHITECTURE:
+  Model Dimension: 512
+  Number of Heads: 8
+  Number of Layers: 6
+  FFN Multiplier: 4
+  Vocabulary Size: 64
+  Number of HVGs: 2000
+  Total Genes in Vocab: 36601
+
+CONDITIONING:
+  Gene Embedding Dim: 128
+  Perturbation Sign Dim: 3
+  Perturbation Magnitude Dim: 64
+  Magnitude Clipping: ±5.0
+  Control Set Encoder Layers: 2
+  Control Set Hidden Dim: 128
+  Control Set Output Dim: 512
+
+DIFFUSION:
+  Number of Timesteps: 10
+  Mask Ratio: 0.3
+  Schedule: cosine
+
+TRAINING:
+  Batch Size: 32
+  Learning Rate: 0.0003
+  Weight Decay: 0.01
+  Warmup Steps: 1000
+  Pretrain Epochs: 50
+  Finetune Epochs: 20
+
+MODEL SIZE:
+  Estimated Parameters: 24,752,265
+  Model Size (approx): 94.4 MB
