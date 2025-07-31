@@ -18,6 +18,7 @@ from dataclasses import dataclass
 # Try to import flash_attn
 try:
     from flash_attn import flash_attn_func
+    print("USING FLASH ATTN")
     HAS_FLASH_ATTN = True
 except ImportError:
     HAS_FLASH_ATTN = False
@@ -301,6 +302,7 @@ class AugmentedGeneEmbedding(nn.Module):
             self.has_esm = True
         except Exception as e:
             self.has_esm = False
+            print(e)
 
     def forward(self, idx: torch.LongTensor) -> torch.Tensor:
         """(B,) or (B,K) → (B,id_dim) or (B,K,id_dim)."""
@@ -389,10 +391,13 @@ class ConditionalDiffusionTransformer(nn.Module):
         # If ESM2 is present we project it to `dim` and cache HVG indices.
         self.use_esm_in_sequence = getattr(self.gene_embed, "has_esm", False)
         if self.use_esm_in_sequence:
-            self._register_buffer(
+            print("self.use_esm_in_sequence = True")
+            self.register_buffer(
                 "_hvg_idx", torch.arange(config.n_genes, dtype=torch.long), persistent=False
             )
             self.gene_proj = nn.Linear(config.gene_embed_dim, config.dim, bias=False)
+            # Fusion layer to combine token and per-gene features (token_emb || gene_feat)
+            self.fuse_proj = nn.Linear(config.dim * 2, config.dim)
 
         # Time embedding
         self.time_emb = nn.Sequential(
@@ -456,16 +461,22 @@ class ConditionalDiffusionTransformer(nn.Module):
         B, N = tokens.shape
 
         # ------------------------------------------------------------------
-        #  (1) Base token and positional embeddings
+        #  (1) Base token embeddings (and optional gene features)
         # ------------------------------------------------------------------
-        x = self.token_emb(tokens) + self.pos_emb  # (B, N, D)
+        token_emb = self.token_emb(tokens)  # (B, N, D)
 
         # Optionally add per‑gene ESM2/ID embeddings projected to model dim.
         if self.use_esm_in_sequence:
             gene_ids = self._hvg_idx.to(tokens.device)  # (N,)
             gene_feat = self.gene_embed(gene_ids)       # (N, gene_embed_dim)
             gene_feat = self.gene_proj(gene_feat)       # (N, D)
-            x = x + gene_feat.unsqueeze(0)              # broadcast over batch
+            gene_feat = gene_feat.unsqueeze(0).expand(token_emb.size(0), -1, -1)
+            x = self.fuse_proj(torch.cat([token_emb, gene_feat], dim=-1))
+        else:
+            x = token_emb
+
+        # Add positional embeddings
+        x = x + self.pos_emb  # (B, N, D)
 
         # ------------------------------------------------------------------
         #  (2) Global time embedding

@@ -7,3 +7,4 @@ pip install https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.
 # copy data to root dir for faster loading
 cp -r data /
 cp esm_all.pt /
+cp token_distribution.json / 

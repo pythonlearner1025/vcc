@@ -4,6 +4,7 @@ ref/
 env/
 assets/
 data/
+data_normalized/
 artifacts/
 __pycache__/
 wandb/

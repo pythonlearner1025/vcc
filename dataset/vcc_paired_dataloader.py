@@ -237,6 +237,7 @@ def create_vcc_paired_dataloader(
     tokenizer=None,
     prefetch_factor: int = 2,
     pin_memory: bool = False,
+    normalize: bool = True
 ) -> Tuple[VCCPairedDataset, DataLoader]:
    
     dataset = VCCPairedDataset(
@@ -247,6 +248,7 @@ def create_vcc_paired_dataloader(
         train_split=train_split,
         is_train=is_train,
         random_seed=random_seed,
+        normalize=normalize
     )
     
     # Build a collate function that performs tokenisation and other CPU-heavy work
