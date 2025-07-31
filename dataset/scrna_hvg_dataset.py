@@ -8,6 +8,7 @@ from torch.utils.data import Dataset
 import numpy as np
 from pathlib import Path
 from typing import Optional, Dict, List
+import scanpy as sc
 import json
 
 
@@ -19,7 +20,8 @@ class ScRNADatasetWithHVGs(Dataset):
         data_dir: str, 
         hvg_genes: List[str],
         transform=None,
-        use_cache: bool = True
+        use_cache: bool = True,
+        normalize: bool = True
     ):
         """
         Args:
@@ -31,6 +33,7 @@ class ScRNADatasetWithHVGs(Dataset):
         self.data_dir = Path(data_dir)
         self.transform = transform
         self.use_cache = use_cache
+        self.normalize = normalize
         
         # Store HVG genes
         self.hvg_genes = hvg_genes
@@ -107,6 +110,19 @@ class ScRNADatasetWithHVGs(Dataset):
         batch_file = self.batch_files[batch_idx]
         with h5py.File(batch_file, 'r') as f:
             X = f['X'][:]
+
+            # Apply normalization if requested
+        if self.normalize:
+            # Convert to float32 for normalization
+            X = X.astype(np.float32)
+            
+            # CP10K normalization: scale each cell to 10,000 total counts
+            row_sums = X.sum(axis=1, keepdims=True)
+            row_sums[row_sums == 0] = 1  # Avoid division by zero
+            X = (X / row_sums) * 10000
+            
+            # Log1p transformation
+            X = np.log1p(X)
         
         # Extract HVG columns
         X_hvg = self._extract_hvg_columns(X)
@@ -157,7 +173,8 @@ def create_scrna_hvg_dataloader(
     batch_size: int = 32,
     shuffle: bool = True,
     num_workers: int = 4,
-    use_cache: bool = True
+    use_cache: bool = True,
+    normalize: bool = True
 ) -> torch.utils.data.DataLoader:
     """
     Create a DataLoader for scRNA data using cross-dataset HVGs.
@@ -176,7 +193,8 @@ def create_scrna_hvg_dataloader(
     dataset = ScRNADatasetWithHVGs(
         data_dir=data_dir,
         hvg_genes=hvg_genes,
-        use_cache=use_cache
+        use_cache=use_cache,
+        normalize=normalize
     )
     
     dataloader = torch.utils.data.DataLoader(
