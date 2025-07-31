@@ -524,20 +524,39 @@ class PartialMaskingDiffusion:
         if config.token_distribution_json:
             self.token_weights = self._compute_token_mask_weights(config.token_distribution_json)
     
-    def _compute_token_mask_weights(self, token_distribution_json: str, smoothing: float = 1e-6) -> torch.Tensor:
+    def _compute_token_mask_weights(self, token_distribution_json: str, smoothing: float = 1.0) -> torch.Tensor:
         """Compute token mask weights based on inverse frequency."""
         with open(token_distribution_json, 'r') as f:
             token_counts = json.load(f)
         
         counts = np.zeros(self.vocab_size)
+        total_count = 0
         for k, v in token_counts.items():
             k = int(k)
             if k < self.vocab_size:
                 counts[k] = v
+                total_count += v
         
-        # Inverse frequency with smoothing
-        inv_freq = 1.0 / (counts + smoothing)
-        weights = inv_freq / inv_freq.sum()  # Normalize to sum to 1
+        # Calculate frequencies
+        frequencies = counts / (total_count + 1e-10)
+        
+        # For tokens not in the distribution, use median frequency
+        seen_mask = counts > 0
+        if seen_mask.any():
+            median_freq = np.median(frequencies[seen_mask])
+        else:
+            median_freq = 1.0 / self.vocab_size
+        
+        # Set frequency for unseen tokens
+        frequencies[~seen_mask] = median_freq
+        
+        # Compute weights as inverse frequency with smoothing
+        # Add smoothing to avoid division by zero and extreme weights
+        weights = 1.0 / (frequencies + smoothing / self.vocab_size)
+        
+        # Normalize so average weight is 1.0 (preserves overall mask rate)
+        weights = weights / weights.mean()
+        
         return torch.tensor(weights, dtype=torch.float32)
     
     def sample_mask_ratio(self, is_conditioned: bool, step: int) -> float:
@@ -601,7 +620,8 @@ class PartialMaskingDiffusion:
         else:
             # Token-aware masking: get per-token mask prob
             weights = self.token_weights.to(device)[x_start]  # shape: [B, N]
-            scaled_probs = weights * mask_prob.unsqueeze(1) * self.vocab_size  # normalize by vocab_size
+            # Scale mask probability by token weight (weights average to 1.0)
+            scaled_probs = weights * mask_prob.unsqueeze(1)
             rand = torch.rand(B, N, device=device)
             mask = rand < scaled_probs.clamp(0, 1)
         
