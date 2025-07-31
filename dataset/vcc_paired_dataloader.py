@@ -12,6 +12,7 @@ import scanpy as sc
 from torch.utils.data import Dataset, DataLoader
 from typing import List, Tuple
 import warnings
+from dataset.vcc_collator import VCCCollator
 
 class VCCPairedDataset(Dataset):
     """
@@ -30,18 +31,31 @@ class VCCPairedDataset(Dataset):
         train_split: float = 0.8,
         is_train: bool = True, # Train or val
         random_seed: int = 42,
+        normalize: bool = True,
     ):
   
         self.set_size = set_size
         self.n_samples_per_gene = n_samples_per_gene
         self.random_seed = random_seed
         self.is_train = is_train
+        self.normalize = normalize
         
         np.random.seed(random_seed)
         
         # Load data
         print(f"Loading VCC data from {adata_path}...")
         self.adata = sc.read_h5ad(adata_path)
+
+              # Apply normalization if requested
+        if self.normalize:
+            print("Applying CP10K normalization + log1p transformation...")
+            # Make a copy to avoid modifying the original data
+            self.adata = self.adata.copy()
+            # Normalize each cell to 10,000 total counts
+            sc.pp.normalize_total(self.adata, target_sum=1e4)
+            # Log1p transformation
+            sc.pp.log1p(self.adata)
+            print(f"  Normalization complete. Expression values now in range [0, {self.adata.X.max():.2f}]")
         
         # Create gene name <-> ID mappings
         self.gene_name_to_id = dict(zip(self.adata.var.index, self.adata.var['gene_id']))
@@ -81,6 +95,9 @@ class VCCPairedDataset(Dataset):
         # Prepare samples
         self._prepare_samples()
         print(f"Created {len(self.samples)} samples from {len(self.target_genes)} genes")
+        # Build batch name → index mapping once so collate_fn can convert strings fast
+        self.unique_batches = sorted(list(set(self.adata.obs['batch'].values)))
+        self.batch_to_idx = {name: idx for idx, name in enumerate(self.unique_batches)}
         
     def _filter_to_hvgs(self, hvg_gene_ids: List[str]):
         """Filter adata to only include HVG genes."""
@@ -182,10 +199,19 @@ class VCCPairedDataset(Dataset):
         
         # Calculate log2 fold change for the target gene
         gene_idx_in_adata = self.adata.var.index.get_loc(sample['gene'])
-        pert_gene_expr = pert_expr[:, gene_idx_in_adata].mean() + 1e-6
-        ctrl_gene_expr = ctrl_expr[:, gene_idx_in_adata].mean() + 1e-6
-        log2fc = np.log2(pert_gene_expr / ctrl_gene_expr)
-        
+
+            
+        if self.normalize:
+            # For normalized data, calculate fold change in log space
+            # Since data is already log-transformed, we can subtract
+            pert_gene_expr = pert_expr[:, gene_idx_in_adata].mean()
+            ctrl_gene_expr = ctrl_expr[:, gene_idx_in_adata].mean()
+            # Convert from natural log to log2: log2(x/y) = (ln(x) - ln(y)) / ln(2)
+            log2fc = (pert_gene_expr - ctrl_gene_expr) / np.log(2)
+        else:
+            pert_gene_expr = pert_expr[:, gene_idx_in_adata].mean() + 1e-6
+            ctrl_gene_expr = ctrl_expr[:, gene_idx_in_adata].mean() + 1e-6
+            log2fc = np.log2(pert_gene_expr / ctrl_gene_expr)
         return {
             'perturbed_expr': pert_expr,
             'control_expr': ctrl_expr,
@@ -208,6 +234,9 @@ def create_vcc_paired_dataloader(
     num_workers: int = 4,
     shuffle: bool = True,
     random_seed: int = 42,
+    tokenizer=None,
+    prefetch_factor: int = 2,
+    pin_memory: bool = False,
 ) -> Tuple[VCCPairedDataset, DataLoader]:
    
     dataset = VCCPairedDataset(
@@ -220,19 +249,28 @@ def create_vcc_paired_dataloader(
         random_seed=random_seed,
     )
     
-    dataloader = DataLoader(
-        dataset,
+    # Build a collate function that performs tokenisation and other CPU-heavy work
+    collate_fn = VCCCollator(tokenizer, dataset.batch_to_idx, set_size) if tokenizer else None
+
+    dataloader_kwargs = dict(
         batch_size=batch_size,
         shuffle=shuffle and is_train,  # Only shuffle training data
         num_workers=num_workers,
-        pin_memory=True,
         drop_last=True,
+        pin_memory=pin_memory,
     )
+    if collate_fn is not None:
+        dataloader_kwargs['collate_fn'] = collate_fn
+    if num_workers > 0:
+        dataloader_kwargs['prefetch_factor'] = prefetch_factor
+
+    dataloader = DataLoader(dataset, **dataloader_kwargs)
     
     return dataset, dataloader
 
 
 def create_train_val_dataloaders(
+    *,
     adata_path: str = "data/vcc_data/adata_Training.h5ad",
     hvg_gene_ids: List[str] = None,
     set_size: int = 16,
@@ -241,7 +279,11 @@ def create_train_val_dataloaders(
     n_samples_per_gene_val: int = 1,
     train_split: float = 0.8,
     num_workers: int = 4,
+    tokenizer=None,
+    prefetch_factor: int = 2,
+    pin_memory: bool = False,
     random_seed: int = 42,
+    normalize: bool = True,
 ) -> Tuple[Tuple[VCCPairedDataset, DataLoader], Tuple[VCCPairedDataset, DataLoader]]:
 
     # Training dataloader
@@ -256,6 +298,10 @@ def create_train_val_dataloaders(
         num_workers=num_workers,
         shuffle=True,
         random_seed=random_seed,
+        tokenizer=tokenizer,
+        prefetch_factor=prefetch_factor,
+        pin_memory=pin_memory,
+        normalize=normalize,
     )
     
     # Validation dataloader
@@ -270,6 +316,10 @@ def create_train_val_dataloaders(
         num_workers=0,  # Disable multiprocessing for validation
         shuffle=False,
         random_seed=random_seed,
+        tokenizer=tokenizer,
+        prefetch_factor=prefetch_factor,
+        pin_memory=pin_memory,
+        normalize=normalize,
     )
     
     return (train_dataset, train_dataloader), (val_dataset, val_dataloader)
