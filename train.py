@@ -77,6 +77,10 @@ def create_simple_tokenizer(vocab_size: int = 64, max_value: float = 10000.0):
             if isinstance(x, np.ndarray):
                 x = torch.from_numpy(x)
             
+            # Ensure bins are on the same device as input
+            if x.device != self.bins.device:
+                self.bins = self.bins.to(x.device)
+            
             # Handle zero values explicitly
             zero_mask = (x == 0)
             
@@ -120,7 +124,7 @@ def train_epoch_st(
     batch_to_idx: Optional[Dict[str, int]] = None,
     use_control_sets: bool = True,
     mixed_training: bool = True,
-    max_steps: Optional[int] = None,
+    max_cells: Optional[int] = None,
 ) -> int:
     """
     Train for one epoch using ST-style conditioning.
@@ -138,7 +142,7 @@ def train_epoch_st(
         batch_to_idx: Mapping from batch names to indices for batch conditioning
         use_control_sets: Whether to use control set conditioning
         mixed_training: Whether to mix conditioned and unconditioned batches
-        max_steps: Maximum number of steps to run (for debugging), None for full epoch
+        max_cells: Maximum number of cells to process (for debugging), None for full epoch
         
     Returns:
         Updated global step
@@ -148,14 +152,15 @@ def train_epoch_st(
     epoch_losses = []
     
     total_steps = len(dataloader)
-    if max_steps is not None:
-        total_steps = min(total_steps, max_steps)
-        print(f"Debug mode: limiting epoch to {max_steps} steps")
+    cells_processed = 0
+    
+    if max_cells is not None:
+        print(f"Debug mode: limiting epoch to {max_cells} cells")
     
     for batch_idx, batch in enumerate(dataloader):
         # Early cutoff for debugging
-        if max_steps is not None and batch_idx >= max_steps:
-            print(f"Debug cutoff: stopping after {max_steps} steps")
+        if max_cells is not None and cells_processed >= max_cells:
+            print(f"Debug cutoff: stopping after processing {cells_processed} cells (limit: {max_cells})")
             break
         
         if isinstance(batch, dict) and 'perturbed_expr' in batch:
@@ -191,18 +196,8 @@ def train_epoch_st(
                 target_gene_idx = torch.tensor(target_gene_idx)
             target_gene_idx = target_gene_idx.cuda()
             
-            # Compute perturbation signs
-            log2fc = batch['log2fc'].cuda()
-            if log2fc.dim() > 1:
-                log2fc_avg = log2fc.mean(dim=-1)
-            else:
-                log2fc_avg = log2fc
-            perturb_sign = torch.sign(log2fc_avg).long()
-            
             # Expand conditioning to match batch
             target_gene_idx = target_gene_idx.unsqueeze(1).expand(-1, S).reshape(-1)
-            log2fc_avg = log2fc_avg.unsqueeze(1).expand(-1, S).reshape(-1)
-            perturb_sign = perturb_sign.unsqueeze(1).expand(-1, S).reshape(-1)
             
             # Process batch information
             if batch_to_idx is not None and 'pert_batches' in batch:
@@ -220,14 +215,13 @@ def train_epoch_st(
                 # Unconditioned batch
                 X_ctrl = None
                 target_gene_idx = None
-                log2fc = None
-                perturb_sign = None
+
                 batch_indices = None  # No batch conditioning for unconditioned training
                 tokens = X_pert_flat
             else:
                 # Conditioned batch
                 tokens = X_pert_flat
-                log2fc = log2fc_avg
+
                 # batch_indices already computed above
                 
                 if X_ctrl is not None:
@@ -236,23 +230,26 @@ def train_epoch_st(
                     # Each of the S perturbed cells from a batch should see the same control set
                     X_ctrl_expanded = X_ctrl.unsqueeze(1).expand(-1, S, -1, -1)  # (B, S, S, N)
                     X_ctrl = X_ctrl_expanded.reshape(B * S, S, N)  # (B*S, S, N)
+            
+            # Update cells processed count for VCC data
+            cells_processed += B * S
         else:
             # Processing regular pretraining data
             tokens = batch.cuda()
             B = tokens.shape[0]
             X_ctrl = None
             target_gene_idx = None
-            log2fc = None
-            perturb_sign = None
             batch_indices = None  # No batch conditioning for pretraining data
+            
+            # Update cells processed count for regular data
+            cells_processed += B
         
         loss = diffusion.compute_loss(
             model, 
             tokens,
             control_set=X_ctrl,
             target_gene_idx=target_gene_idx,
-            perturb_magnitude=log2fc,
-            perturb_sign=perturb_sign,
+
             batch_idx=batch_indices,
             step=global_step
         )
@@ -298,8 +295,8 @@ def train_epoch_st(
     
     epoch_time = time.time() - epoch_start
     avg_epoch_loss = np.mean(epoch_losses)
-    steps_completed = min(len(dataloader), max_steps) if max_steps is not None else len(dataloader)
-    print(f"Epoch {epoch} completed in {epoch_time:.1f}s | Steps: {steps_completed} | Avg Loss: {avg_epoch_loss:.4f}")
+    steps_completed = batch_idx + 1  # Actual number of steps taken
+    print(f"Epoch {epoch} completed in {epoch_time:.1f}s | Steps: {steps_completed} | Cells: {cells_processed} | Avg Loss: {avg_epoch_loss:.4f}")
     
     return global_step
 
@@ -312,7 +309,7 @@ def evaluate_validation(
     epoch: int,
     tokenizer = None,
     batch_to_idx: Optional[Dict[str, int]] = None,
-    max_steps: Optional[int] = None,
+    max_cells: Optional[int] = None,
 ) -> Dict[str, float]:
     """
     Evaluate validation loss on held-out genes (20% split).
@@ -326,21 +323,21 @@ def evaluate_validation(
         epoch: Current epoch number
         tokenizer: Tokenizer function to convert expression values to tokens
         batch_to_idx: Mapping from batch names to indices for batch conditioning
-        max_steps: Maximum number of batches to evaluate (for debugging), None for full dataset
+        max_cells: Maximum number of cells to evaluate (for debugging), None for full dataset
     """
     model.eval()
     val_losses = []
+    cells_evaluated = 0
     
     total_batches = len(val_dataloader)
-    if max_steps is not None:
-        total_batches = min(total_batches, max_steps)
-        print(f"Debug mode: limiting evaluation to {max_steps} batches")
+    if max_cells is not None:
+        print(f"Debug mode: limiting evaluation to {max_cells} cells")
     
     with torch.no_grad():
         for batch_idx, batch in enumerate(val_dataloader):
             # Early cutoff for debugging
-            if max_steps is not None and batch_idx >= max_steps:
-                print(f"Debug cutoff: stopping evaluation after {max_steps} batches")
+            if max_cells is not None and cells_evaluated >= max_cells:
+                print(f"Debug cutoff: stopping evaluation after {cells_evaluated} cells (limit: {max_cells})")
                 break
             
             # Process batch data
@@ -348,6 +345,9 @@ def evaluate_validation(
             X_ctrl = batch['control_expr'].cuda()
             
             B, S, N = X_pert.shape  # (batch, set_size, n_genes)
+            
+            # Update cells evaluated count
+            cells_evaluated += B * S
             
             # Tokenize the expression data
             X_pert_tokens = torch.zeros_like(X_pert, dtype=torch.long)
@@ -365,18 +365,8 @@ def evaluate_validation(
                 target_gene_idx = torch.tensor(target_gene_idx)
             target_gene_idx = target_gene_idx.cuda()
             
-            # Compute perturbation signs
-            log2fc = batch['log2fc'].cuda()
-            if log2fc.dim() > 1:
-                log2fc_avg = log2fc.mean(dim=-1)
-            else:
-                log2fc_avg = log2fc
-            perturb_sign = torch.sign(log2fc_avg).long()
-            
             # Expand conditioning to match batch
             target_gene_idx = target_gene_idx.unsqueeze(1).expand(-1, S).reshape(-1)
-            log2fc_avg = log2fc_avg.unsqueeze(1).expand(-1, S).reshape(-1)
-            perturb_sign = perturb_sign.unsqueeze(1).expand(-1, S).reshape(-1)
             
             # Process batch information
             if batch_to_idx is not None and 'pert_batches' in batch:
@@ -400,8 +390,7 @@ def evaluate_validation(
                 X_pert_flat,
                 control_set=X_ctrl_flat,
                 target_gene_idx=target_gene_idx,
-                perturb_magnitude=log2fc_avg,
-                perturb_sign=perturb_sign,
+                
                 batch_idx=batch_indices,
                 step=epoch  # Use epoch as step for validation
             )
@@ -442,61 +431,67 @@ def main():
     4. Use multi-query attention (already implemented)
     
     DEBUG MODE:
-    For quick testing, set config.debug_max_steps to a small number (e.g., 10-50)
-    This will limit both training and evaluation to the specified number of steps.
+    For quick testing, set config.debug_max_cells to a small number (e.g., 1000-5000)
+    This will limit both training and evaluation to the specified number of cells.
     """
     # Configuration
     config = ConditionalModelConfig(
         # Model architecture
-        dim=256,
+        train_notes="",
+        dim=512,
         n_head=8,
-        n_layer=8,
+        n_layer=12,
         ffn_mult=8,
-        vocab_size=128,
+        vocab_size=256,
         n_genes=2000,
         
         # Conditioning
         n_total_genes=2000,  # Using HVG genes only
         gene_embed_dim=128,
-        perturb_sign_dim=16,
-        perturb_magnitude_dim=64,
-        magnitude_clip=5.0,
         
         # Batch conditioning - ENABLED with correct number of batches
+        # WHAT's this? 
         use_batch_conditioning=True,
         n_batches=48,  # From VCC data exploration: 48 unique batches
-        batch_embed_dim=64,
+        batch_embed_dim=40,
         
         # Control set encoder
         control_set_encoder_layers=2,
-        control_set_dim_hidden=128,
+        control_set_dim_hidden=256,
         # LEGACY, this is now just config.dim
         #control_set_dim_out=128,  # Must match model dim for cross-attention
         
         # Diffusion
-        n_timesteps=10,
-        mask_ratio=0.30,
+        n_timesteps=16,
         schedule="cosine",
-        
+        pretrain_mask_ratio=0.40,  # Fixed mask ratio for pretraining
+        finetune_mask_ratio_start=0.40,  # Starting mask ratio for finetuning
+        finetune_mask_ratio_end=0.90,  # End mask ratio for finetuning (curriculum)
+        finetune_mask_ratio_steps=10000,  # Steps to ramp from start to end
+        finetune_full_mask_prob=0.05,  # Probability of 100% masking during finetune
         # Training - MEMORY OPTIMIZED
         # Note: With 2000-gene sequences, attention is O(N²) = 4M operations per head per sequence
         # Each batch processes batch_size × set_size = total sequences
         # Memory scales as: total_sequences × n_heads × sequence_length²
-        pretrain_batch_size=32,  # Very small due to 2000-token sequences and cross-attention
+        pretrain_batch_size=16,  # Very small due to 2000-token sequences and cross-attention
         vcc_batch_size=1,
-        vcc_set_size=32,
+        vcc_set_size=16,
         learning_rate=1e-4,
         weight_decay=0.01,
-        warmup_steps=5000,
+        warmup_steps=500,
 
         # Pretrain data dir  
-        pretrain_data_dir = "/scRNA/processed",
-        finetune_data_path = "/vcc_data/adata_Training.h5ad",
-        hvg_info_path = "data/hvg.txt",
-        
+        pretrain_data_dir = "/data/scRNA/processed",
+        finetune_data_path = "/data/vcc_data/adata_Training.h5ad",
+        hvg_info_path = "/workspace/vcc/hvg_seuratv3_2000.txt",
+
+            # ESM2 embeddings
+        esm_matrix_path = None, #"/esm_all.pt",  # Path to precomputed ESM2 embeddings (None to skip)
+        esm_proj_dim = 256,  # Projection dimension for ESM2 embeddings
+
         # Epochs
-        pretrain_epochs=0,
-        finetune_epochs=1,
+        pretrain_epochs=1,
+        finetune_epochs=10,
         
         # Logging
         log_every=10,  # Updated to match hardcoded logging frequency
@@ -504,10 +499,10 @@ def main():
         save_every=5000,
         vcc_eval_interval=5000,
         
-        # Debug - set to None for full training, or number of steps for quick debugging
-        debug_pretrain_max_steps = 10,
-        debug_finetune_max_steps = 10,
-        debug_eval_max_steps = 10 # equivalent to validation set's target perturb genes
+        # Debug - set to None for full training, or number of cells for quick debugging
+        debug_pretrain_max_cells=None,#64000//2,
+        debug_finetune_max_cells=200000//10,
+        debug_eval_max_cells=1000  # equivalent to validation set's target perturb genes
     )
     
     # Initialize wandb
@@ -614,7 +609,7 @@ def main():
                 batch_to_idx=None,  # No batch conditioning for pretraining
                 use_control_sets=False,  # No control sets in pretraining
                 mixed_training=False,
-                max_steps=config.debug_pretrain_max_steps
+                max_cells=config.debug_pretrain_max_cells
             )
             
         # Save checkpoint after pretraining
@@ -642,16 +637,16 @@ def main():
             batch_to_idx=batch_to_idx,  # Pass batch mapping for conditioning
             use_control_sets=True,
             mixed_training=True,  # Mix conditioned and unconditioned batches
-            max_steps=config.debug_finetune_max_steps
+            max_cells=config.debug_finetune_max_cells
         )
         
         # Evaluate on validation set (20% of training genes)
-        if epoch % 5 == 0:
+        if epoch % 1 == 0:
             print("\n=== Validation Set Evaluation ===")
             val_metrics = evaluate_validation(
                 model, diffusion, val_dataloader, optimizer, config,
                 epoch, tokenizer, batch_to_idx,
-                max_steps=config.debug_eval_max_steps
+                max_cells=config.debug_eval_max_cells
             )
             print(f"Validation loss: {val_metrics['val_loss']:.4f} ({val_metrics['val_batches_evaluated']} batches)")
             wandb.log(val_metrics)
