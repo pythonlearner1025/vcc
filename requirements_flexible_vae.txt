@@ -1,0 +1,29 @@
+# Core dependencies for Flexible VAE
+torch>=1.11.0
+numpy>=1.21.0
+scipy>=1.7.0
+pandas>=1.3.0
+scikit-learn>=1.0.0
+
+# Configuration and logging
+PyYAML>=6.0
+tensorboard>=2.8.0
+tqdm>=4.62.0
+
+# Data processing
+h5py>=3.6.0
+
+# Visualization
+matplotlib>=3.5.0
+seaborn>=0.11.0
+
+# Optional: Single-cell analysis (for advanced features)
+scanpy>=1.8.0
+
+# Optional: Transformers (for ESM2 embeddings)
+transformers>=4.15.0
+
+# Development and testing (optional)
+pytest>=6.2.0
+black>=22.0.0
+flake8>=4.0.0

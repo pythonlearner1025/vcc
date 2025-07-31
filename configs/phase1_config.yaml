@@ -1,0 +1,28 @@
+# Phase 1 Configuration: Self-supervised pretraining
+# Use this configuration for training on large scRNA-seq datasets without perturbation labels
+
+# === Core Architecture ===
+input_dim: 1808  # Will be set from data
+latent_dim: 512  # Latent space dimension - TUNE THIS for experiments
+hidden_dims: [1024, 512, 256]  # Encoder/decoder hidden layers
+
+# === Conditioning Dimensions ===
+experiment_embed_dim: 32  # Batch/experiment embedding size
+target_gene_embed_dim: 128  # Target gene embedding size (ESM2, Gene2Vec, etc.)
+
+# === Vocabulary Sizes (will be set from data) ===
+n_experiments: 500  # Number of unique experiments/batches
+n_genes: 1808  # Number of genes in vocabulary
+
+# === Training Parameters ===
+learning_rate: 0.001
+batch_size: 256
+dropout_rate: 0.1
+
+# === Loss Weighting ===
+reconstruction_weight: 1.0
+kld_weight: 0.5  # Lower KLD weight for Phase 1 to encourage exploration
+
+# === Architecture Options ===
+use_batch_norm: true
+activation: "relu"  # "relu", "gelu", "swish"

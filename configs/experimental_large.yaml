@@ -1,0 +1,28 @@
+# Experimental Configuration: Large latent space
+# Use this for experiments with higher dimensional latent representations
+
+# === Core Architecture ===
+input_dim: 1808  # Will be set from data
+latent_dim: 1024  # Larger latent space for more complex representations
+hidden_dims: [2048, 1024, 512]  # Larger hidden layers
+
+# === Conditioning Dimensions ===
+experiment_embed_dim: 64  # Larger experiment embeddings
+target_gene_embed_dim: 256  # Larger gene embeddings (for complex embeddings like ESM2)
+
+# === Vocabulary Sizes ===
+n_experiments: 500
+n_genes: 1808
+
+# === Training Parameters ===
+learning_rate: 0.0005  # Slightly lower learning rate for larger model
+batch_size: 128  # Smaller batch size due to memory constraints
+dropout_rate: 0.15  # Higher dropout for regularization
+
+# === Loss Weighting ===
+reconstruction_weight: 1.0
+kld_weight: 0.1  # Very low KLD weight to allow complex latent structure
+
+# === Architecture Options ===
+use_batch_norm: true
+activation: "gelu"  # GELU activation for better performance with larger models

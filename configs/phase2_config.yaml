@@ -1,0 +1,28 @@
+# Phase 2 Configuration: Perturbation fine-tuning
+# Use this configuration for fine-tuning with paired control/perturbation data
+
+# === Core Architecture ===
+input_dim: 1808  # Will be set from data
+latent_dim: 512  # Should match Phase 1 model
+hidden_dims: [1024, 512, 256]  # Should match Phase 1 model
+
+# === Conditioning Dimensions ===
+experiment_embed_dim: 32  # Should match Phase 1 model
+target_gene_embed_dim: 128  # Target gene embedding size
+
+# === Vocabulary Sizes (will be set from data) ===
+n_experiments: 500  # Number of unique experiments/batches
+n_genes: 1808  # Number of genes in vocabulary
+
+# === Training Parameters ===
+learning_rate: 0.0001  # Lower learning rate for fine-tuning
+batch_size: 128  # Smaller batch size for paired data
+dropout_rate: 0.05  # Lower dropout for fine-tuning
+
+# === Loss Weighting ===
+reconstruction_weight: 1.0
+kld_weight: 1.0  # Higher KLD weight for Phase 2 to maintain structure
+
+# === Architecture Options ===
+use_batch_norm: true
+activation: "relu"  # Should match Phase 1 model
