@@ -24,10 +24,11 @@ except ImportError:
 class ConditionalModelConfig:
     """Configuration for conditional diffusion model."""
     # Model architecture
-    dim: int = 512
+    train_notes: str = ""
+    dim: int = 256
     n_head: int = 8
-    n_layer: int = 6
-    ffn_mult: int = 4
+    n_layer: int = 8
+    ffn_mult: int = 8
     vocab_size: int = 64  # 64 expression bins
     n_genes: int = 2000  # Number of HVGs
     
@@ -36,7 +37,7 @@ class ConditionalModelConfig:
     gene_embed_dim: int = 128
     
     # ESM2 embeddings
-    esm_matrix_path: str = "esm_all.pt"  # Path to precomputed ESM2 embeddings
+    esm_matrix_path: Optional[str] = "/esm_all.pt"  # Path to precomputed ESM2 embeddings (None to skip)
     esm_proj_dim: int = 256  # Projection dimension for ESM2 embeddings
     
     # Batch conditioning
@@ -249,42 +250,46 @@ class AugmentedGeneEmbedding(nn.Module):
     """Combines trainable gene ID embeddings with frozen ESM2 protein embeddings."""
     
     def __init__(self, n_genes: int, id_dim: int = 128, 
-                 esm_matrix_path: str = "esm_all.pt", proj_dim: int = 256,
+                 esm_matrix_path: Optional[str] = None, proj_dim: int = 256,
                  use_canonical_only: bool = True):
         super().__init__()
         # 1) Existing small, trainable ID embedding
         self.id_emb = nn.Embedding(n_genes, id_dim)
         self.use_canonical_only = use_canonical_only
         
-        # 2) Load frozen ESM table
-        try:
-            obj = torch.load(esm_matrix_path, map_location="cpu")
-            self.esm_emb = nn.Embedding.from_pretrained(obj["emb"], freeze=True)
-            self.esm_dim = obj["emb"].shape[-1]
-            
-            # Load gene list and isoform mapping
-            self.genes = obj.get("genes", [])
-            self.gene_to_idx = {gene: i for i, gene in enumerate(self.genes)}
-            self.gene_to_isoform_indices = obj.get("gene_to_isoform_indices", {})
-            
-            # Create mapping from gene index to ESM embedding index
-            self.gene_idx_to_esm_idx = torch.zeros(n_genes, dtype=torch.long)
-            for gene, esm_indices in self.gene_to_isoform_indices.items():
-                if gene in self.gene_to_idx:
-                    gene_idx = self.gene_to_idx[gene]
-                    if gene_idx < n_genes and esm_indices:
-                        # Use first isoform (canonical) by default
-                        self.gene_idx_to_esm_idx[gene_idx] = esm_indices[0]
-            
-            self.has_esm = True
-            print(f"Loaded ESM2 embeddings from {esm_matrix_path} with shape {obj['emb'].shape}")
-            print(f"Found {len(self.gene_to_isoform_indices)} genes with isoforms")
-            n_multi_isoform = sum(1 for indices in self.gene_to_isoform_indices.values() if len(indices) > 1)
-            print(f"Genes with multiple isoforms: {n_multi_isoform}")
-        except (FileNotFoundError, KeyError) as e:
-            print(f"Warning: Could not load ESM2 embeddings from {esm_matrix_path}: {e}")
-            print("Using only trainable ID embeddings.")
+        # 2) Load frozen ESM table if path is provided
+        if esm_matrix_path is None:
+            print("ESM2 embeddings path not provided. Using only trainable ID embeddings.")
             self.has_esm = False
+        else:
+            try:
+                obj = torch.load(esm_matrix_path, map_location="cpu")
+                self.esm_emb = nn.Embedding.from_pretrained(obj["emb"], freeze=True)
+                self.esm_dim = obj["emb"].shape[-1]
+                
+                # Load gene list and isoform mapping
+                self.genes = obj.get("genes", [])
+                self.gene_to_idx = {gene: i for i, gene in enumerate(self.genes)}
+                self.gene_to_isoform_indices = obj.get("gene_to_isoform_indices", {})
+                
+                # Create mapping from gene index to ESM embedding index
+                self.gene_idx_to_esm_idx = torch.zeros(n_genes, dtype=torch.long)
+                for gene, esm_indices in self.gene_to_isoform_indices.items():
+                    if gene in self.gene_to_idx:
+                        gene_idx = self.gene_to_idx[gene]
+                        if gene_idx < n_genes and esm_indices:
+                            # Use first isoform (canonical) by default
+                            self.gene_idx_to_esm_idx[gene_idx] = esm_indices[0]
+                
+                self.has_esm = True
+                print(f"Loaded ESM2 embeddings from {esm_matrix_path} with shape {obj['emb'].shape}")
+                print(f"Found {len(self.gene_to_isoform_indices)} genes with isoforms")
+                n_multi_isoform = sum(1 for indices in self.gene_to_isoform_indices.values() if len(indices) > 1)
+                print(f"Genes with multiple isoforms: {n_multi_isoform}")
+            except (FileNotFoundError, KeyError) as e:
+                print(f"Warning: Could not load ESM2 embeddings from {esm_matrix_path}: {e}")
+                print("Using only trainable ID embeddings.")
+                self.has_esm = False
         
         if self.has_esm:
             # 3) Projection + gating
@@ -322,8 +327,9 @@ class AugmentedGeneEmbedding(nn.Module):
         # Create mask for valid gene indices
         valid_gene_mask = idx_flat < len(self.gene_idx_to_esm_idx)
         
-        # Initialize seq_vec with zeros
-        seq_vec_flat = torch.zeros(len(idx_flat), self.esm_proj.out_features, device=device)
+        # Initialize seq_vec with zeros (using id_vec dtype to ensure consistency)
+        seq_vec_flat = torch.zeros(len(idx_flat), self.esm_proj.out_features, 
+                                   device=device, dtype=id_vec.dtype)
         
         # Get ESM embeddings for valid genes
         if valid_gene_mask.any():
@@ -338,6 +344,9 @@ class AugmentedGeneEmbedding(nn.Module):
                 # Get embeddings only for valid ESM indices
                 valid_esm_indices = esm_indices[valid_esm_mask]
                 valid_esm = self.esm_emb(valid_esm_indices)
+                
+                # Convert to float32 to match linear layer dtype
+                valid_esm = valid_esm.float()
                 
                 # Project ESM embeddings
                 projected = self.esm_proj(valid_esm)
