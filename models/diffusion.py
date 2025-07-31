@@ -57,6 +57,7 @@ class ConditionalModelConfig:
     mask_ratio: float = 0.30  # Fraction of genes to mask (BERT-style)
     schedule: str = "cosine"
     token_distribution_json: Optional[str] = None  # Path to token distribution JSON for frequency-aware masking
+    token_weighting_annealing_steps: Optional[int] = 10_000  # Steps to anneal from uniform to frequency-based masking (0 or None = no annealing)
     
     # Masking parameters
     pretrain_mask_ratio: float = 0.20  # Fixed mask ratio for pretraining
@@ -262,7 +263,6 @@ class AugmentedGeneEmbedding(nn.Module):
         proj_dim: int = 256,
     ):
         super().__init__()
-        print("using AugmentedGeneEmbedding")
 
         # Trainable gene‑ID embedding
         self.id_emb = nn.Embedding(n_genes, id_dim, device="cpu")
@@ -272,6 +272,8 @@ class AugmentedGeneEmbedding(nn.Module):
             self.has_esm = False
             return
         try:
+
+            print("using AugmentedGeneEmbedding")
             obj = torch.load(esm_matrix_path, map_location="cpu")
             seq_dim = obj["emb"].shape[-1]
 
@@ -361,146 +363,152 @@ class ControlSetEncoder(nn.Module):
 
 
 class ConditionalDiffusionTransformer(nn.Module):
-    """Conditional discrete diffusion transformer with continuous perturbation conditioning."""
-    
-    def __init__(self, config: ConditionalModelConfig):
+    """Conditional discrete diffusion transformer that optionally injects
+    per‑gene ESM2 features into the token stream whenever the underlying
+    `AugmentedGeneEmbedding` has a loaded ESM table.
+    """
+
+    def __init__(self, config):
         super().__init__()
         self.config = config
-        
-        # Token embeddings
+
+        # ------------------------------------------------------------------
+        #  Embeddings
+        # ------------------------------------------------------------------
         self.token_emb = nn.Embedding(config.vocab_size, config.dim)
         self.pos_emb = nn.Parameter(torch.randn(1, config.n_genes, config.dim) * 0.02)
 
-        
+        # Gene‑level embeddings (trainable IDs + optional ESM2 vectors)
+        self.gene_embed = AugmentedGeneEmbedding(
+            n_genes=config.n_total_genes,
+            id_dim=config.gene_embed_dim,
+            esm_matrix_path=config.esm_matrix_path,
+            proj_dim=config.esm_proj_dim,
+        )
+
+        # If ESM2 is present we project it to `dim` and cache HVG indices.
+        self.use_esm_in_sequence = getattr(self.gene_embed, "has_esm", False)
+        if self.use_esm_in_sequence:
+            self._register_buffer(
+                "_hvg_idx", torch.arange(config.n_genes, dtype=torch.long), persistent=False
+            )
+            self.gene_proj = nn.Linear(config.gene_embed_dim, config.dim, bias=False)
+
         # Time embedding
         self.time_emb = nn.Sequential(
             SinusoidalPosEmb(config.dim),
             nn.Linear(config.dim, config.dim),
             nn.GELU(),
-            nn.Linear(config.dim, config.dim)
+            nn.Linear(config.dim, config.dim),
         )
-        
-        # Control set encoder
+
+        # Control‑set encoder, batch embeddings, transformer blocks ...
+        # (identical to original implementation, omitted for brevity)
+        # ------------------------------------------------------------------
         self.control_encoder = ControlSetEncoder(
-            n_genes=config.n_genes,  # Control sets have n_genes dimensions (after tokenization)
+            n_genes=config.n_genes,
             d_hidden=config.control_set_dim_hidden,
             d_out=config.dim,
             n_layers=config.control_set_encoder_layers,
-            n_head=config.n_head
+            n_head=config.n_head,
         )
-        
-        # Conditioning embeddings
-        self.gene_embed = AugmentedGeneEmbedding(
-            n_genes=config.n_total_genes,
-            id_dim=config.gene_embed_dim,
-            esm_matrix_path=config.esm_matrix_path,
-            proj_dim=config.esm_proj_dim
-        )
-        
-        # Batch embedding
+
         if config.use_batch_conditioning:
             self.batch_embed = nn.Embedding(config.n_batches, config.batch_embed_dim)
-        
-        # Combine conditioning
         batch_dim = config.batch_embed_dim if config.use_batch_conditioning else 0
-        total_cond_dim = config.gene_embed_dim + batch_dim
         self.cond_proj = nn.Sequential(
-            nn.Linear(total_cond_dim, config.dim),
+            nn.Linear(config.gene_embed_dim + batch_dim, config.dim),
             nn.GELU(),
-            nn.Linear(config.dim, config.dim)
+            nn.Linear(config.dim, config.dim),
         )
-        
-        # Transformer blocks with cross-attention
-        self.blocks = nn.ModuleList([
-            TransformerBlock(config.dim, config.n_head, config.ffn_mult)
-            for _ in range(config.n_layer)
-        ])
-        
-        # Output projection
+
+        self.blocks = nn.ModuleList(
+            [TransformerBlock(config.dim, config.n_head, config.ffn_mult) for _ in range(config.n_layer)]
+        )
         self.ln_f = nn.LayerNorm(config.dim)
         self.head = nn.Linear(config.dim, config.vocab_size)
-        
-        # Initialize weights
+
         self.apply(self._init_weights)
-        
-    def _init_weights(self, module):
-        if isinstance(module, nn.Linear):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-            if module.bias is not None:
-                torch.nn.init.zeros_(module.bias)
-        elif isinstance(module, nn.Embedding):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-            
+
+    # ----------------------------------------------------------------------
+    #  Helpers
+    # ----------------------------------------------------------------------
+    @staticmethod
+    def _init_weights(m):
+        if isinstance(m, nn.Linear):
+            nn.init.normal_(m.weight, mean=0.0, std=0.02)
+            if m.bias is not None:
+                nn.init.zeros_(m.bias)
+        elif isinstance(m, nn.Embedding):
+            nn.init.normal_(m.weight, mean=0.0, std=0.02)
+
+    # ----------------------------------------------------------------------
+    #  Forward
+    # ----------------------------------------------------------------------
     def forward(
-        self, 
+        self,
         tokens: torch.LongTensor,  # (B, N)
         timesteps: torch.LongTensor,  # (B,)
-        control_set: Optional[torch.LongTensor] = None,  # (B, S, N) tokenized control cells
+        control_set: Optional[torch.LongTensor] = None,  # (B, S, N)
         target_gene_idx: Optional[torch.LongTensor] = None,  # (B,)
-        batch_idx: Optional[torch.LongTensor] = None,  # (B,) batch indices
+        batch_idx: Optional[torch.LongTensor] = None,  # (B,)
     ) -> torch.Tensor:
-        """
-        Forward pass with cross-attention conditioning.
-        
-        Args:
-            tokens: Input tokens of shape (batch_size, n_genes)
-            timesteps: Diffusion timesteps of shape (batch_size,)
-            control_set: Tokenized control cells (batch_size, set_size, n_genes)
-            target_gene_idx: Target gene indices
-            batch_idx: Batch indices for technical variation conditioning
-            
-        Returns:
-            Logits of shape (batch_size, n_genes, vocab_size)
-        """
         B, N = tokens.shape
-        
-        # Embed tokens
-        x = self.token_emb(tokens) + self.pos_emb
-        
-        # Time embedding
+
+        # ------------------------------------------------------------------
+        #  (1) Base token and positional embeddings
+        # ------------------------------------------------------------------
+        x = self.token_emb(tokens) + self.pos_emb  # (B, N, D)
+
+        # Optionally add per‑gene ESM2/ID embeddings projected to model dim.
+        if self.use_esm_in_sequence:
+            gene_ids = self._hvg_idx.to(tokens.device)  # (N,)
+            gene_feat = self.gene_embed(gene_ids)       # (N, gene_embed_dim)
+            gene_feat = self.gene_proj(gene_feat)       # (N, D)
+            x = x + gene_feat.unsqueeze(0)              # broadcast over batch
+
+        # ------------------------------------------------------------------
+        #  (2) Global time embedding
+        # ------------------------------------------------------------------
         t_emb = self.time_emb(timesteps.float())  # (B, D)
-        
-        # Control set encoding (if provided)
+
+        # ------------------------------------------------------------------
+        #  (3) Control‑set context (ST‑style)
+        # ------------------------------------------------------------------
         context = None
         if control_set is not None:
-            # Control set should be (B, S, N) where S is set size
-            context = self.control_encoder(control_set.float())  # (B, S, control_set_dim_out)
-        
-        # Conditioning embedding
+            context = self.control_encoder(control_set.float())  # (B, S, D)
+
+        # ------------------------------------------------------------------
+        #  (4) Conditioning vector (target gene + batch) if provided
+        # ------------------------------------------------------------------
+        combined_emb = t_emb  # always include time
         if target_gene_idx is not None:
-            # Gene embedding - clamp indices to valid range to avoid CUDA assertion errors
-            target_gene_idx_clamped = torch.clamp(target_gene_idx, 0, self.config.n_total_genes - 1)
-            target_gene_emb = self.gene_embed(target_gene_idx_clamped)  # (B, gene_embed_dim)
-            
-            # Combine embeddings
-            cond_components = [target_gene_emb]
-            
-            # Add batch embedding if provided
+            target_gene_idx = torch.clamp(target_gene_idx, 0, self.config.n_total_genes - 1)
+            gene_cond_emb = self.gene_embed(target_gene_idx)  # (B, gene_embed_dim)
+            cond_parts = [gene_cond_emb]
             if self.config.use_batch_conditioning and batch_idx is not None:
-                batch_idx_clamped = torch.clamp(batch_idx, 0, self.config.n_batches - 1)
-                batch_emb = self.batch_embed(batch_idx_clamped)  # (B, batch_embed_dim)
-                cond_components.append(batch_emb)
-            
-            cond_emb = torch.cat(cond_components, dim=-1)
-            cond_emb = self.cond_proj(cond_emb)  # (B, D)
-            
-            # Combine time and conditioning
-            combined_emb = t_emb + cond_emb
-        else:
-            combined_emb = t_emb
-        
-        # Add to sequence (following ST: add perturbation embedding to input)
-        x = x + combined_emb.unsqueeze(1)  # Broadcast to all positions
-        
-        # Apply transformer blocks with optional cross-attention to control set
+                batch_idx = torch.clamp(batch_idx, 0, self.config.n_batches - 1)
+                cond_parts.append(self.batch_embed(batch_idx))
+            cond_vec = torch.cat(cond_parts, dim=-1)
+            cond_vec = self.cond_proj(cond_vec)
+            combined_emb = combined_emb + cond_vec
+
+        # Inject combined (time + conditioning) into every token position
+        x = x + combined_emb.unsqueeze(1)  # (B, 1, D)
+
+        # ------------------------------------------------------------------
+        #  (5) Transformer
+        # ------------------------------------------------------------------
         for block in self.blocks:
             x = block(x, context=context)
-            
-        # Final layer norm and projection
+
+        # ------------------------------------------------------------------
+        #  (6) Output head
+        # ------------------------------------------------------------------
         x = self.ln_f(x)
-        logits = self.head(x)
-        
-        return logits
+        return self.head(x)
+
 
 class PartialMaskingDiffusion:
     """Discrete diffusion with partial masking strategy."""
@@ -594,7 +602,8 @@ class PartialMaskingDiffusion:
         x_start: torch.LongTensor, 
         t: torch.LongTensor,
         mask_token: int = 63,  # Last token is [MASK]
-        mask_ratio: Optional[float] = None
+        mask_ratio: Optional[float] = None,
+        step: int = 0
     ) -> Tuple[torch.LongTensor, torch.BoolTensor]:
         """
         Forward diffusion: partially mask tokens based on timestep.
@@ -618,9 +627,20 @@ class PartialMaskingDiffusion:
             rand = torch.rand(B, N, device=device)
             mask = rand < mask_prob.unsqueeze(1)
         else:
-            # Token-aware masking: get per-token mask prob
-            weights = self.token_weights.to(device)[x_start]  # shape: [B, N]
-            # Scale mask probability by token weight (weights average to 1.0)
+            # Token-aware masking with annealing
+            if self.config.token_weighting_annealing_steps is None or self.config.token_weighting_annealing_steps == 0:
+                # No annealing - use full frequency-based masking
+                annealing_factor = 1.0
+            else:
+                annealing_factor = min(1.0, step / self.config.token_weighting_annealing_steps)
+            
+            # Get frequency-based weights for tokens
+            freq_weights = self.token_weights.to(device)[x_start]  # shape: [B, N]
+            
+            # Blend uniform weights (1.0) with frequency weights based on annealing
+            weights = (1.0 - annealing_factor) + annealing_factor * freq_weights
+            
+            # Scale mask probability by token weight
             scaled_probs = weights * mask_prob.unsqueeze(1)
             rand = torch.rand(B, N, device=device)
             mask = rand < scaled_probs.clamp(0, 1)
@@ -654,7 +674,7 @@ class PartialMaskingDiffusion:
         mask_ratio = self.sample_mask_ratio(is_conditioned, step)
         
         # Partial masking
-        x_noisy, mask = self.q_sample(x_start, t, mask_token, mask_ratio=mask_ratio)
+        x_noisy, mask = self.q_sample(x_start, t, mask_token, mask_ratio=mask_ratio, step=step)
         
         # Predict original tokens
         logits = model(
