@@ -7,9 +7,11 @@ including the model architecture, diffusion process, and associated utilities.
 """
 
 import math
+import json
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import numpy as np
 from typing import Dict, List, Tuple, Optional
 from dataclasses import dataclass
 
@@ -48,12 +50,13 @@ class ConditionalModelConfig:
     
     # Control set conditioning
     control_set_encoder_layers: int = 2
-    control_set_dim_hidden: int = 128
+    control_set_dim_hidden: int = 256
     
     # Diffusion parameters
     n_timesteps: int = 10
     mask_ratio: float = 0.30  # Fraction of genes to mask (BERT-style)
     schedule: str = "cosine"
+    token_distribution_json: Optional[str] = None  # Path to token distribution JSON for frequency-aware masking
     
     # Masking parameters
     pretrain_mask_ratio: float = 0.20  # Fixed mask ratio for pretraining
@@ -64,9 +67,12 @@ class ConditionalModelConfig:
     
     # Training parameters
     pretrain_batch_size: int = 32
-    learning_rate: float = 3e-4
+    learning_rate: float = 1e-4
     weight_decay: float = 0.01
-    warmup_steps: int = 1000
+    warmup_steps: int = 500
+
+    finetune_learning_rate: float = 3e-5
+    finetune_warmup_steps: int = 500
 
     vcc_batch_size: int = 1
     vcc_set_size: int = 64
@@ -92,7 +98,6 @@ class ConditionalModelConfig:
     def n_params(self) -> int:
         """Estimate parameter count."""
         params = self.vocab_size * self.dim  # Token embedding
-        params += self.n_genes * self.dim  # Position embedding
         params += self.n_timesteps * self.dim  # Time embedding
         params += self.n_total_genes * self.gene_embed_dim  # Gene embeddings
         
@@ -247,127 +252,70 @@ class TransformerBlock(nn.Module):
 
 
 class AugmentedGeneEmbedding(nn.Module):
-    """Combines trainable gene ID embeddings with frozen ESM2 protein embeddings."""
-    
-    def __init__(self, n_genes: int, id_dim: int = 128, 
-                 esm_matrix_path: Optional[str] = None, proj_dim: int = 256,
-                 use_canonical_only: bool = True):
+    """Minimal version: trainable ID embedding + frozen ESM2 table."""
+
+    def __init__(
+        self,
+        n_genes: int,
+        id_dim: int = 128,
+        esm_matrix_path: Optional[str] = None,
+        proj_dim: int = 256,
+    ):
         super().__init__()
-        # 1) Existing small, trainable ID embedding
-        self.id_emb = nn.Embedding(n_genes, id_dim)
-        self.use_canonical_only = use_canonical_only
-        
-        # 2) Load frozen ESM table if path is provided
+        print("using AugmentedGeneEmbedding")
+
+        # Trainable gene‑ID embedding
+        self.id_emb = nn.Embedding(n_genes, id_dim, device="cpu")
+
+        # If no ESM table is given we just fall back to the ID embedding.
         if esm_matrix_path is None:
-            print("ESM2 embeddings path not provided. Using only trainable ID embeddings.")
             self.has_esm = False
-        else:
-            try:
-                obj = torch.load(esm_matrix_path, map_location="cpu")
-                self.esm_emb = nn.Embedding.from_pretrained(obj["emb"], freeze=True)
-                self.esm_dim = obj["emb"].shape[-1]
-                
-                # Load gene list and isoform mapping
-                self.genes = obj.get("genes", [])
-                self.gene_to_idx = {gene: i for i, gene in enumerate(self.genes)}
-                self.gene_to_isoform_indices = obj.get("gene_to_isoform_indices", {})
-                
-                # Create mapping from gene index to ESM embedding index
-                self.gene_idx_to_esm_idx = torch.zeros(n_genes, dtype=torch.long)
-                for gene, esm_indices in self.gene_to_isoform_indices.items():
-                    if gene in self.gene_to_idx:
-                        gene_idx = self.gene_to_idx[gene]
-                        if gene_idx < n_genes and esm_indices:
-                            # Use first isoform (canonical) by default
-                            self.gene_idx_to_esm_idx[gene_idx] = esm_indices[0]
-                
-                self.has_esm = True
-                print(f"Loaded ESM2 embeddings from {esm_matrix_path} with shape {obj['emb'].shape}")
-                print(f"Found {len(self.gene_to_isoform_indices)} genes with isoforms")
-                n_multi_isoform = sum(1 for indices in self.gene_to_isoform_indices.values() if len(indices) > 1)
-                print(f"Genes with multiple isoforms: {n_multi_isoform}")
-            except (FileNotFoundError, KeyError) as e:
-                print(f"Warning: Could not load ESM2 embeddings from {esm_matrix_path}: {e}")
-                print("Using only trainable ID embeddings.")
-                self.has_esm = False
-        
-        if self.has_esm:
-            # 3) Projection + gating
-            self.esm_proj = nn.Linear(self.esm_dim, proj_dim)
-            self.gate = nn.Parameter(torch.zeros(1))
-            self.mix = nn.Sequential(
-                nn.Linear(id_dim + proj_dim, proj_dim),
-                nn.GELU(),
-                nn.Linear(proj_dim, id_dim)  # back to id_dim so existing code needn't change
-            )
-        
+            return
+        try:
+            obj = torch.load(esm_matrix_path, map_location="cpu")
+            seq_dim = obj["emb"].shape[-1]
+
+            # Build table: one row per gene, isoforms mean‑pooled.
+            table = torch.zeros(n_genes, seq_dim)
+            genes = obj["genes"]
+            iso_map = obj["gene_to_isoform_indices"]
+
+            for g, iso_idxs in iso_map.items():
+                if g not in genes:
+                    continue
+                gid = genes.index(g)
+                if gid >= n_genes:
+                    continue
+                emb = obj["emb"][iso_idxs].mean(0) if iso_idxs else obj["emb"][gid]
+                table[gid] = emb
+
+            # Frozen ESM lookup aligned with gene indices
+            self.esm_emb = nn.Embedding.from_pretrained(table, freeze=True)
+            self.esm_proj = nn.Linear(seq_dim, proj_dim, bias=False)
+
+            # Simple gated fusion back to id_dim so downstream shapes stay unchanged
+            self.gate = nn.Parameter(torch.ones(1) * 2)
+            self.mix = nn.Linear(id_dim + proj_dim, id_dim)
+            self.has_esm = True
+        except Exception as e:
+            self.has_esm = False
+
     def forward(self, idx: torch.LongTensor) -> torch.Tensor:
-        """
-        Args:
-            idx: Gene indices (B,) or (B, K) 
-            
-        Returns:
-            Gene embeddings (B, id_dim) or (B, K, id_dim)
-        """
-        id_vec = self.id_emb(idx)  # (B, id_dim) or (B, K, id_dim)
-        
+        """(B,) or (B,K) → (B,id_dim) or (B,K,id_dim)."""
+        id_vec = self.id_emb(idx)
+
         if not self.has_esm:
             return id_vec
-        
-        # Handle indices that might be out of range
-        device = id_vec.device
-        shape = idx.shape
-        idx_flat = idx.view(-1)
-        
-        # Map gene indices to ESM embedding indices
-        # Move mapping to device if needed
-        if self.gene_idx_to_esm_idx.device != device:
-            self.gene_idx_to_esm_idx = self.gene_idx_to_esm_idx.to(device)
-        
-        # Create mask for valid gene indices
-        valid_gene_mask = idx_flat < len(self.gene_idx_to_esm_idx)
-        
-        # Initialize seq_vec with zeros (using id_vec dtype to ensure consistency)
-        seq_vec_flat = torch.zeros(len(idx_flat), self.esm_proj.out_features, 
-                                   device=device, dtype=id_vec.dtype)
-        
-        # Get ESM embeddings for valid genes
-        if valid_gene_mask.any():
-            valid_gene_idx = idx_flat[valid_gene_mask]
-            # Map gene indices to ESM indices
-            esm_indices = self.gene_idx_to_esm_idx[valid_gene_idx]
-            
-            # Check which mapped indices are valid in ESM embedding
-            valid_esm_mask = (esm_indices > 0) & (esm_indices < self.esm_emb.num_embeddings)
-            
-            if valid_esm_mask.any():
-                # Get embeddings only for valid ESM indices
-                valid_esm_indices = esm_indices[valid_esm_mask]
-                valid_esm = self.esm_emb(valid_esm_indices)
-                
-                # Convert to float32 to match linear layer dtype
-                valid_esm = valid_esm.float()
-                
-                # Project ESM embeddings
-                projected = self.esm_proj(valid_esm)
-                
-                # Place projected embeddings in the right positions
-                valid_positions = valid_gene_mask.nonzero().squeeze(-1)[valid_esm_mask]
-                seq_vec_flat[valid_positions] = projected
-        
-        # Reshape back to original shape
-        seq_vec = seq_vec_flat.view(*shape, -1)
-        
-        # Fuse ID and ESM embeddings
-        fused = self.mix(torch.cat([id_vec, self.gate.tanh() * seq_vec], -1))
-        
-        return fused
 
+        # 4‑line sequence branch
+        seq_vec = self.esm_proj(self.esm_emb(idx).float())
+        fused = self.mix(torch.cat([id_vec, torch.tanh(self.gate) * seq_vec], dim=-1))
+        return fused
 
 class ControlSetEncoder(nn.Module):
     """Encoder for control cell sets following ST architecture."""
     
-    def __init__(self, n_genes: int, d_hidden: int = 128, d_out: int = 512, n_layers: int = 2):
+    def __init__(self, n_genes: int, d_hidden: int = 128, d_out: int = 512, n_layers: int = 2, n_head: int = 4):
         super().__init__()
         
         # Cell-level MLP
@@ -380,7 +328,7 @@ class ControlSetEncoder(nn.Module):
         # Set-level transformer
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=d_hidden,
-            nhead=4,
+            nhead=n_head,
             dim_feedforward=4 * d_hidden,
             batch_first=True,
             activation='gelu'
@@ -419,9 +367,10 @@ class ConditionalDiffusionTransformer(nn.Module):
         super().__init__()
         self.config = config
         
-        # Token and position embeddings
+        # Token embeddings
         self.token_emb = nn.Embedding(config.vocab_size, config.dim)
         self.pos_emb = nn.Parameter(torch.randn(1, config.n_genes, config.dim) * 0.02)
+
         
         # Time embedding
         self.time_emb = nn.Sequential(
@@ -436,7 +385,8 @@ class ConditionalDiffusionTransformer(nn.Module):
             n_genes=config.n_genes,  # Control sets have n_genes dimensions (after tokenization)
             d_hidden=config.control_set_dim_hidden,
             d_out=config.dim,
-            n_layers=config.control_set_encoder_layers
+            n_layers=config.control_set_encoder_layers,
+            n_head=config.n_head
         )
         
         # Conditioning embeddings
@@ -504,7 +454,7 @@ class ConditionalDiffusionTransformer(nn.Module):
         """
         B, N = tokens.shape
         
-        # Embed tokens and add position embeddings
+        # Embed tokens
         x = self.token_emb(tokens) + self.pos_emb
         
         # Time embedding
@@ -520,10 +470,10 @@ class ConditionalDiffusionTransformer(nn.Module):
         if target_gene_idx is not None:
             # Gene embedding - clamp indices to valid range to avoid CUDA assertion errors
             target_gene_idx_clamped = torch.clamp(target_gene_idx, 0, self.config.n_total_genes - 1)
-            gene_emb = self.gene_embed(target_gene_idx_clamped)  # (B, gene_embed_dim)
+            target_gene_emb = self.gene_embed(target_gene_idx_clamped)  # (B, gene_embed_dim)
             
             # Combine embeddings
-            cond_components = [gene_emb]
+            cond_components = [target_gene_emb]
             
             # Add batch embedding if provided
             if self.config.use_batch_conditioning and batch_idx is not None:
@@ -561,19 +511,34 @@ class PartialMaskingDiffusion:
         self.vocab_size = config.vocab_size
         self.mask_ratio = config.mask_ratio
         
-        # Create noise schedule for mask probability
-        if config.schedule == "linear":
-            self.mask_probs = torch.linspace(0.0, self.mask_ratio, self.n_timesteps)
-        elif config.schedule == "cosine":
-            # Cosine schedule
-            s = 0.008
-            steps = torch.arange(self.n_timesteps + 1, dtype=torch.float32)
-            alphas = torch.cos((steps / self.n_timesteps + s) / (1 + s) * math.pi * 0.5) ** 2
-            alphas = alphas / alphas[0]
-            self.mask_probs = 1 - alphas[:-1]
-            self.mask_probs = self.mask_probs * self.mask_ratio / self.mask_probs[-1]
-        else:
-            raise ValueError(f"Unknown schedule: {config.schedule}")
+        # Cosine schedule
+        s = 0.008
+        steps = torch.arange(self.n_timesteps + 1, dtype=torch.float32)
+        alphas = torch.cos((steps / self.n_timesteps + s) / (1 + s) * math.pi * 0.5) ** 2
+        alphas = alphas / alphas[0]
+        self.mask_probs = 1 - alphas[:-1]
+        self.mask_probs = self.mask_probs * self.mask_ratio / self.mask_probs[-1]
+        
+        # Load token weights for frequency-aware masking
+        self.token_weights = None
+        if config.token_distribution_json:
+            self.token_weights = self._compute_token_mask_weights(config.token_distribution_json)
+    
+    def _compute_token_mask_weights(self, token_distribution_json: str, smoothing: float = 1e-6) -> torch.Tensor:
+        """Compute token mask weights based on inverse frequency."""
+        with open(token_distribution_json, 'r') as f:
+            token_counts = json.load(f)
+        
+        counts = np.zeros(self.vocab_size)
+        for k, v in token_counts.items():
+            k = int(k)
+            if k < self.vocab_size:
+                counts[k] = v
+        
+        # Inverse frequency with smoothing
+        inv_freq = 1.0 / (counts + smoothing)
+        weights = inv_freq / inv_freq.sum()  # Normalize to sum to 1
+        return torch.tensor(weights, dtype=torch.float32)
     
     def sample_mask_ratio(self, is_conditioned: bool, step: int) -> float:
         """
@@ -629,9 +594,16 @@ class PartialMaskingDiffusion:
             # Get mask probability for each timestep
             mask_prob = self.mask_probs[t].to(device)  # (B,)
         
-        # For each sample, randomly mask mask_prob fraction of genes
-        rand = torch.rand(B, N, device=device)
-        mask = rand < mask_prob.unsqueeze(1)
+        if self.token_weights is None:
+            # Uniform masking
+            rand = torch.rand(B, N, device=device)
+            mask = rand < mask_prob.unsqueeze(1)
+        else:
+            # Token-aware masking: get per-token mask prob
+            weights = self.token_weights.to(device)[x_start]  # shape: [B, N]
+            scaled_probs = weights * mask_prob.unsqueeze(1) * self.vocab_size  # normalize by vocab_size
+            rand = torch.rand(B, N, device=device)
+            mask = rand < scaled_probs.clamp(0, 1)
         
         # Apply mask
         x_noisy = torch.where(mask, mask_token, x_start)
@@ -740,22 +712,6 @@ class PartialMaskingDiffusion:
                 x[unmask] = new_tokens[unmask]
         
         return x
-
-
-def create_gene_mapping(source_genes: List[str], target_genes: List[str]) -> Dict[int, int]:
-    """Create mapping between different gene spaces."""
-    gene_to_idx_source = {gene: idx for idx, gene in enumerate(source_genes)}
-    gene_to_idx_target = {gene: idx for idx, gene in enumerate(target_genes)}
-    
-    mapping = {}
-    for gene, target_idx in gene_to_idx_target.items():
-        if gene in gene_to_idx_source:
-            mapping[gene_to_idx_source[gene]] = target_idx
-    
-    return mapping
-
-
-
 
 
 def create_optimizer(model: nn.Module, config: ConditionalModelConfig):
