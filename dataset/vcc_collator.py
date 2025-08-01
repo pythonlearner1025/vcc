@@ -32,9 +32,8 @@ class VCCCollator:
         pert = torch.stack([b["perturbed_expr"] for b in batch_list])
         ctrl = torch.stack([b["control_expr"] for b in batch_list])
 
-        # Compute Δ = perturbed − mean(control) before tokenisation
-        ctrl_mean = ctrl.mean(1, keepdim=True)  # (B,1,N)
-        delta_expr = pert - ctrl_mean            # (B,S,N)
+        # Compute Δ per cell (no averaging): Δ = perturbed_i − control_i
+        delta_expr = pert - ctrl                 # (B,S,N)
 
         # Vectorised tokenisation on CPU (runs in DataLoader worker)
         delta_tok = self.tokenizer(delta_expr)

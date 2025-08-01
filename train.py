@@ -181,9 +181,10 @@ def train_epoch_st(
             X_ctrl = batch['control_expr'].cuda() if 'control_expr' in batch else None
             B, S, N = X_pert.shape
 
-            # Build Δ = perturbed − mean(control)
-            ctrl_mean = X_ctrl.mean(1, keepdim=True) if X_ctrl is not None else torch.zeros_like(X_pert)
-            delta_expr = X_pert - ctrl_mean
+            # Build per-cell Δ = perturbed − control (no averaging)
+            if X_ctrl is None:
+                raise ValueError("control_expr is required for delta computation")
+            delta_expr = X_pert - X_ctrl
 
             delta_tokens = _tokenize_batch(delta_expr, tokenizer)
             tokens = delta_tokens.view(B * S, N)
@@ -313,9 +314,10 @@ def val_epoch_st(
             X_ctrl = batch['control_expr'].cuda() if 'control_expr' in batch else None
             B, S, N = X_pert.shape
 
-            # Δ computation for validation
-            ctrl_mean = X_ctrl.mean(1, keepdim=True)
-            delta_expr = X_pert - ctrl_mean
+            # Δ computation for validation (per-cell)
+            if X_ctrl is None:
+                raise ValueError("control_expr is required for delta computation in validation")
+            delta_expr = X_pert - X_ctrl
 
             delta_tokens = _tokenize_batch(delta_expr, tokenizer)
             X_ctrl_expanded = None
