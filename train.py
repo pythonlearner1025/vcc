@@ -341,10 +341,10 @@ def main():
     """Main training function for ST-style Conditional Discrete Diffusion Transformer."""
     config = ConditionalModelConfig(
         train_notes="100M Norm NO ESM2",
-        dim=512,
-        n_head=8,
-        n_layer=16,
-        ffn_mult=8,
+        dim=256,
+        n_head=4,
+        n_layer=4,
+        ffn_mult=4,
         vocab_size=256,
         n_genes=2000,
         n_total_genes=2000,
@@ -354,7 +354,7 @@ def main():
         batch_embed_dim=40,
 
         control_set_encoder_layers=2,
-        control_set_dim_hidden=512,
+        control_set_dim_hidden=256,
         
         n_timesteps=16,
         schedule="cosine",
@@ -366,8 +366,8 @@ def main():
         vcc_batch_size=1,
 
         # batch sizes
-        pretrain_batch_size=16,
-        vcc_set_size=16,
+        pretrain_batch_size=4,
+        vcc_set_size=4,
 
         # pretrain
         learning_rate=1e-4,
@@ -380,7 +380,7 @@ def main():
 
         pretrain_data_dir = "/data_normalized/scRNA/processed",
         finetune_data_path = "/data_normalized/vcc_data/adata_Training.h5ad",
-        hvg_info_path = "/workspace/vcc/hvg_seuratv3_2000.txt",
+        hvg_info_path = "/workspace/vcc/hvg_seuratv3_3000.txt",
         esm_matrix_path = None,
 
         token_distribution_json = "/token_distribution.json",  # Path to token distribution JSON for frequency-aware masking
@@ -388,31 +388,17 @@ def main():
 
         esm_proj_dim = 512,
         pretrain_epochs=1,
-        finetune_epochs=10,
+        finetune_epochs=1,
         log_every=10,
         eval_every=1000,
         save_every=5000,
         vcc_eval_interval=5000,
         
         # Debug - set to None for full training, or number of cells for quick debugging
-        debug_pretrain_max_cells=None,#64000//2,
-        debug_finetune_max_cells=200000//10,
+        debug_pretrain_max_cells=1,#None,#64000//2,
+        debug_finetune_max_cells=1,#200000//10,
         debug_eval_max_cells=1000  # equivalent to validation set's target perturb genes
     )
-    
-    # Initialize wandb
-    wandb.init(
-        project="vcc-st-diffusion",
-        config=config.__dict__,
-        name=f"st_diffusion_{time.strftime('%Y%m%d_%H%M%S')}"
-    )
-    
-    # Create model
-    model = ConditionalDiffusionTransformer(config).cuda()
-    diffusion = PartialMaskingDiffusion(config)
-    optimizer = create_optimizer(model, config)
-    
-    print(f"\nModel created with {sum(p.numel() for p in model.parameters()):,} parameters")
     
     # Create tokenizer
     tokenizer, detokenizer = create_simple_tokenizer(config.vocab_size)
@@ -446,6 +432,25 @@ def main():
     )
     
     print(f"Pretrain dataset: {len(pretrain_dataset):,} cells, {scrna_dataset.n_hvgs} HVG genes")
+
+    # ------------------------------------------------------------------
+    #  Update config & create model now that we know the final HVG count
+    # ------------------------------------------------------------------
+    config.n_genes = scrna_dataset.n_hvgs
+    hvg_gene_ensemble = scrna_dataset.get_gene_names()
+
+    # Initialise wandb AFTER we have the final config
+    wandb.init(
+        project="vcc-st-diffusion",
+        config=config.__dict__,
+        name=f"st_diffusion_{time.strftime('%Y%m%d_%H%M%S')}"
+    )
+
+    # Create model / diffusion / optimiser
+    model = ConditionalDiffusionTransformer(config).cuda()
+    diffusion = PartialMaskingDiffusion(config)
+    optimizer = create_optimizer(model, config)
+    print(f"\nModel created with {sum(p.numel() for p in model.parameters()):,} parameters")
     
     # Create VCC train and validation dataloaders
     (vcc_dataset, vcc_dataloader), (val_dataset, val_dataloader) = create_train_val_dataloaders(
