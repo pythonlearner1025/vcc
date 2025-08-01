@@ -416,8 +416,8 @@ def main():
         vcc_batch_size=1,
 
         # batch sizes
-        pretrain_batch_size=10,
-        vcc_set_size=10,
+        pretrain_batch_size=8,
+        vcc_set_size=8,
 
         # pretrain
         learning_rate=1e-4,
@@ -428,8 +428,11 @@ def main():
         finetune_learning_rate = 3e-5,
         finetune_warmup_steps  = 250,
 
+        # scBaseCOunt data is not UMI normalized
         pretrain_data_dir = "/data_normalized/scRNA/processed",
-        finetune_data_path = "/data_normalized/vcc_data/adata_Training.h5ad",
+        # it is assumed competition_support dataset from Arc is UMI normalized
+        # since it was log1p normalized.
+        finetune_data_path = "/competition_train.h5",
         hvg_info_path = "/workspace/vcc/hvg_seuratv3_3000.txt",
         esm_matrix_path = "/esm_all.pt",
 
@@ -447,7 +450,10 @@ def main():
         # Debug - set to None for full training, or number of cells for quick debugging
         debug_pretrain_max_cells=110000,#None,#64000//2,
         debug_finetune_max_cells=20000,
-        debug_eval_max_cells=1000  # equivalent to validation set's target perturb genes
+        debug_eval_max_cells=1000,  # equivalent to validation set's target perturb genes
+
+        # finetune target objective
+        target_is_delta = True
     )
 
     # -----------------------------
@@ -465,9 +471,11 @@ def main():
 
     # Create tokenizer – use delta-aware tokenizer when fine-tuning on perturbations
     if getattr(config, 'target_is_delta', False):
-        tokenizer, detokenizer = create_delta_tokenizer(config.vocab_size)
+        ft_tokenizer, ft_detokenizer = create_delta_tokenizer(config.vocab_size)
     else:
-        tokenizer, detokenizer = create_simple_tokenizer(config.vocab_size)
+        ft_tokenizer, ft_detokenizer = create_simple_tokenizer(config.vocab_size)
+
+    pt_tokenizer, pt_detokenizer = create_simple_tokenizer(config.vocab_size)
 
     with open(config.hvg_info_path, 'r') as f:
         hvg_gene_ensemble = [line.strip() for line in f.readlines()]
@@ -486,7 +494,7 @@ def main():
     )
     
     # Wrap with tokenizer
-    pretrain_dataset = TokenizedScRNADataset(scrna_dataset, tokenizer)
+    pretrain_dataset = TokenizedScRNADataset(scrna_dataset, pt_tokenizer)
     
     pretrain_dataloader = DataLoader(
         pretrain_dataset,

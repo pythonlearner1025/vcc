@@ -8,4 +8,4 @@ pip install https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.
 cp -r data_normalized /
 cp esm_all.pt /
 cp token_distribution.json / 
-cp -r /workspace/vcc/data/competition_support/competition_train.h5 /
+cp -r data/competition_support/competition_train.h5 /
