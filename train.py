@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Optional, Tuple, Dict
 import numpy as np
 import json
+import argparse
 from torch.utils.data import Dataset, DataLoader
 
 from models.diffusion import (
@@ -339,22 +340,53 @@ def val_epoch_st(
 
 def main():
     """Main training function for ST-style Conditional Discrete Diffusion Transformer."""
-    config = ConditionalModelConfig(
-        train_notes="100M Norm NO ESM2",
-        dim=256,
-        n_head=4,
-        n_layer=4,
-        ffn_mult=4,
+    # -----------------------------
+    # Parse command line arguments
+    # -----------------------------
+    parser = argparse.ArgumentParser(description="Train or continue training ST-style Conditional Diffusion Transformer")
+    parser.add_argument("--ckpt_pt", type=str, default=None, help="Path to checkpoint .pt file to resume from")
+    parser.add_argument("--continue_from", type=str, choices=["pretrain", "finetune"], default="pretrain",
+                        help="Stage to continue from: 'pretrain' or 'finetune'")
+    parser.add_argument("--continue_pretrain_epochs", type=int, default=None,
+                        help="Override the number of pretrain epochs from the saved config")
+    parser.add_argument("--continue_finetune_epochs", type=int, default=None,
+                        help="Override the number of finetune epochs from the saved config")
+    parser.add_argument("--continue_bs", type=int, default=None,
+                        help="Override the batch size for both pretraining and finetuning")
+    parser.add_argument("--wandb_run_id", type=str, default=None,
+                        help="Existing wandb run ID to continue logging to (e.g., from restored run)")
+    args = parser.parse_args()
+
+    # -----------------------------
+    # Load config
+    # -----------------------------
+    if args.ckpt_pt:
+        ckpt_path = Path(args.ckpt_pt)
+        ckpt_dir = ckpt_path.parent
+        config_json_path = ckpt_dir / "config.json"
+        if not config_json_path.exists():
+            raise FileNotFoundError(f"Could not find config.json in {ckpt_dir}")
+        with open(config_json_path, "r") as f:
+            cfg_dict = json.load(f)
+        config = ConditionalModelConfig(**cfg_dict)
+    else:
+        # Fresh training run – create default config
+        config = ConditionalModelConfig(
+            train_notes="100M Norm NO ESM2",
+            dim=512,
+        n_head=8,
+        n_layer=16,
+        ffn_mult=8,
         vocab_size=256,
-        n_genes=2000,
-        n_total_genes=2000,
+        n_genes=3000,
+        n_total_genes=3000,
         gene_embed_dim=256,
         use_batch_conditioning=True,
         n_batches=48,
         batch_embed_dim=40,
 
         control_set_encoder_layers=2,
-        control_set_dim_hidden=256,
+        control_set_dim_hidden=512,
         
         n_timesteps=16,
         schedule="cosine",
@@ -366,8 +398,8 @@ def main():
         vcc_batch_size=1,
 
         # batch sizes
-        pretrain_batch_size=4,
-        vcc_set_size=4,
+        pretrain_batch_size=10,
+        vcc_set_size=10,
 
         # pretrain
         learning_rate=1e-4,
@@ -381,25 +413,38 @@ def main():
         pretrain_data_dir = "/data_normalized/scRNA/processed",
         finetune_data_path = "/data_normalized/vcc_data/adata_Training.h5ad",
         hvg_info_path = "/workspace/vcc/hvg_seuratv3_3000.txt",
-        esm_matrix_path = None,
+        esm_matrix_path = "/esm_all.pt",
 
         token_distribution_json = "/token_distribution.json",  # Path to token distribution JSON for frequency-aware masking
         token_weighting_annealing_steps = None,
 
         esm_proj_dim = 512,
         pretrain_epochs=1,
-        finetune_epochs=1,
+        finetune_epochs=10,
         log_every=10,
         eval_every=1000,
         save_every=5000,
         vcc_eval_interval=5000,
         
         # Debug - set to None for full training, or number of cells for quick debugging
-        debug_pretrain_max_cells=1,#None,#64000//2,
-        debug_finetune_max_cells=1,#200000//10,
+        debug_pretrain_max_cells=110000,#None,#64000//2,
+        debug_finetune_max_cells=20000,
         debug_eval_max_cells=1000  # equivalent to validation set's target perturb genes
     )
-    
+
+    # -----------------------------
+    # Apply overrides from CLI args
+    # -----------------------------
+    if args.continue_pretrain_epochs is not None:
+        config.pretrain_epochs = args.continue_pretrain_epochs
+    if args.continue_finetune_epochs is not None:
+        config.finetune_epochs = args.continue_finetune_epochs
+    if args.continue_bs is not None:
+        config.pretrain_batch_size = args.continue_bs
+        config.vcc_set_size = args.continue_bs
+    if args.continue_from == "finetune":
+        config.pretrain_epochs = 0
+
     # Create tokenizer
     tokenizer, detokenizer = create_simple_tokenizer(config.vocab_size)
 
@@ -440,16 +485,43 @@ def main():
     hvg_gene_ensemble = scrna_dataset.get_gene_names()
 
     # Initialise wandb AFTER we have the final config
-    wandb.init(
-        project="vcc-st-diffusion",
-        config=config.__dict__,
-        name=f"st_diffusion_{time.strftime('%Y%m%d_%H%M%S')}"
-    )
+    if args.wandb_run_id:
+        # Resume existing run - use the project from the existing run
+        print(f"Resuming wandb logging to existing run: {args.wandb_run_id}")
+        wandb.init(
+            project="vcc-st-diffusion",  # Use same project as restored run
+            config=config.__dict__,
+            id=args.wandb_run_id,
+            resume="must"  # Must resume the specified run
+        )
+    else:
+        # Create new run
+        wandb.init(
+            project="vcc-st-diffusion",
+            config=config.__dict__,
+            name=f"st_diffusion_{time.strftime('%Y%m%d_%H%M%S')}"
+        )
 
+    # -----------------------------
     # Create model / diffusion / optimiser
-    model = ConditionalDiffusionTransformer(config).cuda()
+    # -----------------------------
+    model = ConditionalDiffusionTransformer(config)
+    if args.ckpt_pt:
+        print(f"Loading weights from checkpoint: {args.ckpt_pt}")
+        ckpt_state = torch.load(args.ckpt_pt, map_location="cpu", weights_only=False)
+        model.load_state_dict(ckpt_state["model_state_dict"])
+    else:
+        ckpt_state = {}
+    # Move model to the appropriate device
+    model = model.cuda()
     diffusion = PartialMaskingDiffusion(config)
     optimizer = create_optimizer(model, config)
+    # If continuing from a checkpoint try to restore optimizer state
+    if args.ckpt_pt and "optimizer_state_dict" in ckpt_state:
+        try:
+            optimizer.load_state_dict(ckpt_state["optimizer_state_dict"])
+        except Exception as e:
+            print(f"Could not load optimizer state: {e}")
     print(f"\nModel created with {sum(p.numel() for p in model.parameters()):,} parameters")
     
     # Create VCC train and validation dataloaders
@@ -528,7 +600,7 @@ def main():
     
     # Phase 2: Fine-tuning with control sets
     print("\n=== Phase 2: Fine-tuning with Control Sets ===")
-    print(f"Using batch_size={config.pretrain_batch_size} optimized for 2000-gene sequences")
+    print(f"Using batch_size={config.pretrain_batch_size} optimized for {config.n_genes}-gene sequences")
     global_step = 0
     config_ft = config
     config_ft.learning_rate = config.finetune_learning_rate

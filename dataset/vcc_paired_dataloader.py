@@ -24,14 +24,15 @@ class VCCPairedDataset(Dataset):
     
     def __init__(
         self,
-        adata_path: str = "data/vcc_data/adata_Training.h5ad",
+        adata_path: str = "data/competition_support/competition_train.h5",
         hvg_gene_ids: List[str] = None,
         set_size: int = 16,
         n_samples_per_gene: int = 10,
         train_split: float = 0.8,
-        is_train: bool = True, # Train or val
+        is_train: bool = True,  # Train or val
         random_seed: int = 42,
         normalize: bool = True,
+        blacklist_path: str = None,
     ):
   
         self.set_size = set_size
@@ -39,6 +40,16 @@ class VCCPairedDataset(Dataset):
         self.random_seed = random_seed
         self.is_train = is_train
         self.normalize = normalize
+        
+        # Load blacklist genes if provided
+        self.blacklist_genes = set()
+        if blacklist_path is not None:
+            try:
+                with open(blacklist_path, 'r') as fh:
+                    self.blacklist_genes = {line.strip() for line in fh if line.strip()}
+                print(f"Loaded {len(self.blacklist_genes)} genes from blacklist file {blacklist_path}")
+            except FileNotFoundError:
+                warnings.warn(f"Blacklist file {blacklist_path} not found. Continuing without blacklist.")
         
         np.random.seed(random_seed)
         
@@ -61,23 +72,31 @@ class VCCPairedDataset(Dataset):
         self.gene_name_to_id = dict(zip(self.adata.var.index, self.adata.var['gene_id']))
         self.gene_id_to_name = dict(zip(self.adata.var['gene_id'], self.adata.var.index))
         
-        # Filter to HVG genes if provided
+        # Filter to HVG genes if provided, otherwise keep all genes
         if hvg_gene_ids is not None:
             self._filter_to_hvgs(hvg_gene_ids)
+        else:
+            self.hvg_gene_ids = list(self.adata.var['gene_id'])
+            self.hvg_gene_names = list(self.adata.var.index)
         
         # Get all perturbed genes (excluding non-targeting)
         all_perturbed_genes = [g for g in self.adata.obs['target_gene'].unique() 
                                if g != 'non-targeting']
         
-        # Perform 80:20 split on all perturbed genes
-        np.random.seed(random_seed)
-        np.random.shuffle(all_perturbed_genes)
-        split_idx = int(len(all_perturbed_genes) * train_split)
-        
-        if is_train:
-            self.target_genes = all_perturbed_genes[:split_idx]
+        # Determine train/validation gene sets
+        if self.blacklist_genes:
+            if is_train:
+                # Training uses all genes except blacklist for H1 (handled later per cell type)
+                self.target_genes = all_perturbed_genes
+            else:
+                # Validation focuses only on blacklist genes
+                self.target_genes = [g for g in all_perturbed_genes if g in self.blacklist_genes]
         else:
-            self.target_genes = all_perturbed_genes[split_idx:]
+            # Fallback to random 80:20 split if no blacklist provided
+            np.random.seed(random_seed)
+            np.random.shuffle(all_perturbed_genes)
+            split_idx = int(len(all_perturbed_genes) * train_split)
+            self.target_genes = all_perturbed_genes[:split_idx] if is_train else all_perturbed_genes[split_idx:]
         
         print(f"{'Training' if is_train else 'Validation'} dataset: {len(self.target_genes)} genes")
         
@@ -123,59 +142,73 @@ class VCCPairedDataset(Dataset):
         self.gene_id_to_name = dict(zip(self.adata.var['gene_id'], self.adata.var.index))
         
     def _prepare_samples(self):
-        """Pre-compute sample indices for each gene."""
+        """Pre-compute sample indices for each gene / cell-type combination."""
         self.samples = []
-        skipped_genes = []
-        
+        skipped_entries = []
+
+        obs = self.adata.obs  # shorthand
+        rng = np.random.default_rng(self.random_seed)
+
         for gene in self.target_genes:
-            # Skip if gene not in our HVG list
+            # Ignore genes that are not in HVG list
             if gene not in self.gene_to_hvg_idx:
-                skipped_genes.append((gene, "not in HVG"))
+                skipped_entries.append((gene, "not in HVG"))
                 continue
-                
-            # Get perturbed cells for this gene
-            pert_mask = self.adata.obs['target_gene'] == gene
-            pert_cells = self.adata.obs.index[pert_mask].values
-            
-            if len(pert_cells) < self.set_size:
-                skipped_genes.append((gene, f"only {len(pert_cells)} perturbed cells"))
-                warnings.warn(f"Gene {gene} has only {len(pert_cells)} cells, skipping")
+
+            gene_mask = obs['target_gene'] == gene
+            if gene_mask.sum() == 0:
+                skipped_entries.append((gene, "no perturbed cells"))
                 continue
-            
-            # Get batches where this gene was perturbed
-            pert_batches = self.adata.obs.loc[pert_mask, 'batch'].unique()
-            
-            # Get control cells from same batches
-            ctrl_mask = (self.adata.obs['target_gene'] == 'non-targeting') & \
-                        (self.adata.obs['batch'].isin(pert_batches))
-            ctrl_cells = self.adata.obs.index[ctrl_mask].values
-            
-            if len(ctrl_cells) < self.set_size:
-                skipped_genes.append((gene, f"only {len(ctrl_cells)} control cells"))
-                warnings.warn(f"Not enough control cells for gene {gene}, skipping")
-                continue
-            
-            # Create n_samples_per_gene different sets
-            for _ in range(self.n_samples_per_gene):
-                # Sample cells
-                pert_sample = np.random.choice(pert_cells, self.set_size, replace=False)
-                ctrl_sample = np.random.choice(ctrl_cells, self.set_size, replace=False)
-                
-                self.samples.append({
-                    'gene': gene,
-                    'gene_idx': self.gene_to_hvg_idx[gene],
-                    'pert_cells': pert_sample,
-                    'ctrl_cells': ctrl_sample,
-                    'pert_batches': self.adata.obs.loc[pert_sample, 'batch'].values,
-                    'ctrl_batches': self.adata.obs.loc[ctrl_sample, 'batch'].values,
-                })
-        
-        if skipped_genes:
-            print(f"  -> Skipped {len(skipped_genes)} genes:")
-            for gene, reason in skipped_genes[:5]:  # Show first 5
-                print(f"     - {gene}: {reason}")
-            if len(skipped_genes) > 5:
-                print(f"     ... and {len(skipped_genes) - 5} more")
+
+            # iterate over each cell_type separately so that control / perturb pairs share the same type
+            for cell_type in obs.loc[gene_mask, 'cell_type'].unique():
+                ct_mask = gene_mask & (obs['cell_type'] == cell_type)
+                in_blacklist = gene in self.blacklist_genes
+
+                # Apply blacklist logic (only affects H1)
+                if self.is_train and in_blacklist and cell_type == 'ARC_H1':
+                    continue  # skip H1 blacklist genes in training
+                if (not self.is_train):
+                    # Validation must be H1 + blacklist genes only
+                    if not (in_blacklist and cell_type == 'ARC_H1'):
+                        continue
+
+                pert_cells = obs.index[ct_mask].values
+                if len(pert_cells) < self.set_size:
+                    skipped_entries.append((f"{gene}/{cell_type}", f"only {len(pert_cells)} perturbed cells"))
+                    continue
+
+                # batches where this gene was perturbed within this cell_type
+                pert_batches = obs.loc[ct_mask, 'batch'].unique()
+
+                # control cells: non-targeting, same batches, same cell_type
+                ctrl_mask = (
+                    (obs['target_gene'] == 'non-targeting') &
+                    (obs['batch'].isin(pert_batches)) &
+                    (obs['cell_type'] == cell_type)
+                )
+                ctrl_cells = obs.index[ctrl_mask].values
+                if len(ctrl_cells) < self.set_size:
+                    skipped_entries.append((f"{gene}/{cell_type}", f"only {len(ctrl_cells)} control cells"))
+                    continue
+
+                for _ in range(self.n_samples_per_gene):
+                    pert_sample = rng.choice(pert_cells, self.set_size, replace=False)
+                    ctrl_sample = rng.choice(ctrl_cells, self.set_size, replace=False)
+                    self.samples.append({
+                        'gene': gene,
+                        'gene_idx': self.gene_to_hvg_idx[gene],
+                        'cell_type': cell_type,
+                        'pert_cells': pert_sample,
+                        'ctrl_cells': ctrl_sample,
+                        'pert_batches': obs.loc[pert_sample, 'batch'].values,
+                        'ctrl_batches': obs.loc[ctrl_sample, 'batch'].values,
+                    })
+
+        if skipped_entries:
+            print(f"  -> Skipped {len(skipped_entries)} gene/cell-type combos:")
+            for entry, reason in skipped_entries[:5]:
+                print(f"     - {entry}: {reason}")
         
     def __len__(self):
         return len(self.samples)
@@ -193,25 +226,20 @@ class VCCPairedDataset(Dataset):
         if hasattr(ctrl_expr, 'toarray'):
             ctrl_expr = ctrl_expr.toarray()
         
+        # Calculate log2 fold change for the target gene BEFORE exponentiating
+        gene_idx_in_adata = self.adata.var.index.get_loc(sample['gene'])
+        pert_gene_expr_log = pert_expr[:, gene_idx_in_adata].mean()
+        ctrl_gene_expr_log = ctrl_expr[:, gene_idx_in_adata].mean()
+        log2fc = (pert_gene_expr_log - ctrl_gene_expr_log) / np.log(2)
+
+        # Exponentiate log1p values back to counts (range ~0–10k)
+        pert_expr = np.expm1(pert_expr)
+        ctrl_expr = np.expm1(ctrl_expr)
+
         # Convert to torch tensors
         pert_expr = torch.from_numpy(pert_expr).float()
         ctrl_expr = torch.from_numpy(ctrl_expr).float()
-        
-        # Calculate log2 fold change for the target gene
-        gene_idx_in_adata = self.adata.var.index.get_loc(sample['gene'])
 
-            
-        if self.normalize:
-            # For normalized data, calculate fold change in log space
-            # Since data is already log-transformed, we can subtract
-            pert_gene_expr = pert_expr[:, gene_idx_in_adata].mean()
-            ctrl_gene_expr = ctrl_expr[:, gene_idx_in_adata].mean()
-            # Convert from natural log to log2: log2(x/y) = (ln(x) - ln(y)) / ln(2)
-            log2fc = (pert_gene_expr - ctrl_gene_expr) / np.log(2)
-        else:
-            pert_gene_expr = pert_expr[:, gene_idx_in_adata].mean() + 1e-6
-            ctrl_gene_expr = ctrl_expr[:, gene_idx_in_adata].mean() + 1e-6
-            log2fc = np.log2(pert_gene_expr / ctrl_gene_expr)
         return {
             'perturbed_expr': pert_expr,
             'control_expr': ctrl_expr,
@@ -220,11 +248,12 @@ class VCCPairedDataset(Dataset):
             'log2fc': torch.tensor(float(log2fc), dtype=torch.float32),
             'pert_batches': sample['pert_batches'].tolist(),
             'ctrl_batches': sample['ctrl_batches'].tolist(),
+            'cell_type': sample['cell_type'],
         }
 
 
 def create_vcc_paired_dataloader(
-    adata_path: str = "data/vcc_data/adata_Training.h5ad",
+    adata_path: str = "data/competition_support/competition_train.h5",
     hvg_gene_ids: List[str] = None,
     set_size: int = 16,
     batch_size: int = 4,
@@ -237,7 +266,8 @@ def create_vcc_paired_dataloader(
     tokenizer=None,
     prefetch_factor: int = 2,
     pin_memory: bool = False,
-    normalize: bool = True
+    normalize: bool = True,
+    blacklist_path: str = None
 ) -> Tuple[VCCPairedDataset, DataLoader]:
    
     dataset = VCCPairedDataset(
@@ -248,7 +278,8 @@ def create_vcc_paired_dataloader(
         train_split=train_split,
         is_train=is_train,
         random_seed=random_seed,
-        normalize=normalize
+        normalize=normalize,
+        blacklist_path=blacklist_path
     )
     
     # Build a collate function that performs tokenisation and other CPU-heavy work
@@ -273,7 +304,7 @@ def create_vcc_paired_dataloader(
 
 def create_train_val_dataloaders(
     *,
-    adata_path: str = "data/vcc_data/adata_Training.h5ad",
+    adata_path: str = "data/competition_support/competition_train.h5",
     hvg_gene_ids: List[str] = None,
     set_size: int = 16,
     batch_size: int = 4,
@@ -286,6 +317,7 @@ def create_train_val_dataloaders(
     pin_memory: bool = False,
     random_seed: int = 42,
     normalize: bool = True,
+    blacklist_path: str = None,
 ) -> Tuple[Tuple[VCCPairedDataset, DataLoader], Tuple[VCCPairedDataset, DataLoader]]:
 
     # Training dataloader
@@ -304,6 +336,7 @@ def create_train_val_dataloaders(
         prefetch_factor=prefetch_factor,
         pin_memory=pin_memory,
         normalize=normalize,
+        blacklist_path=blacklist_path,
     )
     
     # Validation dataloader
@@ -322,6 +355,7 @@ def create_train_val_dataloaders(
         prefetch_factor=prefetch_factor,
         pin_memory=pin_memory,
         normalize=normalize,
+        blacklist_path=blacklist_path,
     )
     
     return (train_dataset, train_dataloader), (val_dataset, val_dataloader)
