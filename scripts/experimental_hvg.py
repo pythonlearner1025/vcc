@@ -117,7 +117,7 @@ def _sample_cells_from_batch(batch_file: str, target: int) -> tuple[np.ndarray, 
     with h5py.File(batch_file, "r") as f:
         X = f["X"]  # shape (cells, genes) – assumed CSR‑compressed sparse saved dense
         n_cells = X.shape[0]
-        idx = np.random.choice(n_cells, size=min(target, n_cells), replace=False)
+        idx = np.random.choice(n_cells, size=int(min(target, n_cells)), replace=False)
         # Sort indices for h5py compatibility
         idx = np.sort(idx)
         data = X[idx]
@@ -460,10 +460,10 @@ def main(args):
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser(description="Unified HVG selection (Seurat v3)")
-    p.add_argument("--scrna_dir", default="scRNA/processed", help="Directory with batch_*.h5")
-    p.add_argument("--finetune_path", default="vcc_data/adata_Training.h5ad", help="Finetune .h5ad file")
-    p.add_argument("--output_dir", default=".")
-    p.add_argument("--whitelist_path", default="vcc_perturbed_genes.txt",help="Gene list to force‑include")
+    p.add_argument("--scrna_dir", default="data/scRNA/processed", help="Directory with batch_*.h5")
+    p.add_argument("--finetune_path", default="data/vcc_data/adata_Training.h5ad", help="Finetune .h5ad file")
+    p.add_argument("--output_dir", default="data")
+    p.add_argument("--whitelist_path", default="data/vcc_perturbed_genes.txt",help="Gene list to force‑include")
     p.add_argument("--n_hvgs", type=int, default=2000, help="#HVGs to keep")
     p.add_argument(
         "--max_cells_pretrain",

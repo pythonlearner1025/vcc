@@ -1,0 +1,9 @@
+{
+  "ckpt_dir": "/run_20250731_072803",
+  "val_genes_number": "10",
+  "val_set_size": "8",
+  "test_genes_path": "data/vcc_data/pert_counts_Validation.csv",
+  "test_sample_size": "64",
+  "test_gene_names_path": "data/vcc_data/gene_names.csv",
+  "hvg_ids_path": "hvg_seuratv3_global_scRNA1e5_2000.txt"
+}
