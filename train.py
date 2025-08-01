@@ -28,6 +28,7 @@ from models.diffusion import (
 # Updated imports for cross-dataset HVGs
 from dataset.scrna_hvg_dataset import ScRNADatasetWithHVGs, create_scrna_hvg_dataloader
 from dataset.vcc_paired_dataloader import create_train_val_dataloaders
+from delta_tokenizer import create_delta_tokenizer
 
 class TokenizedScRNADataset(Dataset):
     """Wrapper around ScRNADatasetWithHVGs that applies tokenization."""
@@ -177,16 +178,24 @@ def train_epoch_st(
             cells_processed += tokens.shape[0]
         elif isinstance(batch, dict) and 'perturbed_expr' in batch:
             X_pert = batch['perturbed_expr'].cuda()
+            X_ctrl = batch['control_expr'].cuda() if 'control_expr' in batch else None
             B, S, N = X_pert.shape
-            
-            X_pert_tokens = _tokenize_batch(X_pert, tokenizer)
-            tokens = X_pert_tokens.view(B * S, N)
-            
-            X_ctrl = None
-            if use_control_sets and 'control_expr' in batch:
-                X_ctrl = batch['control_expr'].cuda()
+
+            # Build Δ = perturbed − mean(control)
+            ctrl_mean = X_ctrl.mean(1, keepdim=True) if X_ctrl is not None else torch.zeros_like(X_pert)
+            delta_expr = X_pert - ctrl_mean
+
+            delta_tokens = _tokenize_batch(delta_expr, tokenizer)
+            tokens = delta_tokens.view(B * S, N)
+
+            # Prepare control-set tokens for contextual conditioning (unchanged)
+            X_ctrl_expanded = None
+            if use_control_sets and X_ctrl is not None:
                 X_ctrl_tokens = _tokenize_batch(X_ctrl, tokenizer)
-                X_ctrl = _expand_control_sets(X_ctrl_tokens, S)
+                X_ctrl_expanded = _expand_control_sets(X_ctrl_tokens, S)
+
+            # Use expanded tokenised control set for the loss (can be None)
+            X_ctrl = X_ctrl_expanded
             
             target_gene_idx = batch['target_gene_idx']
             if isinstance(target_gene_idx, list):
@@ -301,14 +310,21 @@ def val_epoch_st(
                 continue
 
             X_pert = batch['perturbed_expr'].cuda()
-            X_ctrl = batch['control_expr'].cuda()
+            X_ctrl = batch['control_expr'].cuda() if 'control_expr' in batch else None
             B, S, N = X_pert.shape
-            
-            X_pert_tokens = _tokenize_batch(X_pert, tokenizer)
-            X_ctrl_tokens = _tokenize_batch(X_ctrl, tokenizer)
-            
-            tokens = X_pert_tokens.view(B * S, N)
-            X_ctrl = _expand_control_sets(X_ctrl_tokens, S)
+
+            # Δ computation for validation
+            ctrl_mean = X_ctrl.mean(1, keepdim=True)
+            delta_expr = X_pert - ctrl_mean
+
+            delta_tokens = _tokenize_batch(delta_expr, tokenizer)
+            X_ctrl_expanded = None
+            if X_ctrl is not None:
+                X_ctrl_tokens = _tokenize_batch(X_ctrl, tokenizer)
+                X_ctrl_expanded = _expand_control_sets(X_ctrl_tokens, S)
+
+            tokens = delta_tokens.view(B * S, N)
+            X_ctrl = X_ctrl_expanded
             
             target_gene_idx = batch['target_gene_idx']
             if isinstance(target_gene_idx, list):
@@ -445,8 +461,11 @@ def main():
     if args.continue_from == "finetune":
         config.pretrain_epochs = 0
 
-    # Create tokenizer
-    tokenizer, detokenizer = create_simple_tokenizer(config.vocab_size)
+    # Create tokenizer – use delta-aware tokenizer when fine-tuning on perturbations
+    if getattr(config, 'target_is_delta', False):
+        tokenizer, detokenizer = create_delta_tokenizer(config.vocab_size)
+    else:
+        tokenizer, detokenizer = create_simple_tokenizer(config.vocab_size)
 
     with open(config.hvg_info_path, 'r') as f:
         hvg_gene_ensemble = [line.strip() for line in f.readlines()]
