@@ -189,21 +189,29 @@ def merge_hvg_lists(
 ) -> List[str]:
     """Return *ordered* union: whitelist first, then HVGs by precedence.
 
-    Precedence = appear in both > finetune only > pretrain only (modifiable).
+    Precedence = appear in both > half/half of pretrain and finetune only 
     The list is trimmed / extended to satisfy *n_final* while never dropping
     any whitelisted genes.
     """
     common = [g for g in pretrain_hvgs if g in finetune_hvgs]
     only_fine = [g for g in finetune_hvgs if g not in pretrain_hvgs]
     only_pre = [g for g in pretrain_hvgs if g not in finetune_hvgs]
+    
+    # Take half of each list, rounding up for only_fine if total is odd
+    n_each = (len(only_fine) + len(only_pre)) // 2
+    n_fine = (n_each + 1) if (len(only_fine) + len(only_pre)) % 2 else n_each
+    n_pre = n_each
+    
+    selected_fine = only_fine[:n_fine]
+    selected_pre = only_pre[:n_pre]
 
-    ordered = list(dict.fromkeys(list(whitelist) + common + only_fine + only_pre))
+    ordered = list(dict.fromkeys(list(whitelist) + common + selected_fine + selected_pre))
 
     logger.info("HVG composition before trimming:")
     logger.info("  Whitelisted genes: %d", len(whitelist))
     logger.info("  Common to pretrain & finetune: %d", len(common))
-    logger.info("  Finetune-only: %d", len(only_fine))
-    logger.info("  Pretrain-only: %d", len(only_pre))
+    logger.info("  Finetune-only: %d", len(selected_fine))
+    logger.info("  Pretrain-only: %d", len(selected_pre))
 
     if len(ordered) > n_final:
         # Retain whitelist, then top genes until budget exhausted
