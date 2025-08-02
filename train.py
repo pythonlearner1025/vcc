@@ -406,18 +406,18 @@ def main():
     else:
         # Fresh training run – create default config
         config = ConditionalModelConfig(
-            train_notes="100M Norm NO ESM2",
-            full_eval=True,
-            target_is_delta=True,
+            train_notes="Brain Test",
+            full_eval=False,
+            target_is_delta=False,
 
             dim=512,
             n_head=8,
-            n_layer=16,
-            ffn_mult=8,
+            n_layer=8,
+            ffn_mult=4,
 
             vocab_size=256,
-            n_genes=3000,
-            n_total_genes=3000,
+            n_genes=2000,
+            n_total_genes=2000,
             gene_embed_dim=256,
 
             use_batch_conditioning=True,
@@ -427,8 +427,8 @@ def main():
             control_set_dim_hidden=512,
 
             # BS
-            pretrain_batch_size=8,
-            vcc_set_size=8,
+            pretrain_batch_size=16,
+            vcc_set_size=16,
 
             # Diffusion
             n_timesteps=16,
@@ -442,16 +442,16 @@ def main():
             vcc_batch_size=1,
             
             # LR
-            learning_rate=1e-4,
+            learning_rate=3e-4,
             weight_decay=0.01,
-            warmup_steps=500,
+            warmup_steps=1000,
             finetune_learning_rate=3e-5,
             finetune_warmup_steps=250,
 
             # DATA
-            pretrain_data_dir="/data_normalized/scRNA/processed",
+            pretrain_data_dir="/scRNA_brain_norm/processed",
             finetune_data_path="/competition_train.h5",
-            hvg_info_path="/workspace/vcc/hvg_seuratv3_3000.txt",
+            hvg_info_path="/workspace/vcc/hvg_seuratv3_brain_2000.txt",
             esm_matrix_path="/esm_all.pt",
             blacklist_path="data/blacklist.txt",
             token_distribution_json="/token_distribution.json",
