@@ -34,6 +34,9 @@ class ConditionalModelConfig:
     ffn_mult: int = 8
     vocab_size: int = 64  # 64 expression bins
     n_genes: int = 2000  # Number of HVGs
+
+    # Training target type
+    target_is_delta: bool = True  # Predict Δ rather than raw counts during fine-tune
     
     # Conditioning
     n_total_genes: int = 36601  # Total genes in vocabulary for embedding
