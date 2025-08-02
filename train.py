@@ -28,6 +28,7 @@ from models.diffusion import (
 # Updated imports for cross-dataset HVGs
 from dataset.scrna_hvg_dataset import ScRNADatasetWithHVGs, create_scrna_hvg_dataloader
 from dataset.vcc_paired_dataloader import create_train_val_dataloaders
+from delta_tokenizer import create_delta_tokenizer
 
 class TokenizedScRNADataset(Dataset):
     """Wrapper around ScRNADatasetWithHVGs that applies tokenization."""
@@ -177,16 +178,25 @@ def train_epoch_st(
             cells_processed += tokens.shape[0]
         elif isinstance(batch, dict) and 'perturbed_expr' in batch:
             X_pert = batch['perturbed_expr'].cuda()
+            X_ctrl = batch['control_expr'].cuda() if 'control_expr' in batch else None
             B, S, N = X_pert.shape
-            
-            X_pert_tokens = _tokenize_batch(X_pert, tokenizer)
-            tokens = X_pert_tokens.view(B * S, N)
-            
-            X_ctrl = None
-            if use_control_sets and 'control_expr' in batch:
-                X_ctrl = batch['control_expr'].cuda()
+
+            # Build per-cell Δ = perturbed − control (no averaging)
+            if X_ctrl is None:
+                raise ValueError("control_expr is required for delta computation")
+            delta_expr = X_pert - X_ctrl
+
+            delta_tokens = _tokenize_batch(delta_expr, tokenizer)
+            tokens = delta_tokens.view(B * S, N)
+
+            # Prepare control-set tokens for contextual conditioning (unchanged)
+            X_ctrl_expanded = None
+            if use_control_sets and X_ctrl is not None:
                 X_ctrl_tokens = _tokenize_batch(X_ctrl, tokenizer)
-                X_ctrl = _expand_control_sets(X_ctrl_tokens, S)
+                X_ctrl_expanded = _expand_control_sets(X_ctrl_tokens, S)
+
+            # Use expanded tokenised control set for the loss (can be None)
+            X_ctrl = X_ctrl_expanded
             
             target_gene_idx = batch['target_gene_idx']
             if isinstance(target_gene_idx, list):
@@ -301,14 +311,22 @@ def val_epoch_st(
                 continue
 
             X_pert = batch['perturbed_expr'].cuda()
-            X_ctrl = batch['control_expr'].cuda()
+            X_ctrl = batch['control_expr'].cuda() if 'control_expr' in batch else None
             B, S, N = X_pert.shape
-            
-            X_pert_tokens = _tokenize_batch(X_pert, tokenizer)
-            X_ctrl_tokens = _tokenize_batch(X_ctrl, tokenizer)
-            
-            tokens = X_pert_tokens.view(B * S, N)
-            X_ctrl = _expand_control_sets(X_ctrl_tokens, S)
+
+            # Δ computation for validation (per-cell)
+            if X_ctrl is None:
+                raise ValueError("control_expr is required for delta computation in validation")
+            delta_expr = X_pert - X_ctrl
+
+            delta_tokens = _tokenize_batch(delta_expr, tokenizer)
+            X_ctrl_expanded = None
+            if X_ctrl is not None:
+                X_ctrl_tokens = _tokenize_batch(X_ctrl, tokenizer)
+                X_ctrl_expanded = _expand_control_sets(X_ctrl_tokens, S)
+
+            tokens = delta_tokens.view(B * S, N)
+            X_ctrl = X_ctrl_expanded
             
             target_gene_idx = batch['target_gene_idx']
             if isinstance(target_gene_idx, list):
@@ -398,8 +416,8 @@ def main():
         vcc_batch_size=1,
 
         # batch sizes
-        pretrain_batch_size=10,
-        vcc_set_size=10,
+        pretrain_batch_size=8,
+        vcc_set_size=8,
 
         # pretrain
         learning_rate=1e-4,
@@ -410,8 +428,11 @@ def main():
         finetune_learning_rate = 3e-5,
         finetune_warmup_steps  = 250,
 
+        # scBaseCOunt data is not UMI normalized
         pretrain_data_dir = "/data_normalized/scRNA/processed",
-        finetune_data_path = "/data_normalized/vcc_data/adata_Training.h5ad",
+        # it is assumed competition_support dataset from Arc is UMI normalized
+        # since it was log1p normalized.
+        finetune_data_path = "/competition_train.h5",
         hvg_info_path = "/workspace/vcc/hvg_seuratv3_3000.txt",
         esm_matrix_path = "/esm_all.pt",
 
@@ -429,7 +450,10 @@ def main():
         # Debug - set to None for full training, or number of cells for quick debugging
         debug_pretrain_max_cells=110000,#None,#64000//2,
         debug_finetune_max_cells=20000,
-        debug_eval_max_cells=1000  # equivalent to validation set's target perturb genes
+        debug_eval_max_cells=1000,  # equivalent to validation set's target perturb genes
+
+        # finetune target objective
+        target_is_delta = True
     )
 
     # -----------------------------
@@ -445,8 +469,13 @@ def main():
     if args.continue_from == "finetune":
         config.pretrain_epochs = 0
 
-    # Create tokenizer
-    tokenizer, detokenizer = create_simple_tokenizer(config.vocab_size)
+    # Create tokenizer – use delta-aware tokenizer when fine-tuning on perturbations
+    if getattr(config, 'target_is_delta', False):
+        ft_tokenizer, ft_detokenizer = create_delta_tokenizer(config.vocab_size)
+    else:
+        ft_tokenizer, ft_detokenizer = create_simple_tokenizer(config.vocab_size)
+
+    pt_tokenizer, pt_detokenizer = create_simple_tokenizer(config.vocab_size)
 
     with open(config.hvg_info_path, 'r') as f:
         hvg_gene_ensemble = [line.strip() for line in f.readlines()]
@@ -465,7 +494,7 @@ def main():
     )
     
     # Wrap with tokenizer
-    pretrain_dataset = TokenizedScRNADataset(scrna_dataset, tokenizer)
+    pretrain_dataset = TokenizedScRNADataset(scrna_dataset, pt_tokenizer)
     
     pretrain_dataloader = DataLoader(
         pretrain_dataset,
@@ -526,7 +555,7 @@ def main():
     
     # Create VCC train and validation dataloaders
     (vcc_dataset, vcc_dataloader), (val_dataset, val_dataloader) = create_train_val_dataloaders(
-        tokenizer=tokenizer,
+        tokenizer=ft_tokenizer,
         adata_path=config.finetune_data_path,
         hvg_gene_ids=hvg_gene_ensemble,
         set_size=config.vcc_set_size,
@@ -598,6 +627,15 @@ def main():
     else:
         print("\n=== Skipping Phase 1: Pretraining (pretrain_epochs=0) ===")
     
+    # ------------------------------------------------------------------
+    # Re-initialise token embeddings if we switch objective to Δ (fine-tune)
+    # ------------------------------------------------------------------
+    if getattr(config, 'target_is_delta', False):
+        print("Re-initialising token embeddings for Δ objective (fine-tune phase)")
+        torch.nn.init.normal_(model.token_emb.weight, mean=0.0, std=0.02)
+        # Re-initialise output head as well so logits match new embedding
+        if hasattr(model, 'head'):
+            torch.nn.init.normal_(model.head.weight, mean=0.0, std=0.02)
     # Phase 2: Fine-tuning with control sets
     print("\n=== Phase 2: Fine-tuning with Control Sets ===")
     print(f"Using batch_size={config.pretrain_batch_size} optimized for {config.n_genes}-gene sequences")
@@ -611,7 +649,7 @@ def main():
         global_step = train_epoch_st(
             model, diffusion, vcc_dataloader, optimizer, config,
             epoch, global_step, finetune_steps,
-            tokenizer=tokenizer,  # VCC data needs tokenization
+            tokenizer=ft_tokenizer,  # VCC data needs tokenization
             batch_to_idx=batch_to_idx,  # Pass batch mapping for conditioning
             use_control_sets=True,
             max_cells=config.debug_finetune_max_cells
@@ -622,7 +660,7 @@ def main():
             print("\n=== Validation Set Evaluation ===")
             val_metrics = val_epoch_st(
                 model, diffusion, val_dataloader,
-                epoch, tokenizer, batch_to_idx,
+                epoch, ft_tokenizer, batch_to_idx,
                 max_cells=config.debug_eval_max_cells
             )
             print(f"Validation loss: {val_metrics['val_loss']:.4f} ({val_metrics['val_batches_evaluated']} batches)")
