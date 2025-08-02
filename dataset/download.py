@@ -298,7 +298,7 @@ def main():
     parser.add_argument(
         "--cell-count",
         type=float,
-        default=1e5,
+        default=1e6,
         help="Number of cells to download (default: 1e6)"
     )
     parser.add_argument(

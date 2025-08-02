@@ -1,0 +1,16 @@
+*.DS_Store
+*.pt
+ref/
+env/
+assets/
+data/
+data_normalized/
+artifacts/
+__pycache__/
+wandb/
+
+# out dirs
+checkpoints/
+cell-eval-outdir/
+cell-eval/
+evals/

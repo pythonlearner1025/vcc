@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Optional, Tuple, Dict
 import numpy as np
 import json
+import argparse
 from torch.utils.data import Dataset, DataLoader
 
 from models.diffusion import (
@@ -110,6 +111,33 @@ def create_simple_tokenizer(vocab_size: int = 64, max_value: float = 10000.0):
     tokenizer = SimpleTokenizer(vocab_size, max_value)
     return tokenizer, tokenizer.detokenize
 
+def _tokenize_batch(data: torch.Tensor, tokenizer) -> torch.Tensor:
+    """Tokenize a batch of expression data."""
+    if tokenizer is None:
+        return data
+    
+    # Vectorised tokenisation using the tokenizer which can bucketise the whole tensor
+    data_cpu = data.cpu()
+    tokens = tokenizer(data_cpu)
+    return tokens.cuda()
+
+def _process_batch_indices(batch: dict, batch_to_idx: Optional[Dict[str, int]]) -> Optional[torch.Tensor]:
+    """Process batch indices from batch names."""
+    if batch_to_idx is None or 'pert_batches' not in batch:
+        return None
+    
+    batch_indices = []
+    for sample_batches in batch['pert_batches']:
+        for batch_name in sample_batches:
+            batch_indices.append(batch_to_idx.get(batch_name, 0))
+    
+    return torch.tensor(batch_indices, device='cuda')
+
+def _expand_control_sets(X_ctrl: torch.Tensor, S: int) -> torch.Tensor:
+    """Expand control sets to match flattened perturbed cells."""
+    B, _, N = X_ctrl.shape
+    X_ctrl_expanded = X_ctrl.unsqueeze(1).expand(-1, S, -1, -1)
+    return X_ctrl_expanded.reshape(B * S, S, N)
 
 def train_epoch_st(
     model: torch.nn.Module,
@@ -120,154 +148,81 @@ def train_epoch_st(
     epoch: int,
     global_step: int,
     total_training_steps: int,
-    tokenizer = None,
+    tokenizer=None,
     batch_to_idx: Optional[Dict[str, int]] = None,
     use_control_sets: bool = True,
-    mixed_training: bool = True,
     max_cells: Optional[int] = None,
 ) -> int:
-    """
-    Train for one epoch using ST-style conditioning.
-    
-    Args:
-        model: The diffusion model
-        diffusion: The diffusion process handler
-        dataloader: Training data loader (paired sets)
-        optimizer: Optimizer
-        config: Model configuration
-        epoch: Current epoch number
-        global_step: Global step counter
-        total_training_steps: Total training steps for LR scheduling
-        tokenizer: Tokenizer function to convert expression values to tokens (needed for VCC data)
-        batch_to_idx: Mapping from batch names to indices for batch conditioning
-        use_control_sets: Whether to use control set conditioning
-        mixed_training: Whether to mix conditioned and unconditioned batches
-        max_cells: Maximum number of cells to process (for debugging), None for full epoch
-        
-    Returns:
-        Updated global step
-    """
+    """Train for one epoch using ST-style conditioning."""
     model.train()
     epoch_start = time.time()
     epoch_losses = []
-    
-    total_steps = len(dataloader)
     cells_processed = 0
     
-    if max_cells is not None:
-        print(f"Debug mode: limiting epoch to {max_cells} cells")
-    
     for batch_idx, batch in enumerate(dataloader):
-        # Early cutoff for debugging
-        if max_cells is not None and cells_processed >= max_cells:
-            print(f"Debug cutoff: stopping after processing {cells_processed} cells (limit: {max_cells})")
+        if max_cells and cells_processed >= max_cells:
             break
         
-        if isinstance(batch, dict) and 'perturbed_expr' in batch:
-            # Processing VCC paired data
-            X_pert = batch['perturbed_expr'].cuda()
-            X_ctrl = batch['control_expr'].cuda() if use_control_sets else None
-            
-            B, S, N = X_pert.shape  # (batch, set_size, n_genes)
-            
-            # Tokenize the expression data
-            # Note: tokenizer is expected to be passed to train_epoch_st
-            # Move to CPU for tokenization to avoid device mismatch
-            X_pert_cpu = X_pert.cpu()
-            X_pert_tokens = torch.zeros_like(X_pert_cpu, dtype=torch.long)
-            for b in range(B):
-                for s in range(S):
-                    X_pert_tokens[b, s] = tokenizer(X_pert_cpu[b, s])
-            X_pert_tokens = X_pert_tokens.cuda()
-                    
+        if isinstance(batch, dict) and 'tokens' in batch:
+            tokens = batch['tokens'].cuda()
+            X_ctrl = batch.get('control', None)
             if X_ctrl is not None:
-                X_ctrl_cpu = X_ctrl.cpu()
-                X_ctrl_tokens = torch.zeros_like(X_ctrl_cpu, dtype=torch.long)
-                for b in range(B):
-                    for s in range(S):
-                        X_ctrl_tokens[b, s] = tokenizer(X_ctrl_cpu[b, s])
-                X_ctrl = X_ctrl_tokens.cuda()
+                X_ctrl = X_ctrl.cuda()
+            target_gene_idx = batch.get('target_gene_idx', None)
+            if target_gene_idx is not None:
+                target_gene_idx = target_gene_idx.cuda()
+            batch_indices = batch.get('batch_idx', None)
+            if batch_indices is not None:
+                batch_indices = batch_indices.cuda()
+            cells_processed += tokens.shape[0]
+        elif isinstance(batch, dict) and 'perturbed_expr' in batch:
+            X_pert = batch['perturbed_expr'].cuda()
+            B, S, N = X_pert.shape
             
-            X_pert_flat = X_pert_tokens.view(B * S, N)
+            X_pert_tokens = _tokenize_batch(X_pert, tokenizer)
+            tokens = X_pert_tokens.view(B * S, N)
             
-            # Process conditioning information
+            X_ctrl = None
+            if use_control_sets and 'control_expr' in batch:
+                X_ctrl = batch['control_expr'].cuda()
+                X_ctrl_tokens = _tokenize_batch(X_ctrl, tokenizer)
+                X_ctrl = _expand_control_sets(X_ctrl_tokens, S)
+            
             target_gene_idx = batch['target_gene_idx']
             if isinstance(target_gene_idx, list):
                 target_gene_idx = torch.tensor(target_gene_idx)
             target_gene_idx = target_gene_idx.cuda()
-            
-            # Expand conditioning to match batch
             target_gene_idx = target_gene_idx.unsqueeze(1).expand(-1, S).reshape(-1)
             
-            # Process batch information
-            if batch_to_idx is not None and 'pert_batches' in batch:
-                pert_batch_names = batch['pert_batches']  # List of lists: [batch_per_sample][cell_in_set]
-                batch_indices = []
-                for sample_batches in pert_batch_names:
-                    for batch_name in sample_batches:
-                        batch_idx = batch_to_idx.get(batch_name, 0)  # Default to 0 if not found
-                        batch_indices.append(batch_idx)
-                batch_indices = torch.tensor(batch_indices, device='cuda')
-            else:
-                batch_indices = None
-            
-            if mixed_training and torch.rand(1).item() < 0.5:
-                # Unconditioned batch
-                X_ctrl = None
-                target_gene_idx = None
-
-                batch_indices = None  # No batch conditioning for unconditioned training
-                tokens = X_pert_flat
-            else:
-                # Conditioned batch
-                tokens = X_pert_flat
-
-                # batch_indices already computed above
-                
-                if X_ctrl is not None:
-                    # X_ctrl shape: (B, S, N)
-                    # We need to repeat each control set S times to match flattened perturbed cells
-                    # Each of the S perturbed cells from a batch should see the same control set
-                    X_ctrl_expanded = X_ctrl.unsqueeze(1).expand(-1, S, -1, -1)  # (B, S, S, N)
-                    X_ctrl = X_ctrl_expanded.reshape(B * S, S, N)  # (B*S, S, N)
-            
-            # Update cells processed count for VCC data
+            batch_indices = _process_batch_indices(batch, batch_to_idx)
             cells_processed += B * S
         else:
-            # Processing regular pretraining data
             tokens = batch.cuda()
-            B = tokens.shape[0]
             X_ctrl = None
             target_gene_idx = None
-            batch_indices = None  # No batch conditioning for pretraining data
-            
-            # Update cells processed count for regular data
-            cells_processed += B
+            batch_indices = None
+            cells_processed += tokens.shape[0]
         
         loss = diffusion.compute_loss(
-            model, 
+            model,
             tokens,
             control_set=X_ctrl,
             target_gene_idx=target_gene_idx,
-
             batch_idx=batch_indices,
             step=global_step
         )
         
         optimizer.zero_grad()
+        lr = cosine_lr_schedule(optimizer, global_step, total_training_steps, config)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
         
-        total_training_steps = config.pretrain_epochs * len(dataloader) + config.finetune_epochs * len(dataloader)
-        lr = cosine_lr_schedule(optimizer, global_step, total_training_steps, config)
-        
         epoch_losses.append(loss.item())
         
-        # Log every 10 steps
         if global_step % 10 == 0:
-            avg_loss = np.mean(epoch_losses[-100:]) if len(epoch_losses) > 100 else np.mean(epoch_losses)
-            print(f"Epoch {epoch:3d} [{batch_idx+1:4d}/{total_steps:4d}] | "
+            avg_loss = np.mean(epoch_losses[-100:] if len(epoch_losses) > 100 else epoch_losses)
+            print(f"Epoch {epoch:3d} [{batch_idx+1:4d}/{len(dataloader):4d}] | "
                   f"Step {global_step:6d} | Loss: {loss.item():.4f} | "
                   f"Avg Loss: {avg_loss:.4f} | LR: {lr:.2e}")
             
@@ -295,238 +250,204 @@ def train_epoch_st(
     
     epoch_time = time.time() - epoch_start
     avg_epoch_loss = np.mean(epoch_losses)
-    steps_completed = batch_idx + 1  # Actual number of steps taken
-    print(f"Epoch {epoch} completed in {epoch_time:.1f}s | Steps: {steps_completed} | Cells: {cells_processed} | Avg Loss: {avg_epoch_loss:.4f}")
+    print(f"Epoch {epoch} completed in {epoch_time:.1f}s | "
+          f"Steps: {batch_idx + 1} | Cells: {cells_processed} | "
+          f"Avg Loss: {avg_epoch_loss:.4f}")
     
     return global_step
 
-def evaluate_validation(
+def val_epoch_st(
     model: torch.nn.Module,
     diffusion: PartialMaskingDiffusion,
     val_dataloader: torch.utils.data.DataLoader,
-    optimizer: torch.optim.Optimizer,
-    config: ConditionalModelConfig,
     epoch: int,
-    tokenizer = None,
+    tokenizer=None,
     batch_to_idx: Optional[Dict[str, int]] = None,
     max_cells: Optional[int] = None,
 ) -> Dict[str, float]:
-    """
-    Evaluate validation loss on held-out genes (20% split).
-    
-    Args:
-        model: The diffusion model
-        diffusion: The diffusion process handler
-        val_dataloader: Validation data loader
-        optimizer: Optimizer (not used, kept for consistency)
-        config: Model configuration
-        epoch: Current epoch number
-        tokenizer: Tokenizer function to convert expression values to tokens
-        batch_to_idx: Mapping from batch names to indices for batch conditioning
-        max_cells: Maximum number of cells to evaluate (for debugging), None for full dataset
-    """
+    """Evaluate validation loss on held-out data."""
     model.eval()
     val_losses = []
     cells_evaluated = 0
     
-    total_batches = len(val_dataloader)
-    if max_cells is not None:
-        print(f"Debug mode: limiting evaluation to {max_cells} cells")
-    
     with torch.no_grad():
         for batch_idx, batch in enumerate(val_dataloader):
-            # Early cutoff for debugging
-            if max_cells is not None and cells_evaluated >= max_cells:
-                print(f"Debug cutoff: stopping evaluation after {cells_evaluated} cells (limit: {max_cells})")
+            if max_cells and cells_evaluated >= max_cells:
                 break
             
-            # Process batch data
+            # Fast path when batch is already tokenised by the DataLoader collator
+            if isinstance(batch, dict) and 'tokens' in batch:
+                tokens = batch['tokens'].cuda()
+                X_ctrl = batch.get('control', None)
+                if X_ctrl is not None:
+                    X_ctrl = X_ctrl.cuda()
+                target_gene_idx = batch.get('target_gene_idx', None)
+                if target_gene_idx is not None:
+                    target_gene_idx = target_gene_idx.cuda()
+                batch_indices = batch.get('batch_idx', None)
+                if batch_indices is not None:
+                    batch_indices = batch_indices.cuda()
+
+                loss = diffusion.compute_loss(
+                    model,
+                    tokens,
+                    control_set=X_ctrl,
+                    target_gene_idx=target_gene_idx,
+                    batch_idx=batch_indices,
+                    step=epoch
+                )
+                val_losses.append(loss.item())
+                cells_evaluated += tokens.shape[0]
+                continue
+
             X_pert = batch['perturbed_expr'].cuda()
             X_ctrl = batch['control_expr'].cuda()
+            B, S, N = X_pert.shape
             
-            B, S, N = X_pert.shape  # (batch, set_size, n_genes)
+            X_pert_tokens = _tokenize_batch(X_pert, tokenizer)
+            X_ctrl_tokens = _tokenize_batch(X_ctrl, tokenizer)
             
-            # Update cells evaluated count
-            cells_evaluated += B * S
+            tokens = X_pert_tokens.view(B * S, N)
+            X_ctrl = _expand_control_sets(X_ctrl_tokens, S)
             
-            # Tokenize the expression data
-            X_pert_tokens = torch.zeros_like(X_pert, dtype=torch.long)
-            X_ctrl_tokens = torch.zeros_like(X_ctrl, dtype=torch.long)
-            for b in range(B):
-                for s in range(S):
-                    X_pert_tokens[b, s] = tokenizer(X_pert[b, s])
-                    X_ctrl_tokens[b, s] = tokenizer(X_ctrl[b, s])
-            
-            X_pert_flat = X_pert_tokens.view(B * S, N)
-            
-            # Process conditioning information
             target_gene_idx = batch['target_gene_idx']
             if isinstance(target_gene_idx, list):
                 target_gene_idx = torch.tensor(target_gene_idx)
             target_gene_idx = target_gene_idx.cuda()
-            
-            # Expand conditioning to match batch
             target_gene_idx = target_gene_idx.unsqueeze(1).expand(-1, S).reshape(-1)
             
-            # Process batch information
-            if batch_to_idx is not None and 'pert_batches' in batch:
-                pert_batch_names = batch['pert_batches']
-                batch_indices = []
-                for sample_batches in pert_batch_names:
-                    for batch_name in sample_batches:
-                        batch_idx = batch_to_idx.get(batch_name, 0)
-                        batch_indices.append(batch_idx)
-                batch_indices = torch.tensor(batch_indices, device='cuda')
-            else:
-                batch_indices = None
+            batch_indices = _process_batch_indices(batch, batch_to_idx)
             
-            # Expand control sets to match flattened perturbed cells
-            X_ctrl_expanded = X_ctrl_tokens.unsqueeze(1).expand(-1, S, -1, -1)  # (B, S, S, N)
-            X_ctrl_flat = X_ctrl_expanded.reshape(B * S, S, N)  # (B*S, S, N)
-            
-            # Compute loss
             loss = diffusion.compute_loss(
-                model, 
-                X_pert_flat,
-                control_set=X_ctrl_flat,
+                model,
+                tokens,
+                control_set=X_ctrl,
                 target_gene_idx=target_gene_idx,
-                
                 batch_idx=batch_indices,
-                step=epoch  # Use epoch as step for validation
+                step=epoch
             )
             
             val_losses.append(loss.item())
+            cells_evaluated += B * S
     
-    # Compute metrics
     avg_val_loss = np.mean(val_losses) if val_losses else 0.0
-    metrics = {
+    return {
         'val_loss': avg_val_loss,
         'val_batches_evaluated': len(val_losses),
         'epoch': epoch
     }
-    return metrics
 
 
 def main():
-    """
-    MEMORY OPTIMIZATION STRATEGY:
-    
-    This model faces unique memory challenges due to:
-    1. Large sequence length: 2000 genes per cell (vs typical 512-2048 in language models)
-    2. Set-based training: Each batch contains batch_size × set_size sequences
-    3. Cross-attention: Control sets add additional memory overhead
-    
-    Memory scaling for self-attention: O(batch_size × set_size × n_heads × seq_len²)
-    With seq_len=2000: each sequence pair requires 4M attention operations per head
-    
-    Current settings:
-    - batch_size=2, set_size=16 → 32 total sequences per batch
-    - 8 attention heads, 2000 sequence length
-    - Memory per batch: ~1GB for attention matrices (manageable)
-    
-    If you get OOM errors:
-    1. Reduce batch_size further (to 1 if needed)
-    2. Reduce set_size (but may hurt model performance)
-    3. Consider gradient checkpointing
-    4. Use multi-query attention (already implemented)
-    
-    DEBUG MODE:
-    For quick testing, set config.debug_max_cells to a small number (e.g., 1000-5000)
-    This will limit both training and evaluation to the specified number of cells.
-    """
-    # Configuration
-    config = ConditionalModelConfig(
-        # Model architecture
-        train_notes="",
-        dim=512,
+    """Main training function for ST-style Conditional Discrete Diffusion Transformer."""
+    # -----------------------------
+    # Parse command line arguments
+    # -----------------------------
+    parser = argparse.ArgumentParser(description="Train or continue training ST-style Conditional Diffusion Transformer")
+    parser.add_argument("--ckpt_pt", type=str, default=None, help="Path to checkpoint .pt file to resume from")
+    parser.add_argument("--continue_from", type=str, choices=["pretrain", "finetune"], default="pretrain",
+                        help="Stage to continue from: 'pretrain' or 'finetune'")
+    parser.add_argument("--continue_pretrain_epochs", type=int, default=None,
+                        help="Override the number of pretrain epochs from the saved config")
+    parser.add_argument("--continue_finetune_epochs", type=int, default=None,
+                        help="Override the number of finetune epochs from the saved config")
+    parser.add_argument("--continue_bs", type=int, default=None,
+                        help="Override the batch size for both pretraining and finetuning")
+    parser.add_argument("--wandb_run_id", type=str, default=None,
+                        help="Existing wandb run ID to continue logging to (e.g., from restored run)")
+    args = parser.parse_args()
+
+    # -----------------------------
+    # Load config
+    # -----------------------------
+    if args.ckpt_pt:
+        ckpt_path = Path(args.ckpt_pt)
+        ckpt_dir = ckpt_path.parent
+        config_json_path = ckpt_dir / "config.json"
+        if not config_json_path.exists():
+            raise FileNotFoundError(f"Could not find config.json in {ckpt_dir}")
+        with open(config_json_path, "r") as f:
+            cfg_dict = json.load(f)
+        config = ConditionalModelConfig(**cfg_dict)
+    else:
+        # Fresh training run – create default config
+        config = ConditionalModelConfig(
+            train_notes="100M Norm NO ESM2",
+            dim=512,
         n_head=8,
-        n_layer=12,
+        n_layer=16,
         ffn_mult=8,
         vocab_size=256,
-        n_genes=2000,
-        
-        # Conditioning
-        n_total_genes=2000,  # Using HVG genes only
-        gene_embed_dim=128,
-        
-        # Batch conditioning - ENABLED with correct number of batches
-        # WHAT's this? 
+        n_genes=3000,
+        n_total_genes=3000,
+        gene_embed_dim=256,
         use_batch_conditioning=True,
-        n_batches=48,  # From VCC data exploration: 48 unique batches
+        n_batches=48,
         batch_embed_dim=40,
-        
-        # Control set encoder
+
         control_set_encoder_layers=2,
-        control_set_dim_hidden=256,
-        # LEGACY, this is now just config.dim
-        #control_set_dim_out=128,  # Must match model dim for cross-attention
+        control_set_dim_hidden=512,
         
-        # Diffusion
         n_timesteps=16,
         schedule="cosine",
-        pretrain_mask_ratio=0.40,  # Fixed mask ratio for pretraining
-        finetune_mask_ratio_start=0.40,  # Starting mask ratio for finetuning
-        finetune_mask_ratio_end=0.90,  # End mask ratio for finetuning (curriculum)
-        finetune_mask_ratio_steps=10000,  # Steps to ramp from start to end
-        finetune_full_mask_prob=0.05,  # Probability of 100% masking during finetune
-        # Training - MEMORY OPTIMIZED
-        # Note: With 2000-gene sequences, attention is O(N²) = 4M operations per head per sequence
-        # Each batch processes batch_size × set_size = total sequences
-        # Memory scales as: total_sequences × n_heads × sequence_length²
-        pretrain_batch_size=16,  # Very small due to 2000-token sequences and cross-attention
+        pretrain_mask_ratio=0.40,
+        finetune_mask_ratio_start=0.40,
+        finetune_mask_ratio_end=0.90,
+        finetune_mask_ratio_steps=10000,
+        finetune_full_mask_prob=0.05,
         vcc_batch_size=1,
-        vcc_set_size=16,
+
+        # batch sizes
+        pretrain_batch_size=10,
+        vcc_set_size=10,
+
+        # pretrain
         learning_rate=1e-4,
         weight_decay=0.01,
         warmup_steps=500,
 
-        # Pretrain data dir  
-        pretrain_data_dir = "/data/scRNA/processed",
-        finetune_data_path = "/data/vcc_data/adata_Training.h5ad",
-        hvg_info_path = "/workspace/vcc/hvg_seuratv3_2000.txt",
+        # finetune
+        finetune_learning_rate = 3e-5,
+        finetune_warmup_steps  = 250,
 
-            # ESM2 embeddings
-        esm_matrix_path = None, #"/esm_all.pt",  # Path to precomputed ESM2 embeddings (None to skip)
-        esm_proj_dim = 256,  # Projection dimension for ESM2 embeddings
+        pretrain_data_dir = "/data_normalized/scRNA/processed",
+        finetune_data_path = "/data_normalized/vcc_data/adata_Training.h5ad",
+        hvg_info_path = "/workspace/vcc/hvg_seuratv3_3000.txt",
+        esm_matrix_path = "/esm_all.pt",
 
-        # Epochs
+        token_distribution_json = "/token_distribution.json",  # Path to token distribution JSON for frequency-aware masking
+        token_weighting_annealing_steps = None,
+
+        esm_proj_dim = 512,
         pretrain_epochs=1,
         finetune_epochs=10,
-        
-        # Logging
-        log_every=10,  # Updated to match hardcoded logging frequency
+        log_every=10,
         eval_every=1000,
         save_every=5000,
         vcc_eval_interval=5000,
         
         # Debug - set to None for full training, or number of cells for quick debugging
-        debug_pretrain_max_cells=None,#64000//2,
-        debug_finetune_max_cells=200000//10,
+        debug_pretrain_max_cells=110000,#None,#64000//2,
+        debug_finetune_max_cells=20000,
         debug_eval_max_cells=1000  # equivalent to validation set's target perturb genes
     )
-    
-    # Initialize wandb
-    wandb.init(
-        project="vcc-st-diffusion",
-        config=config.__dict__,
-        name=f"st_diffusion_{time.strftime('%Y%m%d_%H%M%S')}"
-    )
-    
-    # Create model
-    model = ConditionalDiffusionTransformer(config).cuda()
-    diffusion = PartialMaskingDiffusion(config)
-    optimizer = create_optimizer(model, config)
-    
-    print(f"\nModel created with {sum(p.numel() for p in model.parameters()):,} parameters")
-    
+
+    # -----------------------------
+    # Apply overrides from CLI args
+    # -----------------------------
+    if args.continue_pretrain_epochs is not None:
+        config.pretrain_epochs = args.continue_pretrain_epochs
+    if args.continue_finetune_epochs is not None:
+        config.finetune_epochs = args.continue_finetune_epochs
+    if args.continue_bs is not None:
+        config.pretrain_batch_size = args.continue_bs
+        config.vcc_set_size = args.continue_bs
+    if args.continue_from == "finetune":
+        config.pretrain_epochs = 0
+
     # Create tokenizer
     tokenizer, detokenizer = create_simple_tokenizer(config.vocab_size)
 
-    # TODO the hvg should be a single .txt file of ENSEMBLIDs
-    # TODO change scran_hvg.py to output ENSEMBLIDs
-    # TODO normalize counts by UMI before tokenizing in dataloader!
-
-        # Load cross-dataset HVG info to get gene names
     with open(config.hvg_info_path, 'r') as f:
         hvg_gene_ensemble = [line.strip() for line in f.readlines()]
 
@@ -539,7 +460,8 @@ def main():
         batch_size=1,  # We'll batch in the wrapper
         shuffle=False,
         num_workers=0,
-        use_cache=True
+        use_cache=True,
+        normalize=False
     )
     
     # Wrap with tokenizer
@@ -555,9 +477,56 @@ def main():
     )
     
     print(f"Pretrain dataset: {len(pretrain_dataset):,} cells, {scrna_dataset.n_hvgs} HVG genes")
+
+    # ------------------------------------------------------------------
+    #  Update config & create model now that we know the final HVG count
+    # ------------------------------------------------------------------
+    config.n_genes = scrna_dataset.n_hvgs
+    hvg_gene_ensemble = scrna_dataset.get_gene_names()
+
+    # Initialise wandb AFTER we have the final config
+    if args.wandb_run_id:
+        # Resume existing run - use the project from the existing run
+        print(f"Resuming wandb logging to existing run: {args.wandb_run_id}")
+        wandb.init(
+            project="vcc-st-diffusion",  # Use same project as restored run
+            config=config.__dict__,
+            id=args.wandb_run_id,
+            resume="must"  # Must resume the specified run
+        )
+    else:
+        # Create new run
+        wandb.init(
+            project="vcc-st-diffusion",
+            config=config.__dict__,
+            name=f"st_diffusion_{time.strftime('%Y%m%d_%H%M%S')}"
+        )
+
+    # -----------------------------
+    # Create model / diffusion / optimiser
+    # -----------------------------
+    model = ConditionalDiffusionTransformer(config)
+    if args.ckpt_pt:
+        print(f"Loading weights from checkpoint: {args.ckpt_pt}")
+        ckpt_state = torch.load(args.ckpt_pt, map_location="cpu", weights_only=False)
+        model.load_state_dict(ckpt_state["model_state_dict"])
+    else:
+        ckpt_state = {}
+    # Move model to the appropriate device
+    model = model.cuda()
+    diffusion = PartialMaskingDiffusion(config)
+    optimizer = create_optimizer(model, config)
+    # If continuing from a checkpoint try to restore optimizer state
+    if args.ckpt_pt and "optimizer_state_dict" in ckpt_state:
+        try:
+            optimizer.load_state_dict(ckpt_state["optimizer_state_dict"])
+        except Exception as e:
+            print(f"Could not load optimizer state: {e}")
+    print(f"\nModel created with {sum(p.numel() for p in model.parameters()):,} parameters")
     
     # Create VCC train and validation dataloaders
     (vcc_dataset, vcc_dataloader), (val_dataset, val_dataloader) = create_train_val_dataloaders(
+        tokenizer=tokenizer,
         adata_path=config.finetune_data_path,
         hvg_gene_ids=hvg_gene_ensemble,
         set_size=config.vcc_set_size,
@@ -566,7 +535,8 @@ def main():
         n_samples_per_gene_val=1,      # Single sample per gene for validation
         train_split=0.8,
         num_workers=4,
-        random_seed=42
+        random_seed=42,
+        normalize=False
     )
     
     # Create gene to index mapping
@@ -583,8 +553,7 @@ def main():
     # Calculate total training steps for learning rate schedule
     pretrain_steps = config.pretrain_epochs * len(pretrain_dataloader) if config.pretrain_epochs > 0 else 0
     finetune_steps = config.finetune_epochs * len(vcc_dataloader)
-    total_training_steps = pretrain_steps + finetune_steps
-    print(f"\nTotal training steps: {total_training_steps:,} (pretrain: {pretrain_steps:,}, finetune: {finetune_steps:,})")
+    print(f"\nTotal training steps: {pretrain_steps+finetune_steps:,} (pretrain: {pretrain_steps:,}, finetune: {finetune_steps:,})")
     
     # Create unique checkpoint directory with timestamp
     from datetime import datetime
@@ -592,8 +561,13 @@ def main():
     checkpoint_dir = Path(f"checkpoints/run_{timestamp}")
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     config_path = checkpoint_dir / "config.json"
+    
+    # Convert config to dict and ensure all fields are serializable
+    config_dict = {k: str(v) if isinstance(v, Path) else v 
+                  for k, v in config.__dict__.items()}
+    
     with open(config_path, "w") as f:
-        json.dump(config.__dict__, f, indent=2)
+        json.dump(config_dict, f, indent=2)
     print(f"\nSaved config to {config_path}")
     
     # Phase 1: Pretraining on single cells
@@ -604,11 +578,10 @@ def main():
         for epoch in range(config.pretrain_epochs):
             global_step = train_epoch_st(
                 model, diffusion, pretrain_dataloader, optimizer, config,
-                epoch, global_step, total_training_steps,
+                epoch, global_step, pretrain_steps,
                 tokenizer=None,  # Pretrain data is already tokenized
                 batch_to_idx=None,  # No batch conditioning for pretraining
                 use_control_sets=False,  # No control sets in pretraining
-                mixed_training=False,
                 max_cells=config.debug_pretrain_max_cells
             )
             
@@ -627,31 +600,33 @@ def main():
     
     # Phase 2: Fine-tuning with control sets
     print("\n=== Phase 2: Fine-tuning with Control Sets ===")
-    print(f"Using batch_size={config.pretrain_batch_size} optimized for 2000-gene sequences")
+    print(f"Using batch_size={config.pretrain_batch_size} optimized for {config.n_genes}-gene sequences")
+    global_step = 0
+    config_ft = config
+    config_ft.learning_rate = config.finetune_learning_rate
+    config_ft.warmup_steps  = config.finetune_warmup_steps
+    optimizer = create_optimizer(model, config_ft)
     
     for epoch in range(config.finetune_epochs):
         global_step = train_epoch_st(
             model, diffusion, vcc_dataloader, optimizer, config,
-            epoch, global_step, total_training_steps,
+            epoch, global_step, finetune_steps,
             tokenizer=tokenizer,  # VCC data needs tokenization
             batch_to_idx=batch_to_idx,  # Pass batch mapping for conditioning
             use_control_sets=True,
-            mixed_training=True,  # Mix conditioned and unconditioned batches
             max_cells=config.debug_finetune_max_cells
         )
         
-        # Evaluate on validation set (20% of training genes)
+        # Evaluate on validation set
         if epoch % 1 == 0:
             print("\n=== Validation Set Evaluation ===")
-            val_metrics = evaluate_validation(
-                model, diffusion, val_dataloader, optimizer, config,
+            val_metrics = val_epoch_st(
+                model, diffusion, val_dataloader,
                 epoch, tokenizer, batch_to_idx,
                 max_cells=config.debug_eval_max_cells
             )
             print(f"Validation loss: {val_metrics['val_loss']:.4f} ({val_metrics['val_batches_evaluated']} batches)")
             wandb.log(val_metrics)
-            
-            # TODO Evaluate true zero-shot performance on unseen genes
     
     # Final save
     final_checkpoint = checkpoint_dir / "checkpoint_st_final.pt"

@@ -8,6 +8,7 @@ from torch.utils.data import Dataset
 import numpy as np
 from pathlib import Path
 from typing import Optional, Dict, List
+import scanpy as sc
 import json
 
 
@@ -19,7 +20,8 @@ class ScRNADatasetWithHVGs(Dataset):
         data_dir: str, 
         hvg_genes: List[str],
         transform=None,
-        use_cache: bool = True
+        use_cache: bool = True,
+        normalize: bool = True
     ):
         """
         Args:
@@ -31,29 +33,44 @@ class ScRNADatasetWithHVGs(Dataset):
         self.data_dir = Path(data_dir)
         self.transform = transform
         self.use_cache = use_cache
+        self.normalize = normalize
         
-        # Store HVG genes
-        self.hvg_genes = hvg_genes
-        self.n_hvgs = len(hvg_genes)
+        # ------------------------------------------------------------------
+        # Filter HVG list to genes that are actually present in the scRNA data
+        # ------------------------------------------------------------------
+        # Load original gene list from config first (to know what exists)
+        config_path = Path(data_dir).parent / "config.json"
+        with open(config_path, 'r') as f:
+            config = json.load(f)
+        self.original_genes = config['gene_list']
+        original_gene_set = set(self.original_genes)
+
+        # Keep only HVGs that are present in the union-of-genes for the corpus.
+        # This mirrors the logic in VCCPairedDataset where HVGs not found are
+        # dropped, ensuring both pre-train and fine-tune see the same gene set.
+        self.hvg_genes = [g for g in hvg_genes if g in original_gene_set]
+        self.n_hvgs = len(self.hvg_genes)
         
+        if self.n_hvgs == 0:
+            raise ValueError("None of the supplied HVGs exist in the scRNA dataset – check gene IDs")
+        
+        # Mapping: gene id → position in the pruned HVG list
+        hvg_to_idx = {g: i for i, g in enumerate(self.hvg_genes)}
+        
+        # ------------------------------------------------------------------
+        # Locate expression matrix files
+        # ------------------------------------------------------------------
         # Find all batch files
         self.batch_files = sorted(self.data_dir.glob("batch_*.h5"))
         if not self.batch_files:
             raise ValueError(f"No batch files found in {data_dir}")
         
-        # Load original gene list from config
-        config_path = self.data_dir.parent / "config.json"
-        with open(config_path, 'r') as f:
-            config = json.load(f)
-        self.original_genes = config['gene_list']
-        
-        # Create mapping from original gene indices to HVG indices
-        self.scrna_to_hvg = {}
-        hvg_set = set(hvg_genes)
-        for orig_idx, gene_id in enumerate(self.original_genes):
-            if gene_id in hvg_set:
-                hvg_idx = hvg_genes.index(gene_id)
-                self.scrna_to_hvg[orig_idx] = hvg_idx
+        # Create mapping from *original* gene position → pruned HVG index
+        self.scrna_to_hvg = {
+            orig_idx: hvg_to_idx[gene_id]
+            for orig_idx, gene_id in enumerate(self.original_genes)
+            if gene_id in hvg_to_idx
+        }
         
         # Extract indices for efficient slicing
         self.original_indices = sorted(self.scrna_to_hvg.keys())
@@ -107,6 +124,19 @@ class ScRNADatasetWithHVGs(Dataset):
         batch_file = self.batch_files[batch_idx]
         with h5py.File(batch_file, 'r') as f:
             X = f['X'][:]
+
+            # Apply normalization if requested
+        if self.normalize:
+            # Convert to float32 for normalization
+            X = X.astype(np.float32)
+            
+            # CP10K normalization: scale each cell to 10,000 total counts
+            row_sums = X.sum(axis=1, keepdims=True)
+            row_sums[row_sums == 0] = 1  # Avoid division by zero
+            X = (X / row_sums) * 10000
+            
+            # Log1p transformation
+            X = np.log1p(X)
         
         # Extract HVG columns
         X_hvg = self._extract_hvg_columns(X)
@@ -157,7 +187,8 @@ def create_scrna_hvg_dataloader(
     batch_size: int = 32,
     shuffle: bool = True,
     num_workers: int = 4,
-    use_cache: bool = True
+    use_cache: bool = True,
+    normalize: bool = True
 ) -> torch.utils.data.DataLoader:
     """
     Create a DataLoader for scRNA data using cross-dataset HVGs.
@@ -176,7 +207,8 @@ def create_scrna_hvg_dataloader(
     dataset = ScRNADatasetWithHVGs(
         data_dir=data_dir,
         hvg_genes=hvg_genes,
-        use_cache=use_cache
+        use_cache=use_cache,
+        normalize=normalize
     )
     
     dataloader = torch.utils.data.DataLoader(

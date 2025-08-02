@@ -16,6 +16,17 @@ def extract_vcc_genes(adata_path: str, output_path: str):
     all_target_genes = adata.obs['target_gene'].unique()
     perturbed_genes = [g for g in all_target_genes if g != 'non-targeting']
     
+    # Add validation genes
+    validation_genes = [
+        'SH3BP4', 'ZNF581', 'ANXA6', 'PACSIN3', 'MGST1', 'IGF1R', 'ITGAV', 'SLIRP', 'CTSV', 'MTFR1',
+        'KLHDC2', 'SMARCB1', 'PAXIP1', 'KRT18', 'EHMT1', 'HMGXB4', 'CSK', 'DOT1L', 'MAT2A', 'CENPB',
+        'TUSC3', 'USF2', 'HDAC8', 'CXCL12', 'THY1', 'GSTZ1', 'COX4I1', 'ACLY', 'COX6C', 'ARPC2',
+        'UQCRB', 'NFE2L1', 'VCL', 'HTATSF1', 'HMGCR', 'JMJD8', 'JAZF1', 'GNG12', 'DPH2', 'STRAP',
+        'PPP2R3C', 'SMARCE1', 'HDAC3', 'TCF7L2', 'SUPV3L1', 'EIF3H', 'FUBP1', 'WAC', 'ZNF598', 'MAX'
+    ]
+    perturbed_genes.extend(validation_genes)
+    perturbed_genes = list(set(perturbed_genes))  # Remove duplicates
+    
     print(f"Found {len(perturbed_genes)} unique perturbed genes")
     print(f"First 10 genes: {perturbed_genes[:10]}")
     
@@ -52,7 +63,7 @@ def extract_vcc_genes(adata_path: str, output_path: str):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Extract perturbed genes from VCC dataset")
-    parser.add_argument("--vcc_path", default="/vcc_data/adata_Training.h5ad", help="Path to VCC dataset")
+    parser.add_argument("--vcc_path", default="data_normalized/vcc_data/adata_Training.h5ad", help="Path to VCC dataset")
     parser.add_argument("--output", default="data/vcc_perturbed_genes.txt", help="Output whitelist file")
     
     args = parser.parse_args()
