@@ -149,6 +149,7 @@ def train_epoch_st(
     epoch: int,
     global_step: int,
     total_training_steps: int,
+    checkpoint_dir: Path,
     tokenizer=None,
     batch_to_idx: Optional[Dict[str, int]] = None,
     use_control_sets: bool = True,
@@ -246,7 +247,7 @@ def train_epoch_st(
             })
         
         if global_step % config.save_every == 0 and global_step > 0:
-            checkpoint_path = f'checkpoint_st_epoch_{epoch}_step_{global_step}.pt'
+            checkpoint_path = checkpoint_dir / f'checkpoint_st_epoch_{epoch}_step_{global_step}.pt'
             torch.save({
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
@@ -390,71 +391,68 @@ def main():
     else:
         # Fresh training run – create default config
         config = ConditionalModelConfig(
-            train_notes="100M Norm NO ESM2",
-            dim=512,
-        n_head=8,
-        n_layer=16,
-        ffn_mult=8,
-        vocab_size=256,
-        n_genes=3000,
-        n_total_genes=3000,
-        gene_embed_dim=256,
-        use_batch_conditioning=True,
-        n_batches=48,
-        batch_embed_dim=40,
+            train_notes="100M",
+            full_eval=True,
+            target_is_delta=True,
 
-        control_set_encoder_layers=2,
-        control_set_dim_hidden=512,
-        
-        n_timesteps=16,
-        schedule="cosine",
-        pretrain_mask_ratio=0.40,
-        finetune_mask_ratio_start=0.40,
-        finetune_mask_ratio_end=0.90,
-        finetune_mask_ratio_steps=10000,
-        finetune_full_mask_prob=0.05,
-        vcc_batch_size=1,
+            dim=256,
+            n_head=4,
+            n_layer=4,
+            ffn_mult=4,
 
-        # batch sizes
-        pretrain_batch_size=8,
-        vcc_set_size=8,
+            vocab_size=256,
+            n_genes=3000,
+            n_total_genes=3000,
+            gene_embed_dim=256,
 
-        # pretrain
-        learning_rate=1e-4,
-        weight_decay=0.01,
-        warmup_steps=500,
+            use_batch_conditioning=True,
+            n_batches=48,
+            batch_embed_dim=40,
+            control_set_encoder_layers=2,
+            control_set_dim_hidden=512,
 
-        # finetune
-        finetune_learning_rate = 3e-5,
-        finetune_warmup_steps  = 250,
+            # BS
+            pretrain_batch_size=8,
+            vcc_set_size=8,
 
-        # scBaseCOunt data is not UMI normalized
-        pretrain_data_dir = "/data_normalized/scRNA/processed",
-        # it is assumed competition_support dataset from Arc is UMI normalized
-        # since it was log1p normalized.
-        finetune_data_path = "/competition_train.h5",
-        hvg_info_path = "/workspace/vcc/hvg_seuratv3_3000.txt",
-        esm_matrix_path = "/esm_all.pt",
+            # Diffusion
+            n_timesteps=16,
+            schedule="cosine",
+            # MASK
+            pretrain_mask_ratio=0.40,
+            finetune_mask_ratio_start=0.40,
+            finetune_mask_ratio_end=0.90,
+            finetune_mask_ratio_steps=10000,
+            finetune_full_mask_prob=0.05,
+            vcc_batch_size=1,
+            
+            # LR
+            learning_rate=1e-4,
+            weight_decay=0.01,
+            warmup_steps=500,
+            finetune_learning_rate=3e-5,
+            finetune_warmup_steps=250,
 
-        token_distribution_json = "/token_distribution.json",  # Path to token distribution JSON for frequency-aware masking
-        token_weighting_annealing_steps = None,
+            # DATA
+            pretrain_data_dir="/data_normalized/scRNA/processed",
+            finetune_data_path="/competition_train.h5",
+            hvg_info_path="/workspace/vcc/hvg_seuratv3_3000.txt",
+            esm_matrix_path="/esm_all.pt",
+            blacklist_path="data/blacklist.txt",
+            token_distribution_json="/token_distribution.json",
 
-        esm_proj_dim = 512,
-        pretrain_epochs=1,
-        finetune_epochs=10,
-        log_every=10,
-        eval_every=1000,
-        save_every=5000,
-        vcc_eval_interval=5000,
-        
-        # Debug - set to None for full training, or number of cells for quick debugging
-        debug_pretrain_max_cells=110000,#None,#64000//2,
-        debug_finetune_max_cells=20000,
-        debug_eval_max_cells=1000,  # equivalent to validation set's target perturb genes
+            token_weighting_annealing_steps=None,
+            esm_proj_dim=512,
+            pretrain_epochs=0,
+            finetune_epochs=3,
+            save_every=5000,
+            vcc_eval_interval=5000,
 
-        # finetune target objective
-        target_is_delta = True
-    )
+            # DEBUG
+            debug_pretrain_max_cells=None,
+            debug_finetune_max_cells=1,
+            debug_eval_max_cells=None
+        )
 
     # -----------------------------
     # Apply overrides from CLI args
@@ -565,7 +563,8 @@ def main():
         train_split=0.8,
         num_workers=4,
         random_seed=42,
-        normalize=False
+        normalize=False,
+        blacklist_path=config.blacklist_path
     )
     
     # Create gene to index mapping
@@ -576,6 +575,14 @@ def main():
     unique_batches = sorted(list(set(vcc_dataset.adata.obs['batch'].values)))
     batch_to_idx = {batch_name: idx for idx, batch_name in enumerate(unique_batches)}
     print(f"Found {len(unique_batches)} unique batches for batch conditioning")
+    # Prepare gene mappings for full evaluation (optional)
+    if getattr(config, "full_eval", False):
+        from evaluate import _prepare_gene_mappings, _run_validation_merged
+        print("Preparing gene mappings for full evaluation …")
+        gene_names, hvg_to_full, hvg_gene_ids = _prepare_gene_mappings(
+            config.finetune_data_path,
+            config.hvg_info_path,
+        )
     
     global_step = 0
     
@@ -607,7 +614,7 @@ def main():
         for epoch in range(config.pretrain_epochs):
             global_step = train_epoch_st(
                 model, diffusion, pretrain_dataloader, optimizer, config,
-                epoch, global_step, pretrain_steps,
+                epoch, global_step, pretrain_steps, checkpoint_dir,
                 tokenizer=None,  # Pretrain data is already tokenized
                 batch_to_idx=None,  # No batch conditioning for pretraining
                 use_control_sets=False,  # No control sets in pretraining
@@ -648,7 +655,7 @@ def main():
     for epoch in range(config.finetune_epochs):
         global_step = train_epoch_st(
             model, diffusion, vcc_dataloader, optimizer, config,
-            epoch, global_step, finetune_steps,
+            epoch, global_step, finetune_steps, checkpoint_dir,
             tokenizer=ft_tokenizer,  # VCC data needs tokenization
             batch_to_idx=batch_to_idx,  # Pass batch mapping for conditioning
             use_control_sets=True,
@@ -665,6 +672,32 @@ def main():
             )
             print(f"Validation loss: {val_metrics['val_loss']:.4f} ({val_metrics['val_batches_evaluated']} batches)")
             wandb.log(val_metrics)
+            # ------------------------------------------------------------------
+            # Full evaluation (cell-eval metrics) – optional
+            # ------------------------------------------------------------------
+            if getattr(config, "full_eval", False):
+                eval_dir = checkpoint_dir / f"eval_ft_epoch{epoch}"
+                eval_dir.mkdir(exist_ok=True)
+                from types import SimpleNamespace
+                args_eval = SimpleNamespace(
+                    val_genes_number=10,
+                    val_set_size=config.vcc_set_size,
+                    blacklist_path=config.blacklist_path,
+                )
+                device_eval = next(model.parameters()).device
+                _run_validation_merged(
+                    config,
+                    model,
+                    diffusion,
+                    ft_tokenizer,
+                    ft_detokenizer,
+                    gene_names,
+                    hvg_to_full,
+                    hvg_gene_ids,
+                    args_eval,
+                    device_eval,
+                    eval_dir,
+                )
     
     # Final save
     final_checkpoint = checkpoint_dir / "checkpoint_st_final.pt"
