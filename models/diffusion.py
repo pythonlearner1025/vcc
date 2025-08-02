@@ -98,6 +98,8 @@ class ConditionalModelConfig:
     debug_pretrain_max_cells: Optional[int] = None 
     debug_finetune_max_cells: Optional[int] = None
     debug_eval_max_cells: int = 3200  # ~50 batches with batch_size=64
+    full_eval: bool = False  # Run full cell-eval suite each epoch
+    blacklist_path: str = "data/blacklist.txt"
     
     @property
     def n_params(self) -> int:

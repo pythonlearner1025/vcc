@@ -1,4 +1,4 @@
-pip install numpy pandas scanpy[skmisc] gcsfs pyarrow h5py tqdm torch matplotlib seaborn wandb nvitop
+pip install numpy pandas scanpy[skmisc] gcsfs pyarrow h5py tqdm torch matplotlib seaborn wandb nvitop cell-eval
 
 # Only install flash attention if torch 2.4 is installed
 python3 -c "import torch; v=torch.__version__; exit(0 if not v.startswith('2.4') else 1)" || \

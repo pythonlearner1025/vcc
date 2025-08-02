@@ -391,14 +391,14 @@ def main():
     else:
         # Fresh training run – create default config
         config = ConditionalModelConfig(
-            train_notes="100M",
+            train_notes="100M Norm NO ESM2",
             full_eval=True,
             target_is_delta=True,
 
-            dim=256,
-            n_head=4,
-            n_layer=4,
-            ffn_mult=4,
+            dim=512,
+            n_head=8,
+            n_layer=16,
+            ffn_mult=8,
 
             vocab_size=256,
             n_genes=3000,
@@ -419,9 +419,9 @@ def main():
             n_timesteps=16,
             schedule="cosine",
             # MASK
-            pretrain_mask_ratio=0.40,
-            finetune_mask_ratio_start=0.40,
-            finetune_mask_ratio_end=0.90,
+            pretrain_mask_ratio=0.4,
+            finetune_mask_ratio_start=0.4,
+            finetune_mask_ratio_end=0.9,
             finetune_mask_ratio_steps=10000,
             finetune_full_mask_prob=0.05,
             vcc_batch_size=1,
@@ -443,15 +443,17 @@ def main():
 
             token_weighting_annealing_steps=None,
             esm_proj_dim=512,
-            pretrain_epochs=0,
-            finetune_epochs=3,
+            pretrain_epochs=1,
+            finetune_epochs=10,
+
             save_every=5000,
+            eval_every=1,
             vcc_eval_interval=5000,
 
             # DEBUG
             debug_pretrain_max_cells=None,
-            debug_finetune_max_cells=1,
-            debug_eval_max_cells=None
+            debug_finetune_max_cells=None,
+            debug_eval_max_cells=1000
         )
 
     # -----------------------------
@@ -663,7 +665,7 @@ def main():
         )
         
         # Evaluate on validation set
-        if epoch % 1 == 0:
+        if epoch % config.eval_every == 0:
             print("\n=== Validation Set Evaluation ===")
             val_metrics = val_epoch_st(
                 model, diffusion, val_dataloader,
