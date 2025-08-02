@@ -443,16 +443,17 @@ def main():
 
             token_weighting_annealing_steps=None,
             esm_proj_dim=512,
-            pretrain_epochs=1,
-            finetune_epochs=10,
-
             save_every=5000,
             eval_every=1,
             vcc_eval_interval=5000,
 
             # DEBUG
-            debug_pretrain_max_cells=None,
-            debug_finetune_max_cells=None,
+            pretrain_epochs=0,
+            finetune_epochs=10,
+
+
+            debug_pretrain_max_cells=1,
+            debug_finetune_max_cells=1,
             debug_eval_max_cells=1000
         )
 
