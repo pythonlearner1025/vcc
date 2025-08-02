@@ -555,7 +555,7 @@ def main():
     
     # Create VCC train and validation dataloaders
     (vcc_dataset, vcc_dataloader), (val_dataset, val_dataloader) = create_train_val_dataloaders(
-        tokenizer=tokenizer,
+        tokenizer=ft_tokenizer,
         adata_path=config.finetune_data_path,
         hvg_gene_ids=hvg_gene_ensemble,
         set_size=config.vcc_set_size,
@@ -627,6 +627,15 @@ def main():
     else:
         print("\n=== Skipping Phase 1: Pretraining (pretrain_epochs=0) ===")
     
+    # ------------------------------------------------------------------
+    # Re-initialise token embeddings if we switch objective to Δ (fine-tune)
+    # ------------------------------------------------------------------
+    if getattr(config, 'target_is_delta', False):
+        print("Re-initialising token embeddings for Δ objective (fine-tune phase)")
+        torch.nn.init.normal_(model.token_emb.weight, mean=0.0, std=0.02)
+        # Re-initialise output head as well so logits match new embedding
+        if hasattr(model, 'head'):
+            torch.nn.init.normal_(model.head.weight, mean=0.0, std=0.02)
     # Phase 2: Fine-tuning with control sets
     print("\n=== Phase 2: Fine-tuning with Control Sets ===")
     print(f"Using batch_size={config.pretrain_batch_size} optimized for {config.n_genes}-gene sequences")
@@ -640,7 +649,7 @@ def main():
         global_step = train_epoch_st(
             model, diffusion, vcc_dataloader, optimizer, config,
             epoch, global_step, finetune_steps,
-            tokenizer=tokenizer,  # VCC data needs tokenization
+            tokenizer=ft_tokenizer,  # VCC data needs tokenization
             batch_to_idx=batch_to_idx,  # Pass batch mapping for conditioning
             use_control_sets=True,
             max_cells=config.debug_finetune_max_cells
@@ -651,7 +660,7 @@ def main():
             print("\n=== Validation Set Evaluation ===")
             val_metrics = val_epoch_st(
                 model, diffusion, val_dataloader,
-                epoch, tokenizer, batch_to_idx,
+                epoch, ft_tokenizer, batch_to_idx,
                 max_cells=config.debug_eval_max_cells
             )
             print(f"Validation loss: {val_metrics['val_loss']:.4f} ({val_metrics['val_batches_evaluated']} batches)")
