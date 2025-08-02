@@ -1,0 +1,132 @@
+{
+  "_description": "Data processing configuration for Virtual Cell Challenge",
+  "_version": "1.0",
+  
+  "input_paths": {
+    "competition_train": "data/raw/competition_support_set/competition_train.h5",
+    "hepg2": "data/raw/competition_support_set/hepg2.h5",
+    "jurkat": "data/raw/competition_support_set/jurkat.h5", 
+    "k562": "data/raw/competition_support_set/k562.h5",
+    "k562_gwps": "data/raw/competition_support_set/k562_gwps.h5",
+    "rpe1": "data/raw/competition_support_set/rpe1.h5",
+    "vcc_data_path": "data/raw/vcc_data"
+  },
+  
+  "output_path": "data/processed/processed_data_ctrl_TEST",
+  
+  "datasets": {
+    "competition_train": {
+      "include": true,
+      "required": true,
+      "subset_to_unique": false,
+      "max_cells": null,
+      "remove_target_genes": [
+                              "NDUFB4",
+                              "C1QBP",
+                              "EIF4B",
+                              "ATP6V0B",
+                              "METTL14",
+                              "MED12",
+                              "SDC1",
+                              "DHX36",
+                              "TAF13",
+                              "UBE3C",
+                              "PHF10",
+                              "LZTR1",
+                              "PTPN1",
+                              "EPB41L2",
+                              "KDM1A",
+                              "TADA1",
+                              "IRF3",
+                              "HAT1",
+                              "KAT2A",
+                              "ACVR1B",
+                              "TCF3",
+                              "MED13",
+                              "SOX2",
+                              "NIT1"
+                            ]
+    },
+    "hepg2": {
+      "include": true,
+      "required": true,
+      "subset_to_unique": false,
+      "max_cells": null
+    },
+    "jurkat": {
+      "include": true,
+      "required": true,
+      "subset_to_unique": false,
+      "max_cells": null
+    },
+    "k562": {
+      "include": true,
+      "required": true,
+      "subset_to_unique": false,
+      "max_cells": null
+    },
+    "k562_gwps": {
+      "include": true,
+      "required": true,
+      "subset_to_unique": false,
+      "max_cells": null
+    },
+    "rpe1": {
+      "include": true,
+      "required": true,
+      "subset_to_unique": false,
+      "max_cells": null
+    }
+  },
+  
+  "filtering": {
+    "min_cells_per_dataset": 0,
+    "min_genes_per_dataset": 0
+  },
+  
+  "quality_control": {
+    "filter_cells": false,
+    "max_mitochondrial_percent": 15
+  },
+  
+  "gene_processing": {
+    "use_vcc_genes": true,
+    "order_by_vcc": true,
+    "strict_vcc_compliance": false,
+    "exclude_gene_patterns": [],
+    "include_genes": []
+  },
+  
+  "cell_processing": {
+    "balance_perturbations": false,
+    "min_genes_per_cell": 200
+  },
+  
+  "alignment": {
+    "enabled": false
+  },
+  
+  "processing_steps": [
+    "load_datasets",
+    "filter_datasets", 
+    "quality_control",
+    "subset_to_control_cells",
+    "combine_datasets",
+    "process_genes",
+    "process_cells",
+    "finalize_and_save"
+  ],
+  
+  "reproducibility": {
+    "random_seed": 42,
+    "save_intermediate": true,
+    "log_level": "INFO"
+  },
+
+  "subset_to_control_cells": false,
+  "control_indicators": {
+    "target_gene": ["non-targeting", "control", "ctrl", "neg", "scramble"],
+    "perturbation_type": ["control", "ctrl", "none"],
+    "condition": ["control", "ctrl", "dmso", "vehicle", "untreated"]
+  }
+}
