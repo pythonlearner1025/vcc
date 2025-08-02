@@ -514,8 +514,15 @@ class ConditionalDiffusionTransformer(nn.Module):
         # ------------------------------------------------------------------
         #  (5) Transformer
         # ------------------------------------------------------------------
+        use_ckpt = self.training and torch.is_grad_enabled()
         for block in self.blocks:
-            x = block(x, context=context)
+            if use_ckpt:
+                # Activation checkpointing to trade compute for memory
+                x = torch.utils.checkpoint.checkpoint(
+                    lambda _x, _ctx=context, _blk=block: _blk(_x, context=_ctx), x
+                )
+            else:
+                x = block(x, context=context)
 
         # ------------------------------------------------------------------
         #  (6) Output head
@@ -790,7 +797,14 @@ def create_optimizer(model: nn.Module, config: ConditionalModelConfig):
         {"params": [param_dict[pn] for pn in sorted(no_decay)], "weight_decay": 0.0},
     ]
     
-    return torch.optim.AdamW(optim_groups, lr=config.learning_rate, betas=(0.9, 0.95))
+    # Prefer 8-bit Adam if bitsandbytes is available
+    try:
+        from bitsandbytes.optim import Adam8bit as _AdamW
+        print("Using bitsandbytes Adam8bit optimizer")
+    except ImportError:
+        _AdamW = torch.optim.AdamW
+    
+    return _AdamW(optim_groups, lr=config.learning_rate, betas=(0.9, 0.95))
 
 
 def cosine_lr_schedule(optimizer, step: int, total_steps: int, config: ConditionalModelConfig):

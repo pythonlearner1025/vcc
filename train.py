@@ -10,6 +10,18 @@ This script implements the ST architecture with:
 
 import torch
 import wandb
+
+# ---------------------------------------------------------------------
+# Enable memory-efficient attention kernels and higher matmul precision
+# ---------------------------------------------------------------------
+try:
+    torch.backends.cuda.enable_flash_sdp(True)
+    torch.backends.cuda.enable_mem_efficient_sdp(True)
+    torch.backends.cuda.enable_math_sdp(True)
+    torch.set_float32_matmul_precision("high")
+except AttributeError:
+    # Older PyTorch versions will not expose these flags – skip silently.
+    pass
 import time
 from pathlib import Path
 from typing import Optional, Tuple, Dict
@@ -213,14 +225,15 @@ def train_epoch_st(
             batch_indices = None
             cells_processed += tokens.shape[0]
         
-        loss = diffusion.compute_loss(
-            model,
-            tokens,
-            control_set=X_ctrl,
-            target_gene_idx=target_gene_idx,
-            batch_idx=batch_indices,
-            step=global_step
-        )
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            loss = diffusion.compute_loss(
+                model,
+                tokens,
+                control_set=X_ctrl,
+                target_gene_idx=target_gene_idx,
+                batch_idx=batch_indices,
+                step=global_step
+            )
         
         optimizer.zero_grad()
         lr = cosine_lr_schedule(optimizer, global_step, total_training_steps, config)
@@ -298,14 +311,15 @@ def val_epoch_st(
                 if batch_indices is not None:
                     batch_indices = batch_indices.cuda()
 
-                loss = diffusion.compute_loss(
-                    model,
-                    tokens,
-                    control_set=X_ctrl,
-                    target_gene_idx=target_gene_idx,
-                    batch_idx=batch_indices,
-                    step=epoch
-                )
+                with torch.autocast("cuda", dtype=torch.bfloat16):
+                    loss = diffusion.compute_loss(
+                        model,
+                        tokens,
+                        control_set=X_ctrl,
+                        target_gene_idx=target_gene_idx,
+                        batch_idx=batch_indices,
+                        step=epoch
+                    )
                 val_losses.append(loss.item())
                 cells_evaluated += tokens.shape[0]
                 continue
@@ -336,14 +350,15 @@ def val_epoch_st(
             
             batch_indices = _process_batch_indices(batch, batch_to_idx)
             
-            loss = diffusion.compute_loss(
-                model,
-                tokens,
-                control_set=X_ctrl,
-                target_gene_idx=target_gene_idx,
-                batch_idx=batch_indices,
-                step=epoch
-            )
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                loss = diffusion.compute_loss(
+                    model,
+                    tokens,
+                    control_set=X_ctrl,
+                    target_gene_idx=target_gene_idx,
+                    batch_idx=batch_indices,
+                    step=epoch
+                )
             
             val_losses.append(loss.item())
             cells_evaluated += B * S
@@ -390,8 +405,8 @@ def main():
     else:
         # Fresh training run – create default config
         config = ConditionalModelConfig(
-            train_notes="100M Norm NO ESM2",
-            dim=512,
+        train_notes="100M Norm NO ESM2",
+        dim=512,
         n_head=8,
         n_layer=16,
         ffn_mult=8,
