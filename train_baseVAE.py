@@ -107,8 +107,8 @@ class TrainingConfig:
     log_every_n_steps: int = 50
     val_check_interval: float = 1.0  # Check validation every epoch
     use_wandb: bool = True  # Enable WandB logging
-    wandb_project: str = "single-cell-vae"
-    wandb_entity: str = 'ag'
+    wandb_project: str = None
+    wandb_entity: str = None
     
     # === Validation & Visualization ===
     num_reconstruction_examples: int = 8
@@ -160,6 +160,12 @@ class BaseVAELightningModule(pl.LightningModule):
         process = psutil.Process()
         ram_usage = process.memory_info().rss / 1024**3
         logger.info(f"[{stage}] RAM Usage: {ram_usage:.2f}GB")
+    
+    def log_gpu_memory():
+        if torch.cuda.is_available():
+            allocated = torch.cuda.memory_allocated() / 1024**3
+            reserved = torch.cuda.memory_reserved() / 1024**3
+            logger.info(f"GPU Memory - Allocated: {allocated:.2f}GB, Reserved: {reserved:.2f}GB")
     
     def forward(self, batch):
         """Forward pass."""
@@ -283,10 +289,44 @@ class BaseVAELightningModule(pl.LightningModule):
         """Compute comprehensive validation metrics."""
         reconstructed = outputs["reconstructed"].detach().cpu().numpy()
         original = gene_expressions.detach().cpu().numpy()
+
+        # Comprehensive NaN/Inf checking before sklearn
+        if np.isnan(reconstructed).any():
+            logger.warning("NaN detected in reconstructed before metrics computation")
+            reconstructed = np.nan_to_num(reconstructed, nan=0.0)
         
+        if np.isnan(original).any():
+            logger.warning("NaN detected in original before metrics computation")
+            original = np.nan_to_num(original, nan=0.0)
+        
+        if np.isinf(reconstructed).any():
+            logger.warning("Inf detected in reconstructed before metrics computation")
+            reconstructed = np.nan_to_num(reconstructed, posinf=1e6, neginf=0.0)
+        
+        if np.isinf(original).any():
+            logger.warning("Inf detected in original before metrics computation")
+            original = np.nan_to_num(original, posinf=1e6, neginf=0.0)
+        
+        # Now compute metrics safely
+        try:
+            mse = mean_squared_error(original.flatten(), reconstructed.flatten())
+            mae = mean_absolute_error(original.flatten(), reconstructed.flatten())
+            
+            # Additional safety check
+            if np.isnan(mse) or np.isinf(mse):
+                logger.warning("MSE is NaN/Inf, setting to large value")
+                mse = 1e6
+            if np.isnan(mae) or np.isinf(mae):
+                logger.warning("MAE is NaN/Inf, setting to large value")  
+                mae = 1e6
+                
+        except Exception as e:
+            logger.error(f"Error computing metrics: {e}")
+            mse, mae = 1e6, 1e6
+    
         # Basic reconstruction metrics
-        mse = mean_squared_error(original.flatten(), reconstructed.flatten())
-        mae = mean_absolute_error(original.flatten(), reconstructed.flatten())
+        # mse = mean_squared_error(original.flatten(), reconstructed.flatten())
+        # mae = mean_absolute_error(original.flatten(), reconstructed.flatten())
         
         # Correlation metrics
         pearson_r, _ = pearsonr(original.flatten(), reconstructed.flatten())
@@ -306,8 +346,9 @@ class BaseVAELightningModule(pl.LightningModule):
             "spearman_r": spearman_r,
         }
         
-        if umi_preservation is not None:
-            metrics["umi_preservation_error"] = umi_preservation
+        # Skip for now
+        # if umi_preservation is not None:
+            # metrics["umi_preservation_error"] = umi_preservation
         
         return metrics
     

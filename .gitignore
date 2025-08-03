@@ -14,3 +14,4 @@ checkpoints/
 cell-eval-outdir/
 cell-eval/
 evals/
+logs/

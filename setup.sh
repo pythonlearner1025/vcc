@@ -1,5 +1,8 @@
 #!/bin/bash
 
+# Copy over data to start dir:
+# /workspace/vcc/data/processed/processed_data_ctrl/processed_data.h5ad
+
 # Install uv
 curl -LsSf https://astral.sh/uv/install.sh | sh
 
@@ -42,3 +45,6 @@ echo "Installing packages with uv..."
 uv sync
 
 echo "Setup completed successfully!"
+
+
+# Restart the shell to apply changes

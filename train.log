@@ -1,0 +1,1010 @@
+nohup: ignoring input
+2025-08-02 12:42:08,384 - __main__ - INFO - Loaded configuration from: config/training_config.json
+Seed set to 42
+2025-08-02 12:42:11,060 - src.models.VAE - INFO - Initialized BaseVAE with latent_dim=256
+2025-08-02 12:42:11,061 - src.models.VAE - INFO - Total parameters: 170,589,344
+2025-08-02 12:42:11,083 - __main__ - INFO - [Model initialized] GPU Memory: 0.00GB allocated, 0.00GB cached
+2025-08-02 12:42:11,084 - __main__ - INFO - [Model initialized] RAM Usage: 1.34GB
+2025-08-02 12:42:11,084 - __main__ - INFO - Initialized BaseVAE Lightning Module
+2025-08-02 12:42:11,084 - __main__ - INFO - Model parameters: 170,589,344
+wandb: Currently logged in as: aurimasgreicius (minjunes) to https://api.wandb.ai. Use `wandb login --relogin` to force relogin
+wandb: Tracking run with wandb version 0.21.0
+wandb: Run data is saved locally in logs/wandb/run-20250802_124226-2lbwz8of
+wandb: Run `wandb offline` to turn off syncing.
+wandb: Syncing run baseVAE_CTRL_pretraining_RunPod_envtest
+wandb: ⭐️ View project at https://wandb.ai/minjunes/ag_vc
+wandb: 🚀 View run at https://wandb.ai/minjunes/ag_vc/runs/2lbwz8of
+2025-08-02 12:42:31,025 - __main__ - INFO - WandB logging enabled successfully
+Using 16bit Automatic Mixed Precision (AMP)
+Trainer already configured with model summary callbacks: [<class 'pytorch_lightning.callbacks.model_summary.ModelSummary'>]. Skipping setting a default `ModelSummary` callback.
+GPU available: True (cuda), used: True
+TPU available: False, using: 0 TPU cores
+HPU available: False, using: 0 HPUs
+`Trainer(val_check_interval=1.0)` was configured so validation will run at the end of the training epoch..
+2025-08-02 12:42:31,325 - __main__ - INFO - VAE Configuration: VAEConfig(input_dim=18080, latent_dim=256, hidden_dims=[4096, 2048, 1024, 512], learning_rate=0.001, batch_size=256, dropout_rate=0.15, reconstruction_weight=1.0, kld_weight=1.0, use_batch_norm=True, activation='relu')
+2025-08-02 12:42:31,325 - __main__ - INFO - Dataset Configuration: DatasetConfig(train_data_path='/processed_data.h5ad', val_data_path=None, test_data_path=None, batch_size=256, num_workers=8, pin_memory=True, shuffle_train=True, needed_obs_columns=None, train_split=0.8, val_split=0.2, test_split=0.0, min_test_cells=1000, preload_to_shared_memory=True, max_memory_gb=16.0, chunk_size=10000, transform=None)
+2025-08-02 12:42:31,325 - __main__ - INFO - Training Configuration: TrainingConfig(experiment_name='baseVAE_CTRL_pretraining_RunPod_envtest', seed=42, max_epochs=100, gradient_clip_val=1.0, accumulate_grad_batches=1, precision=16, learning_rate=0.001, lr_scheduler='reduce_on_plateau', lr_patience=10, lr_factor=0.5, lr_min=1e-06, early_stopping_patience=20, early_stopping_min_delta=0.0001, early_stopping_mode='min', save_top_k=4, checkpoint_monitor='val_total_loss', checkpoint_mode='min', log_every_n_steps=50, val_check_interval=1.0, use_wandb=True, wandb_project='ag_vc', wandb_entity='minjunes', num_reconstruction_examples=8, num_latent_samples=10000, validate_umi_counts=True, generate_plots=True, plot_frequency=5, accelerator='auto', devices='auto', num_nodes=1)
+2025-08-02 12:42:31,326 - __main__ - INFO - Log directory: logs
+You are using a CUDA device ('NVIDIA RTX A4500') that has Tensor Cores. To properly utilize them, you should set `torch.set_float32_matmul_precision('medium' | 'high')` which will trade-off precision for performance. For more details, read https://pytorch.org/docs/stable/generated/torch.set_float32_matmul_precision.html#torch.set_float32_matmul_precision
+2025-08-02 12:42:32,697 - src.dataloaders.vae_loader - INFO - [Before datamodule setup] Memory Usage:
+2025-08-02 12:42:32,697 - src.dataloaders.vae_loader - INFO -   RAM: 1.39GB, Virtual: 12.97GB
+2025-08-02 12:42:32,697 - src.dataloaders.vae_loader - INFO -   GPU: 0.00GB allocated, 0.00GB reserved
+2025-08-02 12:42:32,698 - src.dataloaders.vae_loader - INFO -   Device: cuda
+2025-08-02 12:42:32,699 - src.dataloaders.vae_loader - INFO - [Before dataloader creation] Memory Usage:
+2025-08-02 12:42:32,699 - src.dataloaders.vae_loader - INFO -   RAM: 1.39GB, Virtual: 12.97GB
+2025-08-02 12:42:32,699 - src.dataloaders.vae_loader - INFO -   GPU: 0.00GB allocated, 0.00GB reserved
+2025-08-02 12:42:32,700 - src.dataloaders.vae_loader - INFO -   Device: cuda
+2025-08-02 12:42:32,701 - src.dataloaders.vae_loader - INFO - [Before data loading] Memory Usage:
+2025-08-02 12:42:32,701 - src.dataloaders.vae_loader - INFO -   RAM: 1.39GB, Virtual: 12.97GB
+2025-08-02 12:42:32,701 - src.dataloaders.vae_loader - INFO -   GPU: 0.00GB allocated, 0.00GB reserved
+2025-08-02 12:42:32,702 - src.dataloaders.vae_loader - INFO -   Device: cuda
+2025-08-02 12:43:28,774 - src.dataloaders.vae_loader - INFO - [After data loading] Memory Usage:
+2025-08-02 12:43:28,775 - src.dataloaders.vae_loader - INFO -   RAM: 6.56GB, Virtual: 18.13GB
+2025-08-02 12:43:28,776 - src.dataloaders.vae_loader - INFO -   GPU: 0.00GB allocated, 0.00GB reserved
+2025-08-02 12:43:28,776 - src.dataloaders.vae_loader - INFO -   Device: cuda
+2025-08-02 12:43:28,776 - src.dataloaders.vae_loader - INFO - Converting expression data to tensor format...
+2025-08-02 12:44:02,920 - src.dataloaders.vae_loader - INFO - Processed 10000/152669 cells
+2025-08-02 12:47:19,364 - src.dataloaders.vae_loader - INFO - Processed 60000/152669 cells
+2025-08-02 12:50:16,227 - src.dataloaders.vae_loader - INFO - Processed 110000/152669 cells
+2025-08-02 12:53:04,244 - src.dataloaders.vae_loader - INFO - Processed 152669/152669 cells
+2025-08-02 12:53:09,283 - src.dataloaders.vae_loader - INFO - [After tensor conversion] Memory Usage:
+2025-08-02 12:53:09,283 - src.dataloaders.vae_loader - INFO -   RAM: 11.95GB, Virtual: 25.14GB
+2025-08-02 12:53:09,283 - src.dataloaders.vae_loader - INFO -   GPU: 0.00GB allocated, 0.00GB reserved
+2025-08-02 12:53:09,284 - src.dataloaders.vae_loader - INFO -   Device: cuda
+2025-08-02 12:53:09,284 - src.dataloaders.vae_loader - INFO - Loaded data: 152669 cells, 18080 genes
+2025-08-02 12:53:10,851 - src.dataloaders.vae_loader - INFO - Data stats: mean=0.366, std=0.735, max=8.333
+2025-08-02 12:53:21,249 - src.dataloaders.vae_loader - INFO - Set up shared memory for multiprocessing
+2025-08-02 12:53:21,258 - src.dataloaders.vae_loader - INFO - Data splits created:
+2025-08-02 12:53:21,258 - src.dataloaders.vae_loader - INFO -   Train: 122135 cells (80.0%)
+2025-08-02 12:53:21,258 - src.dataloaders.vae_loader - INFO -   Val: 30533 cells (20.0%)
+2025-08-02 12:53:21,258 - src.dataloaders.vae_loader - INFO -   Test: Not created (test_split=0.0, min_cells=1000)
+2025-08-02 12:53:25,150 - src.dataloaders.vae_loader - INFO - Pre-computed statistics for train:
+2025-08-02 12:53:25,151 - src.dataloaders.vae_loader - INFO -   UMI counts - mean: 6618.8, std: 4568.8, range: [1092.7, 32785.3]
+2025-08-02 12:53:25,151 - src.dataloaders.vae_loader - INFO -   Expression - mean: 0.366, std: 0.735, max: 8.333
+2025-08-02 12:53:26,495 - src.dataloaders.vae_loader - INFO - Initialized train dataset: 122135 cells, 18080 genes
+2025-08-02 12:53:27,420 - src.dataloaders.vae_loader - INFO - Pre-computed statistics for val:
+2025-08-02 12:53:27,421 - src.dataloaders.vae_loader - INFO -   UMI counts - mean: 6625.4, std: 4578.6, range: [1548.4, 29980.3]
+2025-08-02 12:53:27,421 - src.dataloaders.vae_loader - INFO -   Expression - mean: 0.366, std: 0.735, max: 7.540
+2025-08-02 12:53:27,784 - src.dataloaders.vae_loader - INFO - Initialized val dataset: 30533 cells, 18080 genes
+2025-08-02 12:53:27,785 - src.dataloaders.vae_loader - INFO - Created optimized dataloaders:
+2025-08-02 12:53:27,785 - src.dataloaders.vae_loader - INFO -   Train: 477 batches (122135 cells)
+2025-08-02 12:53:27,785 - src.dataloaders.vae_loader - INFO -   Val: 120 batches (30533 cells)
+2025-08-02 12:53:27,785 - src.dataloaders.vae_loader - INFO -   Test: Not created
+2025-08-02 12:53:27,786 - src.dataloaders.vae_loader - INFO - [After dataloader creation] Memory Usage:
+2025-08-02 12:53:27,786 - src.dataloaders.vae_loader - INFO -   RAM: 11.76GB, Virtual: 24.96GB
+2025-08-02 12:53:27,787 - src.dataloaders.vae_loader - INFO -   GPU: 0.00GB allocated, 0.00GB reserved
+2025-08-02 12:53:27,787 - src.dataloaders.vae_loader - INFO -   Device: cuda
+2025-08-02 12:53:27,787 - src.dataloaders.vae_loader - INFO - [After datamodule setup] Memory Usage:
+2025-08-02 12:53:27,788 - src.dataloaders.vae_loader - INFO -   RAM: 11.76GB, Virtual: 24.96GB
+2025-08-02 12:53:27,788 - src.dataloaders.vae_loader - INFO -   GPU: 0.00GB allocated, 0.00GB reserved
+2025-08-02 12:53:27,788 - src.dataloaders.vae_loader - INFO -   Device: cuda
+LOCAL_RANK: 0 - CUDA_VISIBLE_DEVICES: [0]
+
+  | Name          | Type        | Params | Mode 
+------------------------------------------------------
+0 | model         | BaseVAE     | 170 M  | train
+1 | model.encoder | BaseEncoder | 85.4 M | train
+2 | model.decoder | BaseDecoder | 85.2 M | train
+------------------------------------------------------
+170 M     Trainable params
+0         Non-trainable params
+170 M     Total params
+682.357   Total estimated model params size (MB)
+40        Modules in train mode
+0         Modules in eval mode
+
+Sanity Checking: |          | 0/? [00:00<?, ?it/s]
+Sanity Checking:   0%|          | 0/2 [00:00<?, ?it/s]
+Sanity Checking DataLoader 0:   0%|          | 0/2 [00:00<?, ?it/s]
+Sanity Checking DataLoader 0: 100%|██████████| 2/2 [00:05<00:00,  0.38it/s]
+                                                                           
+
+Training: |          | 0/? [00:00<?, ?it/s]
+Training:   0%|          | 0/477 [00:00<?, ?it/s]
+Epoch 0:   0%|          | 0/477 [00:00<?, ?it/s] 
+Epoch 0:   4%|▍         | 20/477 [00:04<01:38,  4.65it/s]
+Epoch 0:   4%|▍         | 20/477 [00:04<01:38,  4.62it/s, v_num=z8of, train_total_loss_step=4.26e+4]
+Epoch 0:   8%|▊         | 40/477 [00:06<01:06,  6.53it/s, v_num=z8of, train_total_loss_step=4.26e+4]
+Epoch 0:   8%|▊         | 40/477 [00:06<01:07,  6.48it/s, v_num=z8of, train_total_loss_step=8.13e+3]
+Epoch 0:  13%|█▎        | 60/477 [00:08<00:55,  7.49it/s, v_num=z8of, train_total_loss_step=8.13e+3]
+Epoch 0:  13%|█▎        | 60/477 [00:08<00:55,  7.47it/s, v_num=z8of, train_total_loss_step=6.88e+3]
+Epoch 0:  17%|█▋        | 80/477 [00:09<00:49,  8.08it/s, v_num=z8of, train_total_loss_step=6.88e+3]
+Epoch 0:  17%|█▋        | 80/477 [00:09<00:49,  8.06it/s, v_num=z8of, train_total_loss_step=3.71e+3]
+Epoch 0:  21%|██        | 100/477 [00:12<00:46,  8.14it/s, v_num=z8of, train_total_loss_step=3.71e+3]
+Epoch 0:  21%|██        | 100/477 [00:12<00:46,  8.12it/s, v_num=z8of, train_total_loss_step=3.45e+3]
+Epoch 0:  25%|██▌       | 120/477 [00:14<00:42,  8.45it/s, v_num=z8of, train_total_loss_step=3.45e+3]
+Epoch 0:  25%|██▌       | 120/477 [00:14<00:42,  8.44it/s, v_num=z8of, train_total_loss_step=3.38e+3]
+Epoch 0:  29%|██▉       | 140/477 [00:15<00:38,  8.76it/s, v_num=z8of, train_total_loss_step=3.38e+3]
+Epoch 0:  29%|██▉       | 140/477 [00:15<00:38,  8.75it/s, v_num=z8of, train_total_loss_step=1.6e+4] 
+Epoch 0:  34%|███▎      | 160/477 [00:17<00:35,  8.94it/s, v_num=z8of, train_total_loss_step=1.6e+4]
+Epoch 0:  34%|███▎      | 160/477 [00:17<00:35,  8.93it/s, v_num=z8of, train_total_loss_step=3.75e+3]
+Epoch 0:  38%|███▊      | 180/477 [00:19<00:32,  9.18it/s, v_num=z8of, train_total_loss_step=3.75e+3]
+Epoch 0:  38%|███▊      | 180/477 [00:19<00:32,  9.17it/s, v_num=z8of, train_total_loss_step=1.74e+5]
+Epoch 0:  42%|████▏     | 200/477 [00:21<00:29,  9.33it/s, v_num=z8of, train_total_loss_step=1.74e+5]
+Epoch 0:  42%|████▏     | 200/477 [00:21<00:29,  9.31it/s, v_num=z8of, train_total_loss_step=3.71e+3]
+Epoch 0:  46%|████▌     | 220/477 [00:23<00:27,  9.36it/s, v_num=z8of, train_total_loss_step=3.71e+3]
+Epoch 0:  46%|████▌     | 220/477 [00:23<00:27,  9.35it/s, v_num=z8of, train_total_loss_step=3.16e+4]
+Epoch 0:  50%|█████     | 240/477 [00:25<00:25,  9.45it/s, v_num=z8of, train_total_loss_step=3.16e+4]
+Epoch 0:  50%|█████     | 240/477 [00:25<00:25,  9.44it/s, v_num=z8of, train_total_loss_step=4.6e+3] 
+Epoch 0:  55%|█████▍    | 260/477 [00:27<00:22,  9.53it/s, v_num=z8of, train_total_loss_step=4.6e+3]
+Epoch 0:  55%|█████▍    | 260/477 [00:27<00:22,  9.52it/s, v_num=z8of, train_total_loss_step=8.62e+3]
+Epoch 0:  59%|█████▊    | 280/477 [00:29<00:20,  9.61it/s, v_num=z8of, train_total_loss_step=8.62e+3]
+Epoch 0:  59%|█████▊    | 280/477 [00:29<00:20,  9.60it/s, v_num=z8of, train_total_loss_step=3.6e+3] 
+Epoch 0:  63%|██████▎   | 300/477 [00:31<00:18,  9.65it/s, v_num=z8of, train_total_loss_step=3.6e+3]
+Epoch 0:  63%|██████▎   | 300/477 [00:31<00:18,  9.65it/s, v_num=z8of, train_total_loss_step=3.36e+3]
+Epoch 0:  67%|██████▋   | 320/477 [00:32<00:16,  9.72it/s, v_num=z8of, train_total_loss_step=3.36e+3]
+Epoch 0:  67%|██████▋   | 320/477 [00:32<00:16,  9.70it/s, v_num=z8of, train_total_loss_step=3.01e+3]
+Epoch 0:  71%|███████▏  | 340/477 [00:34<00:14,  9.78it/s, v_num=z8of, train_total_loss_step=3.01e+3]
+Epoch 0:  71%|███████▏  | 340/477 [00:34<00:14,  9.77it/s, v_num=z8of, train_total_loss_step=2.81e+3]
+Epoch 0:  75%|███████▌  | 360/477 [00:36<00:11,  9.81it/s, v_num=z8of, train_total_loss_step=2.81e+3]
+Epoch 0:  75%|███████▌  | 360/477 [00:36<00:11,  9.81it/s, v_num=z8of, train_total_loss_step=2.86e+3]
+Epoch 0:  80%|███████▉  | 380/477 [00:38<00:09,  9.85it/s, v_num=z8of, train_total_loss_step=2.86e+3]
+Epoch 0:  80%|███████▉  | 380/477 [00:38<00:09,  9.84it/s, v_num=z8of, train_total_loss_step=2.77e+3]
+Epoch 0:  84%|████████▍ | 400/477 [00:40<00:07,  9.93it/s, v_num=z8of, train_total_loss_step=2.77e+3]
+Epoch 0:  84%|████████▍ | 400/477 [00:40<00:07,  9.92it/s, v_num=z8of, train_total_loss_step=2.72e+3]
+Epoch 0:  88%|████████▊ | 420/477 [00:42<00:05,  9.97it/s, v_num=z8of, train_total_loss_step=2.72e+3]
+Epoch 0:  88%|████████▊ | 420/477 [00:42<00:05,  9.97it/s, v_num=z8of, train_total_loss_step=4.39e+3]
+Epoch 0:  92%|█████████▏| 440/477 [00:43<00:03, 10.02it/s, v_num=z8of, train_total_loss_step=4.39e+3]
+Epoch 0:  92%|█████████▏| 440/477 [00:43<00:03, 10.02it/s, v_num=z8of, train_total_loss_step=3.21e+3]
+Epoch 0:  96%|█████████▋| 460/477 [00:45<00:01, 10.05it/s, v_num=z8of, train_total_loss_step=3.21e+3]
+Epoch 0:  96%|█████████▋| 460/477 [00:45<00:01, 10.04it/s, v_num=z8of, train_total_loss_step=2.82e+3]
+Epoch 0: 100%|██████████| 477/477 [00:46<00:00, 10.17it/s, v_num=z8of, train_total_loss_step=2.82e+3]
+Epoch 0: 100%|██████████| 477/477 [00:46<00:00, 10.17it/s, v_num=z8of, train_total_loss_step=2.89e+3]
+
+Validation: |          | 0/? [00:00<?, ?it/s][A
+
+Validation:   0%|          | 0/120 [00:00<?, ?it/s][A
+
+Validation DataLoader 0:   0%|          | 0/120 [00:00<?, ?it/s][A
+
+Validation DataLoader 0:  17%|█▋        | 20/120 [00:24<02:02,  0.82it/s][A
+
+Validation DataLoader 0:  33%|███▎      | 40/120 [00:48<01:37,  0.82it/s][A
+
+Validation DataLoader 0:  50%|█████     | 60/120 [01:12<01:12,  0.83it/s][A
+
+Validation DataLoader 0:  67%|██████▋   | 80/120 [01:36<00:48,  0.83it/s][A
+
+Validation DataLoader 0:  83%|████████▎ | 100/120 [02:00<00:24,  0.83it/s][A
+
+Validation DataLoader 0: 100%|██████████| 120/120 [02:24<00:00,  0.83it/s][A
+
+                                                                          [A
+Epoch 0: 100%|██████████| 477/477 [03:14<00:00,  2.45it/s, v_num=z8of, train_total_loss_step=2.89e+3, val_total_loss=2.76e+3]
+Epoch 0: 100%|██████████| 477/477 [03:14<00:00,  2.45it/s, v_num=z8of, train_total_loss_step=2.89e+3, val_total_loss=2.76e+3, train_total_loss_epoch=6.91e+3]Metric val_total_loss improved. New best score: 2757.835
+
+Epoch 0:   0%|          | 0/477 [00:00<?, ?it/s, v_num=z8of, train_total_loss_step=2.89e+3, val_total_loss=2.76e+3, train_total_loss_epoch=6.91e+3]          
+Epoch 1:   0%|          | 0/477 [00:00<?, ?it/s, v_num=z8of, train_total_loss_step=2.89e+3, val_total_loss=2.76e+3, train_total_loss_epoch=6.91e+3]
+Epoch 1:   4%|▍         | 20/477 [00:02<00:58,  7.80it/s, v_num=z8of, train_total_loss_step=2.89e+3, val_total_loss=2.76e+3, train_total_loss_epoch=6.91e+3]
+Epoch 1:   4%|▍         | 20/477 [00:02<00:59,  7.74it/s, v_num=z8of, train_total_loss_step=2.63e+3, val_total_loss=2.76e+3, train_total_loss_epoch=6.91e+3]
+Epoch 1:   8%|▊         | 40/477 [00:04<00:47,  9.14it/s, v_num=z8of, train_total_loss_step=2.63e+3, val_total_loss=2.76e+3, train_total_loss_epoch=6.91e+3]
+Epoch 1:   8%|▊         | 40/477 [00:04<00:48,  9.09it/s, v_num=z8of, train_total_loss_step=2.73e+3, val_total_loss=2.76e+3, train_total_loss_epoch=6.91e+3]
+Epoch 1:  13%|█▎        | 60/477 [00:06<00:42,  9.87it/s, v_num=z8of, train_total_loss_step=2.73e+3, val_total_loss=2.76e+3, train_total_loss_epoch=6.91e+3]
+Epoch 1:  13%|█▎        | 60/477 [00:06<00:42,  9.84it/s, v_num=z8of, train_total_loss_step=2.7e+3, val_total_loss=2.76e+3, train_total_loss_epoch=6.91e+3] 
+Epoch 1:  17%|█▋        | 80/477 [00:07<00:39, 10.06it/s, v_num=z8of, train_total_loss_step=2.7e+3, val_total_loss=2.76e+3, train_total_loss_epoch=6.91e+3]
+Epoch 1:  17%|█▋        | 80/477 [00:07<00:39, 10.03it/s, v_num=z8of, train_total_loss_step=3.13e+3, val_total_loss=2.76e+3, train_total_loss_epoch=6.91e+3]
+Epoch 1:  21%|██        | 100/477 [00:09<00:37, 10.15it/s, v_num=z8of, train_total_loss_step=3.13e+3, val_total_loss=2.76e+3, train_total_loss_epoch=6.91e+3]
+Epoch 1:  21%|██        | 100/477 [00:09<00:37, 10.13it/s, v_num=z8of, train_total_loss_step=2.71e+3, val_total_loss=2.76e+3, train_total_loss_epoch=6.91e+3]
+Epoch 1:  25%|██▌       | 120/477 [00:11<00:34, 10.44it/s, v_num=z8of, train_total_loss_step=2.71e+3, val_total_loss=2.76e+3, train_total_loss_epoch=6.91e+3]
+Epoch 1:  25%|██▌       | 120/477 [00:11<00:34, 10.40it/s, v_num=z8of, train_total_loss_step=2.68e+3, val_total_loss=2.76e+3, train_total_loss_epoch=6.91e+3]
+Epoch 1:  29%|██▉       | 140/477 [00:13<00:32, 10.48it/s, v_num=z8of, train_total_loss_step=2.68e+3, val_total_loss=2.76e+3, train_total_loss_epoch=6.91e+3]
+Epoch 1:  29%|██▉       | 140/477 [00:13<00:32, 10.46it/s, v_num=z8of, train_total_loss_step=2.68e+3, val_total_loss=2.76e+3, train_total_loss_epoch=6.91e+3]
+Epoch 1:  34%|███▎      | 160/477 [00:15<00:29, 10.63it/s, v_num=z8of, train_total_loss_step=2.68e+3, val_total_loss=2.76e+3, train_total_loss_epoch=6.91e+3]
+Epoch 1:  34%|███▎      | 160/477 [00:15<00:29, 10.61it/s, v_num=z8of, train_total_loss_step=2.65e+3, val_total_loss=2.76e+3, train_total_loss_epoch=6.91e+3]
+Epoch 1:  38%|███▊      | 180/477 [00:17<00:28, 10.49it/s, v_num=z8of, train_total_loss_step=2.65e+3, val_total_loss=2.76e+3, train_total_loss_epoch=6.91e+3]
+Epoch 1:  38%|███▊      | 180/477 [00:17<00:28, 10.48it/s, v_num=z8of, train_total_loss_step=2.62e+3, val_total_loss=2.76e+3, train_total_loss_epoch=6.91e+3]
+Epoch 1:  42%|████▏     | 200/477 [00:18<00:26, 10.54it/s, v_num=z8of, train_total_loss_step=2.62e+3, val_total_loss=2.76e+3, train_total_loss_epoch=6.91e+3]
+Epoch 1:  42%|████▏     | 200/477 [00:18<00:26, 10.53it/s, v_num=z8of, train_total_loss_step=2.49e+3, val_total_loss=2.76e+3, train_total_loss_epoch=6.91e+3]
+Epoch 1:  46%|████▌     | 220/477 [00:20<00:24, 10.50it/s, v_num=z8of, train_total_loss_step=2.49e+3, val_total_loss=2.76e+3, train_total_loss_epoch=6.91e+3]
+Epoch 1:  46%|████▌     | 220/477 [00:20<00:24, 10.49it/s, v_num=z8of, train_total_loss_step=2.63e+3, val_total_loss=2.76e+3, train_total_loss_epoch=6.91e+3]
+Epoch 1:  50%|█████     | 240/477 [00:22<00:22, 10.49it/s, v_num=z8of, train_total_loss_step=2.63e+3, val_total_loss=2.76e+3, train_total_loss_epoch=6.91e+3]
+Epoch 1:  50%|█████     | 240/477 [00:22<00:22, 10.46it/s, v_num=z8of, train_total_loss_step=2.49e+3, val_total_loss=2.76e+3, train_total_loss_epoch=6.91e+3]
+Epoch 1:  55%|█████▍    | 260/477 [00:24<00:20, 10.50it/s, v_num=z8of, train_total_loss_step=2.49e+3, val_total_loss=2.76e+3, train_total_loss_epoch=6.91e+3]
+Epoch 1:  55%|█████▍    | 260/477 [00:24<00:20, 10.49it/s, v_num=z8of, train_total_loss_step=2.58e+3, val_total_loss=2.76e+3, train_total_loss_epoch=6.91e+3]
+Epoch 1:  59%|█████▊    | 280/477 [00:26<00:18, 10.46it/s, v_num=z8of, train_total_loss_step=2.58e+3, val_total_loss=2.76e+3, train_total_loss_epoch=6.91e+3]
+Epoch 1:  59%|█████▊    | 280/477 [00:26<00:18, 10.46it/s, v_num=z8of, train_total_loss_step=2.55e+3, val_total_loss=2.76e+3, train_total_loss_epoch=6.91e+3]
+Epoch 1:  63%|██████▎   | 300/477 [00:28<00:16, 10.49it/s, v_num=z8of, train_total_loss_step=2.55e+3, val_total_loss=2.76e+3, train_total_loss_epoch=6.91e+3]
+Epoch 1:  63%|██████▎   | 300/477 [00:28<00:16, 10.47it/s, v_num=z8of, train_total_loss_step=2.66e+3, val_total_loss=2.76e+3, train_total_loss_epoch=6.91e+3]
+Epoch 1:  67%|██████▋   | 320/477 [00:30<00:14, 10.50it/s, v_num=z8of, train_total_loss_step=2.66e+3, val_total_loss=2.76e+3, train_total_loss_epoch=6.91e+3]
+Epoch 1:  67%|██████▋   | 320/477 [00:30<00:14, 10.49it/s, v_num=z8of, train_total_loss_step=2.46e+3, val_total_loss=2.76e+3, train_total_loss_epoch=6.91e+3]
+Epoch 1:  71%|███████▏  | 340/477 [00:32<00:13, 10.53it/s, v_num=z8of, train_total_loss_step=2.46e+3, val_total_loss=2.76e+3, train_total_loss_epoch=6.91e+3]
+Epoch 1:  71%|███████▏  | 340/477 [00:32<00:13, 10.53it/s, v_num=z8of, train_total_loss_step=2.53e+3, val_total_loss=2.76e+3, train_total_loss_epoch=6.91e+3]
+Epoch 1:  75%|███████▌  | 360/477 [00:34<00:11, 10.53it/s, v_num=z8of, train_total_loss_step=2.53e+3, val_total_loss=2.76e+3, train_total_loss_epoch=6.91e+3]
+Epoch 1:  75%|███████▌  | 360/477 [00:34<00:11, 10.53it/s, v_num=z8of, train_total_loss_step=2.52e+3, val_total_loss=2.76e+3, train_total_loss_epoch=6.91e+3]
+Epoch 1:  80%|███████▉  | 380/477 [00:36<00:09, 10.54it/s, v_num=z8of, train_total_loss_step=2.52e+3, val_total_loss=2.76e+3, train_total_loss_epoch=6.91e+3]
+Epoch 1:  80%|███████▉  | 380/477 [00:36<00:09, 10.54it/s, v_num=z8of, train_total_loss_step=2.59e+3, val_total_loss=2.76e+3, train_total_loss_epoch=6.91e+3]
+Epoch 1:  84%|████████▍ | 400/477 [00:37<00:07, 10.59it/s, v_num=z8of, train_total_loss_step=2.59e+3, val_total_loss=2.76e+3, train_total_loss_epoch=6.91e+3]
+Epoch 1:  84%|████████▍ | 400/477 [00:37<00:07, 10.59it/s, v_num=z8of, train_total_loss_step=2.47e+3, val_total_loss=2.76e+3, train_total_loss_epoch=6.91e+3]
+Epoch 1:  88%|████████▊ | 420/477 [00:39<00:05, 10.61it/s, v_num=z8of, train_total_loss_step=2.47e+3, val_total_loss=2.76e+3, train_total_loss_epoch=6.91e+3]
+Epoch 1:  88%|████████▊ | 420/477 [00:39<00:05, 10.61it/s, v_num=z8of, train_total_loss_step=2.54e+3, val_total_loss=2.76e+3, train_total_loss_epoch=6.91e+3]
+Epoch 1:  92%|█████████▏| 440/477 [00:41<00:03, 10.61it/s, v_num=z8of, train_total_loss_step=2.54e+3, val_total_loss=2.76e+3, train_total_loss_epoch=6.91e+3]
+Epoch 1:  92%|█████████▏| 440/477 [00:41<00:03, 10.60it/s, v_num=z8of, train_total_loss_step=2.42e+3, val_total_loss=2.76e+3, train_total_loss_epoch=6.91e+3]
+Epoch 1:  96%|█████████▋| 460/477 [00:43<00:01, 10.63it/s, v_num=z8of, train_total_loss_step=2.42e+3, val_total_loss=2.76e+3, train_total_loss_epoch=6.91e+3]
+Epoch 1:  96%|█████████▋| 460/477 [00:43<00:01, 10.62it/s, v_num=z8of, train_total_loss_step=2.78e+3, val_total_loss=2.76e+3, train_total_loss_epoch=6.91e+3]
+Epoch 1: 100%|██████████| 477/477 [00:44<00:00, 10.74it/s, v_num=z8of, train_total_loss_step=2.78e+3, val_total_loss=2.76e+3, train_total_loss_epoch=6.91e+3]
+Epoch 1: 100%|██████████| 477/477 [00:44<00:00, 10.73it/s, v_num=z8of, train_total_loss_step=2.51e+3, val_total_loss=2.76e+3, train_total_loss_epoch=6.91e+3]
+
+Validation: |          | 0/? [00:00<?, ?it/s][A
+
+Validation:   0%|          | 0/120 [00:00<?, ?it/s][A
+
+Validation DataLoader 0:   0%|          | 0/120 [00:00<?, ?it/s][A
+
+Validation DataLoader 0:  17%|█▋        | 20/120 [00:22<01:54,  0.87it/s][A
+
+Validation DataLoader 0:  33%|███▎      | 40/120 [00:46<01:33,  0.86it/s][A
+
+Validation DataLoader 0:  50%|█████     | 60/120 [01:10<01:10,  0.85it/s][A
+
+Validation DataLoader 0:  67%|██████▋   | 80/120 [01:33<00:46,  0.85it/s][A
+
+Validation DataLoader 0:  83%|████████▎ | 100/120 [01:58<00:23,  0.85it/s][A
+
+Validation DataLoader 0: 100%|██████████| 120/120 [02:20<00:00,  0.86it/s][A
+
+                                                                          [A
+Epoch 1: 100%|██████████| 477/477 [03:05<00:00,  2.58it/s, v_num=z8of, train_total_loss_step=2.51e+3, val_total_loss=2.43e+3, train_total_loss_epoch=6.91e+3]
+Epoch 1: 100%|██████████| 477/477 [03:05<00:00,  2.58it/s, v_num=z8of, train_total_loss_step=2.51e+3, val_total_loss=2.43e+3, train_total_loss_epoch=2.65e+3]Metric val_total_loss improved by 326.873 >= min_delta = 0.0001. New best score: 2430.962
+
+Epoch 1:   0%|          | 0/477 [00:00<?, ?it/s, v_num=z8of, train_total_loss_step=2.51e+3, val_total_loss=2.43e+3, train_total_loss_epoch=2.65e+3]          
+Epoch 2:   0%|          | 0/477 [00:00<?, ?it/s, v_num=z8of, train_total_loss_step=2.51e+3, val_total_loss=2.43e+3, train_total_loss_epoch=2.65e+3]
+Epoch 2:   4%|▍         | 20/477 [00:02<00:56,  8.02it/s, v_num=z8of, train_total_loss_step=2.51e+3, val_total_loss=2.43e+3, train_total_loss_epoch=2.65e+3]
+Epoch 2:   4%|▍         | 20/477 [00:02<00:57,  8.02it/s, v_num=z8of, train_total_loss_step=2.63e+3, val_total_loss=2.43e+3, train_total_loss_epoch=2.65e+3]
+Epoch 2:   8%|▊         | 40/477 [00:04<00:47,  9.24it/s, v_num=z8of, train_total_loss_step=2.63e+3, val_total_loss=2.43e+3, train_total_loss_epoch=2.65e+3]
+Epoch 2:   8%|▊         | 40/477 [00:04<00:47,  9.20it/s, v_num=z8of, train_total_loss_step=2.47e+3, val_total_loss=2.43e+3, train_total_loss_epoch=2.65e+3]
+Epoch 2:  13%|█▎        | 60/477 [00:06<00:44,  9.36it/s, v_num=z8of, train_total_loss_step=2.47e+3, val_total_loss=2.43e+3, train_total_loss_epoch=2.65e+3]
+Epoch 2:  13%|█▎        | 60/477 [00:06<00:44,  9.33it/s, v_num=z8of, train_total_loss_step=2.43e+3, val_total_loss=2.43e+3, train_total_loss_epoch=2.65e+3]
+Epoch 2:  17%|█▋        | 80/477 [00:08<00:42,  9.40it/s, v_num=z8of, train_total_loss_step=2.43e+3, val_total_loss=2.43e+3, train_total_loss_epoch=2.65e+3]
+Epoch 2:  17%|█▋        | 80/477 [00:08<00:42,  9.38it/s, v_num=z8of, train_total_loss_step=2.41e+3, val_total_loss=2.43e+3, train_total_loss_epoch=2.65e+3]
+Epoch 2:  21%|██        | 100/477 [00:10<00:38,  9.79it/s, v_num=z8of, train_total_loss_step=2.41e+3, val_total_loss=2.43e+3, train_total_loss_epoch=2.65e+3]
+Epoch 2:  21%|██        | 100/477 [00:10<00:38,  9.77it/s, v_num=z8of, train_total_loss_step=2.41e+3, val_total_loss=2.43e+3, train_total_loss_epoch=2.65e+3]
+Epoch 2:  25%|██▌       | 120/477 [00:11<00:35, 10.17it/s, v_num=z8of, train_total_loss_step=2.41e+3, val_total_loss=2.43e+3, train_total_loss_epoch=2.65e+3]
+Epoch 2:  25%|██▌       | 120/477 [00:11<00:35, 10.15it/s, v_num=z8of, train_total_loss_step=2.36e+3, val_total_loss=2.43e+3, train_total_loss_epoch=2.65e+3]
+Epoch 2:  29%|██▉       | 140/477 [00:13<00:32, 10.43it/s, v_num=z8of, train_total_loss_step=2.36e+3, val_total_loss=2.43e+3, train_total_loss_epoch=2.65e+3]
+Epoch 2:  29%|██▉       | 140/477 [00:13<00:32, 10.41it/s, v_num=z8of, train_total_loss_step=2.48e+3, val_total_loss=2.43e+3, train_total_loss_epoch=2.65e+3]
+Epoch 2:  34%|███▎      | 160/477 [00:15<00:29, 10.58it/s, v_num=z8of, train_total_loss_step=2.48e+3, val_total_loss=2.43e+3, train_total_loss_epoch=2.65e+3]
+Epoch 2:  34%|███▎      | 160/477 [00:15<00:29, 10.57it/s, v_num=z8of, train_total_loss_step=2.47e+3, val_total_loss=2.43e+3, train_total_loss_epoch=2.65e+3]
+Epoch 2:  38%|███▊      | 180/477 [00:16<00:27, 10.70it/s, v_num=z8of, train_total_loss_step=2.47e+3, val_total_loss=2.43e+3, train_total_loss_epoch=2.65e+3]
+Epoch 2:  38%|███▊      | 180/477 [00:16<00:27, 10.69it/s, v_num=z8of, train_total_loss_step=2.42e+3, val_total_loss=2.43e+3, train_total_loss_epoch=2.65e+3]
+Epoch 2:  42%|████▏     | 200/477 [00:18<00:25, 10.67it/s, v_num=z8of, train_total_loss_step=2.42e+3, val_total_loss=2.43e+3, train_total_loss_epoch=2.65e+3]
+Epoch 2:  42%|████▏     | 200/477 [00:18<00:26, 10.64it/s, v_num=z8of, train_total_loss_step=2.48e+3, val_total_loss=2.43e+3, train_total_loss_epoch=2.65e+3]
+Epoch 2:  46%|████▌     | 220/477 [00:20<00:23, 10.76it/s, v_num=z8of, train_total_loss_step=2.48e+3, val_total_loss=2.43e+3, train_total_loss_epoch=2.65e+3]
+Epoch 2:  46%|████▌     | 220/477 [00:20<00:23, 10.73it/s, v_num=z8of, train_total_loss_step=2.45e+3, val_total_loss=2.43e+3, train_total_loss_epoch=2.65e+3]
+Epoch 2:  50%|█████     | 240/477 [00:22<00:21, 10.79it/s, v_num=z8of, train_total_loss_step=2.45e+3, val_total_loss=2.43e+3, train_total_loss_epoch=2.65e+3]
+Epoch 2:  50%|█████     | 240/477 [00:22<00:22, 10.77it/s, v_num=z8of, train_total_loss_step=2.56e+3, val_total_loss=2.43e+3, train_total_loss_epoch=2.65e+3]
+Epoch 2:  55%|█████▍    | 260/477 [00:24<00:20, 10.69it/s, v_num=z8of, train_total_loss_step=2.56e+3, val_total_loss=2.43e+3, train_total_loss_epoch=2.65e+3]
+Epoch 2:  55%|█████▍    | 260/477 [00:24<00:20, 10.69it/s, v_num=z8of, train_total_loss_step=2.41e+3, val_total_loss=2.43e+3, train_total_loss_epoch=2.65e+3]
+Epoch 2:  59%|█████▊    | 280/477 [00:26<00:18, 10.68it/s, v_num=z8of, train_total_loss_step=2.41e+3, val_total_loss=2.43e+3, train_total_loss_epoch=2.65e+3]
+Epoch 2:  59%|█████▊    | 280/477 [00:26<00:18, 10.67it/s, v_num=z8of, train_total_loss_step=2.49e+3, val_total_loss=2.43e+3, train_total_loss_epoch=2.65e+3]
+Epoch 2:  63%|██████▎   | 300/477 [00:28<00:16, 10.59it/s, v_num=z8of, train_total_loss_step=2.49e+3, val_total_loss=2.43e+3, train_total_loss_epoch=2.65e+3]
+Epoch 2:  63%|██████▎   | 300/477 [00:28<00:16, 10.58it/s, v_num=z8of, train_total_loss_step=2.44e+3, val_total_loss=2.43e+3, train_total_loss_epoch=2.65e+3]
+Epoch 2:  67%|██████▋   | 320/477 [00:30<00:14, 10.62it/s, v_num=z8of, train_total_loss_step=2.44e+3, val_total_loss=2.43e+3, train_total_loss_epoch=2.65e+3]
+Epoch 2:  67%|██████▋   | 320/477 [00:30<00:14, 10.61it/s, v_num=z8of, train_total_loss_step=2.39e+3, val_total_loss=2.43e+3, train_total_loss_epoch=2.65e+3]
+Epoch 2:  71%|███████▏  | 340/477 [00:31<00:12, 10.63it/s, v_num=z8of, train_total_loss_step=2.39e+3, val_total_loss=2.43e+3, train_total_loss_epoch=2.65e+3]
+Epoch 2:  71%|███████▏  | 340/477 [00:32<00:12, 10.62it/s, v_num=z8of, train_total_loss_step=2.46e+3, val_total_loss=2.43e+3, train_total_loss_epoch=2.65e+3]
+Epoch 2:  75%|███████▌  | 360/477 [00:33<00:11, 10.61it/s, v_num=z8of, train_total_loss_step=2.46e+3, val_total_loss=2.43e+3, train_total_loss_epoch=2.65e+3]
+Epoch 2:  75%|███████▌  | 360/477 [00:33<00:11, 10.59it/s, v_num=z8of, train_total_loss_step=2.54e+3, val_total_loss=2.43e+3, train_total_loss_epoch=2.65e+3]
+Epoch 2:  80%|███████▉  | 380/477 [00:35<00:09, 10.58it/s, v_num=z8of, train_total_loss_step=2.54e+3, val_total_loss=2.43e+3, train_total_loss_epoch=2.65e+3]
+Epoch 2:  80%|███████▉  | 380/477 [00:35<00:09, 10.58it/s, v_num=z8of, train_total_loss_step=2.48e+3, val_total_loss=2.43e+3, train_total_loss_epoch=2.65e+3]
+Epoch 2:  84%|████████▍ | 400/477 [00:37<00:07, 10.63it/s, v_num=z8of, train_total_loss_step=2.48e+3, val_total_loss=2.43e+3, train_total_loss_epoch=2.65e+3]
+Epoch 2:  84%|████████▍ | 400/477 [00:37<00:07, 10.62it/s, v_num=z8of, train_total_loss_step=2.52e+3, val_total_loss=2.43e+3, train_total_loss_epoch=2.65e+3]
+Epoch 2:  88%|████████▊ | 420/477 [00:39<00:05, 10.62it/s, v_num=z8of, train_total_loss_step=2.52e+3, val_total_loss=2.43e+3, train_total_loss_epoch=2.65e+3]
+Epoch 2:  88%|████████▊ | 420/477 [00:39<00:05, 10.62it/s, v_num=z8of, train_total_loss_step=2.45e+3, val_total_loss=2.43e+3, train_total_loss_epoch=2.65e+3]
+Epoch 2:  92%|█████████▏| 440/477 [00:41<00:03, 10.63it/s, v_num=z8of, train_total_loss_step=2.45e+3, val_total_loss=2.43e+3, train_total_loss_epoch=2.65e+3]
+Epoch 2:  92%|█████████▏| 440/477 [00:41<00:03, 10.62it/s, v_num=z8of, train_total_loss_step=2.45e+3, val_total_loss=2.43e+3, train_total_loss_epoch=2.65e+3]
+Epoch 2:  96%|█████████▋| 460/477 [00:43<00:01, 10.62it/s, v_num=z8of, train_total_loss_step=2.45e+3, val_total_loss=2.43e+3, train_total_loss_epoch=2.65e+3]
+Epoch 2:  96%|█████████▋| 460/477 [00:43<00:01, 10.61it/s, v_num=z8of, train_total_loss_step=2.46e+3, val_total_loss=2.43e+3, train_total_loss_epoch=2.65e+3]
+Epoch 2: 100%|██████████| 477/477 [00:44<00:00, 10.74it/s, v_num=z8of, train_total_loss_step=2.46e+3, val_total_loss=2.43e+3, train_total_loss_epoch=2.65e+3]
+Epoch 2: 100%|██████████| 477/477 [00:44<00:00, 10.73it/s, v_num=z8of, train_total_loss_step=2.41e+3, val_total_loss=2.43e+3, train_total_loss_epoch=2.65e+3]
+
+Validation: |          | 0/? [00:00<?, ?it/s][A
+
+Validation:   0%|          | 0/120 [00:00<?, ?it/s][A
+
+Validation DataLoader 0:   0%|          | 0/120 [00:00<?, ?it/s][A
+
+Validation DataLoader 0:  17%|█▋        | 20/120 [00:23<01:58,  0.85it/s][A
+
+Validation DataLoader 0:  33%|███▎      | 40/120 [00:47<01:34,  0.84it/s][A
+
+Validation DataLoader 0:  50%|█████     | 60/120 [01:10<01:10,  0.85it/s][A
+
+Validation DataLoader 0:  67%|██████▋   | 80/120 [01:33<00:46,  0.85it/s][A
+
+Validation DataLoader 0:  83%|████████▎ | 100/120 [01:57<00:23,  0.85it/s][A
+
+Validation DataLoader 0: 100%|██████████| 120/120 [02:19<00:00,  0.86it/s][A
+
+                                                                          [A
+Epoch 2: 100%|██████████| 477/477 [03:04<00:00,  2.58it/s, v_num=z8of, train_total_loss_step=2.41e+3, val_total_loss=2.38e+3, train_total_loss_epoch=2.65e+3]
+Epoch 2: 100%|██████████| 477/477 [03:04<00:00,  2.58it/s, v_num=z8of, train_total_loss_step=2.41e+3, val_total_loss=2.38e+3, train_total_loss_epoch=2.51e+3]Metric val_total_loss improved by 48.301 >= min_delta = 0.0001. New best score: 2382.662
+
+Epoch 2:   0%|          | 0/477 [00:00<?, ?it/s, v_num=z8of, train_total_loss_step=2.41e+3, val_total_loss=2.38e+3, train_total_loss_epoch=2.51e+3]          
+Epoch 3:   0%|          | 0/477 [00:00<?, ?it/s, v_num=z8of, train_total_loss_step=2.41e+3, val_total_loss=2.38e+3, train_total_loss_epoch=2.51e+3]
+Epoch 3:   4%|▍         | 20/477 [00:02<00:52,  8.64it/s, v_num=z8of, train_total_loss_step=2.41e+3, val_total_loss=2.38e+3, train_total_loss_epoch=2.51e+3]
+Epoch 3:   4%|▍         | 20/477 [00:02<00:53,  8.57it/s, v_num=z8of, train_total_loss_step=2.38e+3, val_total_loss=2.38e+3, train_total_loss_epoch=2.51e+3]
+Epoch 3:   8%|▊         | 40/477 [00:04<00:45,  9.50it/s, v_num=z8of, train_total_loss_step=2.38e+3, val_total_loss=2.38e+3, train_total_loss_epoch=2.51e+3]
+Epoch 3:   8%|▊         | 40/477 [00:04<00:46,  9.45it/s, v_num=z8of, train_total_loss_step=2.57e+3, val_total_loss=2.38e+3, train_total_loss_epoch=2.51e+3]
+Epoch 3:  13%|█▎        | 60/477 [00:06<00:42,  9.81it/s, v_num=z8of, train_total_loss_step=2.57e+3, val_total_loss=2.38e+3, train_total_loss_epoch=2.51e+3]
+Epoch 3:  13%|█▎        | 60/477 [00:06<00:42,  9.78it/s, v_num=z8of, train_total_loss_step=2.98e+3, val_total_loss=2.38e+3, train_total_loss_epoch=2.51e+3]
+Epoch 3:  17%|█▋        | 80/477 [00:07<00:38, 10.26it/s, v_num=z8of, train_total_loss_step=2.98e+3, val_total_loss=2.38e+3, train_total_loss_epoch=2.51e+3]
+Epoch 3:  17%|█▋        | 80/477 [00:07<00:38, 10.24it/s, v_num=z8of, train_total_loss_step=2.42e+3, val_total_loss=2.38e+3, train_total_loss_epoch=2.51e+3]
+Epoch 3:  21%|██        | 100/477 [00:09<00:36, 10.30it/s, v_num=z8of, train_total_loss_step=2.42e+3, val_total_loss=2.38e+3, train_total_loss_epoch=2.51e+3]
+Epoch 3:  21%|██        | 100/477 [00:09<00:36, 10.28it/s, v_num=z8of, train_total_loss_step=2.41e+3, val_total_loss=2.38e+3, train_total_loss_epoch=2.51e+3]
+Epoch 3:  25%|██▌       | 120/477 [00:11<00:34, 10.33it/s, v_num=z8of, train_total_loss_step=2.41e+3, val_total_loss=2.38e+3, train_total_loss_epoch=2.51e+3]
+Epoch 3:  25%|██▌       | 120/477 [00:11<00:34, 10.32it/s, v_num=z8of, train_total_loss_step=2.33e+3, val_total_loss=2.38e+3, train_total_loss_epoch=2.51e+3]
+Epoch 3:  29%|██▉       | 140/477 [00:13<00:32, 10.44it/s, v_num=z8of, train_total_loss_step=2.33e+3, val_total_loss=2.38e+3, train_total_loss_epoch=2.51e+3]
+Epoch 3:  29%|██▉       | 140/477 [00:13<00:32, 10.42it/s, v_num=z8of, train_total_loss_step=2.43e+3, val_total_loss=2.38e+3, train_total_loss_epoch=2.51e+3]
+Epoch 3:  34%|███▎      | 160/477 [00:15<00:30, 10.43it/s, v_num=z8of, train_total_loss_step=2.43e+3, val_total_loss=2.38e+3, train_total_loss_epoch=2.51e+3]
+Epoch 3:  34%|███▎      | 160/477 [00:15<00:30, 10.42it/s, v_num=z8of, train_total_loss_step=2.49e+3, val_total_loss=2.38e+3, train_total_loss_epoch=2.51e+3]
+Epoch 3:  38%|███▊      | 180/477 [00:17<00:28, 10.56it/s, v_num=z8of, train_total_loss_step=2.49e+3, val_total_loss=2.38e+3, train_total_loss_epoch=2.51e+3]
+Epoch 3:  38%|███▊      | 180/477 [00:17<00:28, 10.53it/s, v_num=z8of, train_total_loss_step=2.45e+3, val_total_loss=2.38e+3, train_total_loss_epoch=2.51e+3]
+Epoch 3:  42%|████▏     | 200/477 [00:18<00:26, 10.62it/s, v_num=z8of, train_total_loss_step=2.45e+3, val_total_loss=2.38e+3, train_total_loss_epoch=2.51e+3]
+Epoch 3:  42%|████▏     | 200/477 [00:18<00:26, 10.61it/s, v_num=z8of, train_total_loss_step=2.42e+3, val_total_loss=2.38e+3, train_total_loss_epoch=2.51e+3]
+Epoch 3:  46%|████▌     | 220/477 [00:20<00:23, 10.72it/s, v_num=z8of, train_total_loss_step=2.42e+3, val_total_loss=2.38e+3, train_total_loss_epoch=2.51e+3]
+Epoch 3:  46%|████▌     | 220/477 [00:20<00:23, 10.71it/s, v_num=z8of, train_total_loss_step=2.47e+3, val_total_loss=2.38e+3, train_total_loss_epoch=2.51e+3]
+Epoch 3:  50%|█████     | 240/477 [00:22<00:22, 10.75it/s, v_num=z8of, train_total_loss_step=2.47e+3, val_total_loss=2.38e+3, train_total_loss_epoch=2.51e+3]
+Epoch 3:  50%|█████     | 240/477 [00:22<00:22, 10.74it/s, v_num=z8of, train_total_loss_step=2.46e+3, val_total_loss=2.38e+3, train_total_loss_epoch=2.51e+3]
+Epoch 3:  55%|█████▍    | 260/477 [00:24<00:20, 10.78it/s, v_num=z8of, train_total_loss_step=2.46e+3, val_total_loss=2.38e+3, train_total_loss_epoch=2.51e+3]
+Epoch 3:  55%|█████▍    | 260/477 [00:24<00:20, 10.77it/s, v_num=z8of, train_total_loss_step=2.48e+3, val_total_loss=2.38e+3, train_total_loss_epoch=2.51e+3]
+Epoch 3:  59%|█████▊    | 280/477 [00:26<00:18, 10.73it/s, v_num=z8of, train_total_loss_step=2.48e+3, val_total_loss=2.38e+3, train_total_loss_epoch=2.51e+3]
+Epoch 3:  59%|█████▊    | 280/477 [00:26<00:18, 10.72it/s, v_num=z8of, train_total_loss_step=2.46e+3, val_total_loss=2.38e+3, train_total_loss_epoch=2.51e+3]
+Epoch 3:  63%|██████▎   | 300/477 [00:28<00:16, 10.71it/s, v_num=z8of, train_total_loss_step=2.46e+3, val_total_loss=2.38e+3, train_total_loss_epoch=2.51e+3]
+Epoch 3:  63%|██████▎   | 300/477 [00:28<00:16, 10.70it/s, v_num=z8of, train_total_loss_step=2.48e+3, val_total_loss=2.38e+3, train_total_loss_epoch=2.51e+3]
+Epoch 3:  67%|██████▋   | 320/477 [00:29<00:14, 10.75it/s, v_num=z8of, train_total_loss_step=2.48e+3, val_total_loss=2.38e+3, train_total_loss_epoch=2.51e+3]
+Epoch 3:  67%|██████▋   | 320/477 [00:29<00:14, 10.74it/s, v_num=z8of, train_total_loss_step=2.52e+3, val_total_loss=2.38e+3, train_total_loss_epoch=2.51e+3]
+Epoch 3:  71%|███████▏  | 340/477 [00:31<00:12, 10.75it/s, v_num=z8of, train_total_loss_step=2.52e+3, val_total_loss=2.38e+3, train_total_loss_epoch=2.51e+3]
+Epoch 3:  71%|███████▏  | 340/477 [00:31<00:12, 10.74it/s, v_num=z8of, train_total_loss_step=2.49e+3, val_total_loss=2.38e+3, train_total_loss_epoch=2.51e+3]
+Epoch 3:  75%|███████▌  | 360/477 [00:33<00:10, 10.64it/s, v_num=z8of, train_total_loss_step=2.49e+3, val_total_loss=2.38e+3, train_total_loss_epoch=2.51e+3]
+Epoch 3:  75%|███████▌  | 360/477 [00:33<00:11, 10.62it/s, v_num=z8of, train_total_loss_step=2.54e+3, val_total_loss=2.38e+3, train_total_loss_epoch=2.51e+3]
+Epoch 3:  80%|███████▉  | 380/477 [00:35<00:09, 10.66it/s, v_num=z8of, train_total_loss_step=2.54e+3, val_total_loss=2.38e+3, train_total_loss_epoch=2.51e+3]
+Epoch 3:  80%|███████▉  | 380/477 [00:35<00:09, 10.66it/s, v_num=z8of, train_total_loss_step=2.4e+3, val_total_loss=2.38e+3, train_total_loss_epoch=2.51e+3] 
+Epoch 3:  84%|████████▍ | 400/477 [00:37<00:07, 10.65it/s, v_num=z8of, train_total_loss_step=2.4e+3, val_total_loss=2.38e+3, train_total_loss_epoch=2.51e+3]
+Epoch 3:  84%|████████▍ | 400/477 [00:37<00:07, 10.64it/s, v_num=z8of, train_total_loss_step=2.42e+3, val_total_loss=2.38e+3, train_total_loss_epoch=2.51e+3]
+Epoch 3:  88%|████████▊ | 420/477 [00:39<00:05, 10.63it/s, v_num=z8of, train_total_loss_step=2.42e+3, val_total_loss=2.38e+3, train_total_loss_epoch=2.51e+3]
+Epoch 3:  88%|████████▊ | 420/477 [00:39<00:05, 10.63it/s, v_num=z8of, train_total_loss_step=2.4e+3, val_total_loss=2.38e+3, train_total_loss_epoch=2.51e+3] 
+Epoch 3:  92%|█████████▏| 440/477 [00:41<00:03, 10.65it/s, v_num=z8of, train_total_loss_step=2.4e+3, val_total_loss=2.38e+3, train_total_loss_epoch=2.51e+3]
+Epoch 3:  92%|█████████▏| 440/477 [00:41<00:03, 10.64it/s, v_num=z8of, train_total_loss_step=2.41e+3, val_total_loss=2.38e+3, train_total_loss_epoch=2.51e+3]
+Epoch 3:  96%|█████████▋| 460/477 [00:43<00:01, 10.67it/s, v_num=z8of, train_total_loss_step=2.41e+3, val_total_loss=2.38e+3, train_total_loss_epoch=2.51e+3]
+Epoch 3:  96%|█████████▋| 460/477 [00:43<00:01, 10.66it/s, v_num=z8of, train_total_loss_step=2.45e+3, val_total_loss=2.38e+3, train_total_loss_epoch=2.51e+3]
+Epoch 3: 100%|██████████| 477/477 [00:44<00:00, 10.74it/s, v_num=z8of, train_total_loss_step=2.45e+3, val_total_loss=2.38e+3, train_total_loss_epoch=2.51e+3]
+Epoch 3: 100%|██████████| 477/477 [00:44<00:00, 10.73it/s, v_num=z8of, train_total_loss_step=2.41e+3, val_total_loss=2.38e+3, train_total_loss_epoch=2.51e+3]
+
+Validation: |          | 0/? [00:00<?, ?it/s][A
+
+Validation:   0%|          | 0/120 [00:00<?, ?it/s][A
+
+Validation DataLoader 0:   0%|          | 0/120 [00:00<?, ?it/s][A
+
+Validation DataLoader 0:  17%|█▋        | 20/120 [00:23<01:57,  0.85it/s][A
+
+Validation DataLoader 0:  33%|███▎      | 40/120 [00:46<01:33,  0.86it/s][A
+
+Validation DataLoader 0:  50%|█████     | 60/120 [01:10<01:10,  0.86it/s][A
+
+Validation DataLoader 0:  67%|██████▋   | 80/120 [01:32<00:46,  0.86it/s][A
+
+Validation DataLoader 0:  83%|████████▎ | 100/120 [01:55<00:23,  0.86it/s][A
+
+Validation DataLoader 0: 100%|██████████| 120/120 [02:18<00:00,  0.87it/s][A
+
+                                                                          [A
+Epoch 3: 100%|██████████| 477/477 [03:03<00:00,  2.60it/s, v_num=z8of, train_total_loss_step=2.41e+3, val_total_loss=2.39e+3, train_total_loss_epoch=2.51e+3]
+Epoch 3: 100%|██████████| 477/477 [03:03<00:00,  2.60it/s, v_num=z8of, train_total_loss_step=2.41e+3, val_total_loss=2.39e+3, train_total_loss_epoch=2.44e+3]
+Epoch 3:   0%|          | 0/477 [00:00<?, ?it/s, v_num=z8of, train_total_loss_step=2.41e+3, val_total_loss=2.39e+3, train_total_loss_epoch=2.44e+3]          
+Epoch 4:   0%|          | 0/477 [00:00<?, ?it/s, v_num=z8of, train_total_loss_step=2.41e+3, val_total_loss=2.39e+3, train_total_loss_epoch=2.44e+3]
+Epoch 4:   4%|▍         | 20/477 [00:02<01:00,  7.62it/s, v_num=z8of, train_total_loss_step=2.41e+3, val_total_loss=2.39e+3, train_total_loss_epoch=2.44e+3]
+Epoch 4:   4%|▍         | 20/477 [00:02<01:00,  7.56it/s, v_num=z8of, train_total_loss_step=2.39e+3, val_total_loss=2.39e+3, train_total_loss_epoch=2.44e+3]
+Epoch 4:   8%|▊         | 40/477 [00:04<00:49,  8.86it/s, v_num=z8of, train_total_loss_step=2.39e+3, val_total_loss=2.39e+3, train_total_loss_epoch=2.44e+3]
+Epoch 4:   8%|▊         | 40/477 [00:04<00:50,  8.73it/s, v_num=z8of, train_total_loss_step=2.53e+3, val_total_loss=2.39e+3, train_total_loss_epoch=2.44e+3]
+Epoch 4:  13%|█▎        | 60/477 [00:06<00:45,  9.19it/s, v_num=z8of, train_total_loss_step=2.53e+3, val_total_loss=2.39e+3, train_total_loss_epoch=2.44e+3]
+Epoch 4:  13%|█▎        | 60/477 [00:06<00:45,  9.12it/s, v_num=z8of, train_total_loss_step=2.41e+3, val_total_loss=2.39e+3, train_total_loss_epoch=2.44e+3]
+Epoch 4:  17%|█▋        | 80/477 [00:08<00:41,  9.50it/s, v_num=z8of, train_total_loss_step=2.41e+3, val_total_loss=2.39e+3, train_total_loss_epoch=2.44e+3]
+Epoch 4:  17%|█▋        | 80/477 [00:08<00:41,  9.48it/s, v_num=z8of, train_total_loss_step=2.46e+3, val_total_loss=2.39e+3, train_total_loss_epoch=2.44e+3]
+Epoch 4:  21%|██        | 100/477 [00:10<00:38,  9.70it/s, v_num=z8of, train_total_loss_step=2.46e+3, val_total_loss=2.39e+3, train_total_loss_epoch=2.44e+3]
+Epoch 4:  21%|██        | 100/477 [00:10<00:38,  9.68it/s, v_num=z8of, train_total_loss_step=2.5e+3, val_total_loss=2.39e+3, train_total_loss_epoch=2.44e+3] 
+Epoch 4:  25%|██▌       | 120/477 [00:11<00:35, 10.00it/s, v_num=z8of, train_total_loss_step=2.5e+3, val_total_loss=2.39e+3, train_total_loss_epoch=2.44e+3]
+Epoch 4:  25%|██▌       | 120/477 [00:12<00:35,  9.98it/s, v_num=z8of, train_total_loss_step=2.44e+3, val_total_loss=2.39e+3, train_total_loss_epoch=2.44e+3]
+Epoch 4:  29%|██▉       | 140/477 [00:13<00:32, 10.22it/s, v_num=z8of, train_total_loss_step=2.44e+3, val_total_loss=2.39e+3, train_total_loss_epoch=2.44e+3]
+Epoch 4:  29%|██▉       | 140/477 [00:13<00:33, 10.20it/s, v_num=z8of, train_total_loss_step=2.42e+3, val_total_loss=2.39e+3, train_total_loss_epoch=2.44e+3]
+Epoch 4:  34%|███▎      | 160/477 [00:15<00:30, 10.24it/s, v_num=z8of, train_total_loss_step=2.42e+3, val_total_loss=2.39e+3, train_total_loss_epoch=2.44e+3]
+Epoch 4:  34%|███▎      | 160/477 [00:15<00:30, 10.23it/s, v_num=z8of, train_total_loss_step=2.41e+3, val_total_loss=2.39e+3, train_total_loss_epoch=2.44e+3]
+Epoch 4:  38%|███▊      | 180/477 [00:17<00:29, 10.15it/s, v_num=z8of, train_total_loss_step=2.41e+3, val_total_loss=2.39e+3, train_total_loss_epoch=2.44e+3]
+Epoch 4:  38%|███▊      | 180/477 [00:17<00:29, 10.12it/s, v_num=z8of, train_total_loss_step=2.4e+3, val_total_loss=2.39e+3, train_total_loss_epoch=2.44e+3] 
+Epoch 4:  42%|████▏     | 200/477 [00:19<00:27, 10.21it/s, v_num=z8of, train_total_loss_step=2.4e+3, val_total_loss=2.39e+3, train_total_loss_epoch=2.44e+3]
+Epoch 4:  42%|████▏     | 200/477 [00:19<00:27, 10.20it/s, v_num=z8of, train_total_loss_step=2.46e+3, val_total_loss=2.39e+3, train_total_loss_epoch=2.44e+3]
+Epoch 4:  46%|████▌     | 220/477 [00:21<00:24, 10.31it/s, v_num=z8of, train_total_loss_step=2.46e+3, val_total_loss=2.39e+3, train_total_loss_epoch=2.44e+3]
+Epoch 4:  46%|████▌     | 220/477 [00:21<00:24, 10.30it/s, v_num=z8of, train_total_loss_step=2.45e+3, val_total_loss=2.39e+3, train_total_loss_epoch=2.44e+3]
+Epoch 4:  50%|█████     | 240/477 [00:23<00:22, 10.39it/s, v_num=z8of, train_total_loss_step=2.45e+3, val_total_loss=2.39e+3, train_total_loss_epoch=2.44e+3]
+Epoch 4:  50%|█████     | 240/477 [00:23<00:22, 10.38it/s, v_num=z8of, train_total_loss_step=2.33e+3, val_total_loss=2.39e+3, train_total_loss_epoch=2.44e+3]
+Epoch 4:  55%|█████▍    | 260/477 [00:25<00:20, 10.35it/s, v_num=z8of, train_total_loss_step=2.33e+3, val_total_loss=2.39e+3, train_total_loss_epoch=2.44e+3]
+Epoch 4:  55%|█████▍    | 260/477 [00:25<00:21, 10.32it/s, v_num=z8of, train_total_loss_step=2.49e+3, val_total_loss=2.39e+3, train_total_loss_epoch=2.44e+3]
+Epoch 4:  59%|█████▊    | 280/477 [00:26<00:18, 10.39it/s, v_num=z8of, train_total_loss_step=2.49e+3, val_total_loss=2.39e+3, train_total_loss_epoch=2.44e+3]
+Epoch 4:  59%|█████▊    | 280/477 [00:26<00:18, 10.38it/s, v_num=z8of, train_total_loss_step=2.39e+3, val_total_loss=2.39e+3, train_total_loss_epoch=2.44e+3]
+Epoch 4:  63%|██████▎   | 300/477 [00:28<00:17, 10.40it/s, v_num=z8of, train_total_loss_step=2.39e+3, val_total_loss=2.39e+3, train_total_loss_epoch=2.44e+3]
+Epoch 4:  63%|██████▎   | 300/477 [00:28<00:17, 10.39it/s, v_num=z8of, train_total_loss_step=2.43e+3, val_total_loss=2.39e+3, train_total_loss_epoch=2.44e+3]
+Epoch 4:  67%|██████▋   | 320/477 [00:30<00:15, 10.46it/s, v_num=z8of, train_total_loss_step=2.43e+3, val_total_loss=2.39e+3, train_total_loss_epoch=2.44e+3]
+Epoch 4:  67%|██████▋   | 320/477 [00:30<00:15, 10.45it/s, v_num=z8of, train_total_loss_step=2.48e+3, val_total_loss=2.39e+3, train_total_loss_epoch=2.44e+3]
+Epoch 4:  71%|███████▏  | 340/477 [00:32<00:13, 10.52it/s, v_num=z8of, train_total_loss_step=2.48e+3, val_total_loss=2.39e+3, train_total_loss_epoch=2.44e+3]
+Epoch 4:  71%|███████▏  | 340/477 [00:32<00:13, 10.52it/s, v_num=z8of, train_total_loss_step=2.4e+3, val_total_loss=2.39e+3, train_total_loss_epoch=2.44e+3] 
+Epoch 4:  75%|███████▌  | 360/477 [00:34<00:11, 10.53it/s, v_num=z8of, train_total_loss_step=2.4e+3, val_total_loss=2.39e+3, train_total_loss_epoch=2.44e+3]
+Epoch 4:  75%|███████▌  | 360/477 [00:34<00:11, 10.52it/s, v_num=z8of, train_total_loss_step=2.44e+3, val_total_loss=2.39e+3, train_total_loss_epoch=2.44e+3]
+Epoch 4:  80%|███████▉  | 380/477 [00:36<00:09, 10.55it/s, v_num=z8of, train_total_loss_step=2.44e+3, val_total_loss=2.39e+3, train_total_loss_epoch=2.44e+3]
+Epoch 4:  80%|███████▉  | 380/477 [00:36<00:09, 10.54it/s, v_num=z8of, train_total_loss_step=2.49e+3, val_total_loss=2.39e+3, train_total_loss_epoch=2.44e+3]
+Epoch 4:  84%|████████▍ | 400/477 [00:37<00:07, 10.53it/s, v_num=z8of, train_total_loss_step=2.49e+3, val_total_loss=2.39e+3, train_total_loss_epoch=2.44e+3]
+Epoch 4:  84%|████████▍ | 400/477 [00:38<00:07, 10.53it/s, v_num=z8of, train_total_loss_step=2.38e+3, val_total_loss=2.39e+3, train_total_loss_epoch=2.44e+3]
+Epoch 4:  88%|████████▊ | 420/477 [00:39<00:05, 10.56it/s, v_num=z8of, train_total_loss_step=2.38e+3, val_total_loss=2.39e+3, train_total_loss_epoch=2.44e+3]
+Epoch 4:  88%|████████▊ | 420/477 [00:39<00:05, 10.55it/s, v_num=z8of, train_total_loss_step=2.35e+3, val_total_loss=2.39e+3, train_total_loss_epoch=2.44e+3]
+Epoch 4:  92%|█████████▏| 440/477 [00:41<00:03, 10.60it/s, v_num=z8of, train_total_loss_step=2.35e+3, val_total_loss=2.39e+3, train_total_loss_epoch=2.44e+3]
+Epoch 4:  92%|█████████▏| 440/477 [00:41<00:03, 10.60it/s, v_num=z8of, train_total_loss_step=2.36e+3, val_total_loss=2.39e+3, train_total_loss_epoch=2.44e+3]
+Epoch 4:  96%|█████████▋| 460/477 [00:43<00:01, 10.62it/s, v_num=z8of, train_total_loss_step=2.36e+3, val_total_loss=2.39e+3, train_total_loss_epoch=2.44e+3]
+Epoch 4:  96%|█████████▋| 460/477 [00:43<00:01, 10.62it/s, v_num=z8of, train_total_loss_step=2.45e+3, val_total_loss=2.39e+3, train_total_loss_epoch=2.44e+3]
+Epoch 4: 100%|██████████| 477/477 [00:44<00:00, 10.75it/s, v_num=z8of, train_total_loss_step=2.45e+3, val_total_loss=2.39e+3, train_total_loss_epoch=2.44e+3]
+Epoch 4: 100%|██████████| 477/477 [00:44<00:00, 10.75it/s, v_num=z8of, train_total_loss_step=2.46e+3, val_total_loss=2.39e+3, train_total_loss_epoch=2.44e+3]
+
+Validation: |          | 0/? [00:00<?, ?it/s][A
+
+Validation:   0%|          | 0/120 [00:00<?, ?it/s][A
+
+Validation DataLoader 0:   0%|          | 0/120 [00:00<?, ?it/s][A
+
+Validation DataLoader 0:  17%|█▋        | 20/120 [00:23<01:58,  0.85it/s][A
+
+Validation DataLoader 0:  33%|███▎      | 40/120 [00:46<01:32,  0.87it/s][A
+
+Validation DataLoader 0:  50%|█████     | 60/120 [01:09<01:09,  0.86it/s][A
+
+Validation DataLoader 0:  67%|██████▋   | 80/120 [01:32<00:46,  0.86it/s][A
+
+Validation DataLoader 0:  83%|████████▎ | 100/120 [01:55<00:23,  0.86it/s][A
+
+Validation DataLoader 0: 100%|██████████| 120/120 [02:18<00:00,  0.87it/s][A
+
+                                                                          [A
+Epoch 4: 100%|██████████| 477/477 [03:03<00:00,  2.60it/s, v_num=z8of, train_total_loss_step=2.46e+3, val_total_loss=2.37e+3, train_total_loss_epoch=2.44e+3]
+Epoch 4: 100%|██████████| 477/477 [03:03<00:00,  2.60it/s, v_num=z8of, train_total_loss_step=2.46e+3, val_total_loss=2.37e+3, train_total_loss_epoch=2.43e+3]Metric val_total_loss improved by 10.344 >= min_delta = 0.0001. New best score: 2372.318
+
+Epoch 4:   0%|          | 0/477 [00:00<?, ?it/s, v_num=z8of, train_total_loss_step=2.46e+3, val_total_loss=2.37e+3, train_total_loss_epoch=2.43e+3]          
+Epoch 5:   0%|          | 0/477 [00:00<?, ?it/s, v_num=z8of, train_total_loss_step=2.46e+3, val_total_loss=2.37e+3, train_total_loss_epoch=2.43e+3]
+Epoch 5:   4%|▍         | 20/477 [00:02<01:03,  7.21it/s, v_num=z8of, train_total_loss_step=2.46e+3, val_total_loss=2.37e+3, train_total_loss_epoch=2.43e+3]
+Epoch 5:   4%|▍         | 20/477 [00:02<01:03,  7.16it/s, v_num=z8of, train_total_loss_step=2.35e+3, val_total_loss=2.37e+3, train_total_loss_epoch=2.43e+3]
+Epoch 5:   8%|▊         | 40/477 [00:04<00:49,  8.89it/s, v_num=z8of, train_total_loss_step=2.35e+3, val_total_loss=2.37e+3, train_total_loss_epoch=2.43e+3]
+Epoch 5:   8%|▊         | 40/477 [00:04<00:49,  8.85it/s, v_num=z8of, train_total_loss_step=2.36e+3, val_total_loss=2.37e+3, train_total_loss_epoch=2.43e+3]
+Epoch 5:  13%|█▎        | 60/477 [00:06<00:43,  9.52it/s, v_num=z8of, train_total_loss_step=2.36e+3, val_total_loss=2.37e+3, train_total_loss_epoch=2.43e+3]
+Epoch 5:  13%|█▎        | 60/477 [00:06<00:43,  9.49it/s, v_num=z8of, train_total_loss_step=2.39e+3, val_total_loss=2.37e+3, train_total_loss_epoch=2.43e+3]
+Epoch 5:  17%|█▋        | 80/477 [00:08<00:40,  9.89it/s, v_num=z8of, train_total_loss_step=2.39e+3, val_total_loss=2.37e+3, train_total_loss_epoch=2.43e+3]
+Epoch 5:  17%|█▋        | 80/477 [00:08<00:40,  9.87it/s, v_num=z8of, train_total_loss_step=2.37e+3, val_total_loss=2.37e+3, train_total_loss_epoch=2.43e+3]
+Epoch 5:  21%|██        | 100/477 [00:09<00:36, 10.21it/s, v_num=z8of, train_total_loss_step=2.37e+3, val_total_loss=2.37e+3, train_total_loss_epoch=2.43e+3]
+Epoch 5:  21%|██        | 100/477 [00:09<00:37, 10.19it/s, v_num=z8of, train_total_loss_step=2.43e+3, val_total_loss=2.37e+3, train_total_loss_epoch=2.43e+3]
+Epoch 5:  25%|██▌       | 120/477 [00:11<00:34, 10.42it/s, v_num=z8of, train_total_loss_step=2.43e+3, val_total_loss=2.37e+3, train_total_loss_epoch=2.43e+3]
+Epoch 5:  25%|██▌       | 120/477 [00:11<00:34, 10.38it/s, v_num=z8of, train_total_loss_step=2.45e+3, val_total_loss=2.37e+3, train_total_loss_epoch=2.43e+3]
+Epoch 5:  29%|██▉       | 140/477 [00:13<00:32, 10.48it/s, v_num=z8of, train_total_loss_step=2.45e+3, val_total_loss=2.37e+3, train_total_loss_epoch=2.43e+3]
+Epoch 5:  29%|██▉       | 140/477 [00:13<00:32, 10.46it/s, v_num=z8of, train_total_loss_step=2.43e+3, val_total_loss=2.37e+3, train_total_loss_epoch=2.43e+3]
+Epoch 5:  34%|███▎      | 160/477 [00:15<00:29, 10.59it/s, v_num=z8of, train_total_loss_step=2.43e+3, val_total_loss=2.37e+3, train_total_loss_epoch=2.43e+3]
+Epoch 5:  34%|███▎      | 160/477 [00:15<00:30, 10.56it/s, v_num=z8of, train_total_loss_step=2.36e+3, val_total_loss=2.37e+3, train_total_loss_epoch=2.43e+3]
+Epoch 5:  38%|███▊      | 180/477 [00:16<00:28, 10.59it/s, v_num=z8of, train_total_loss_step=2.36e+3, val_total_loss=2.37e+3, train_total_loss_epoch=2.43e+3]
+Epoch 5:  38%|███▊      | 180/477 [00:17<00:28, 10.58it/s, v_num=z8of, train_total_loss_step=2.35e+3, val_total_loss=2.37e+3, train_total_loss_epoch=2.43e+3]
+Epoch 5:  42%|████▏     | 200/477 [00:18<00:26, 10.60it/s, v_num=z8of, train_total_loss_step=2.35e+3, val_total_loss=2.37e+3, train_total_loss_epoch=2.43e+3]
+Epoch 5:  42%|████▏     | 200/477 [00:18<00:26, 10.59it/s, v_num=z8of, train_total_loss_step=2.38e+3, val_total_loss=2.37e+3, train_total_loss_epoch=2.43e+3]
+Epoch 5:  46%|████▌     | 220/477 [00:20<00:24, 10.67it/s, v_num=z8of, train_total_loss_step=2.38e+3, val_total_loss=2.37e+3, train_total_loss_epoch=2.43e+3]
+Epoch 5:  46%|████▌     | 220/477 [00:20<00:24, 10.65it/s, v_num=z8of, train_total_loss_step=2.42e+3, val_total_loss=2.37e+3, train_total_loss_epoch=2.43e+3]
+Epoch 5:  50%|█████     | 240/477 [00:22<00:22, 10.77it/s, v_num=z8of, train_total_loss_step=2.42e+3, val_total_loss=2.37e+3, train_total_loss_epoch=2.43e+3]
+Epoch 5:  50%|█████     | 240/477 [00:22<00:22, 10.76it/s, v_num=z8of, train_total_loss_step=2.41e+3, val_total_loss=2.37e+3, train_total_loss_epoch=2.43e+3]
+Epoch 5:  55%|█████▍    | 260/477 [00:23<00:19, 10.88it/s, v_num=z8of, train_total_loss_step=2.41e+3, val_total_loss=2.37e+3, train_total_loss_epoch=2.43e+3]
+Epoch 5:  55%|█████▍    | 260/477 [00:23<00:19, 10.87it/s, v_num=z8of, train_total_loss_step=2.37e+3, val_total_loss=2.37e+3, train_total_loss_epoch=2.43e+3]
+Epoch 5:  59%|█████▊    | 280/477 [00:25<00:18, 10.87it/s, v_num=z8of, train_total_loss_step=2.37e+3, val_total_loss=2.37e+3, train_total_loss_epoch=2.43e+3]
+Epoch 5:  59%|█████▊    | 280/477 [00:25<00:18, 10.86it/s, v_num=z8of, train_total_loss_step=2.4e+3, val_total_loss=2.37e+3, train_total_loss_epoch=2.43e+3] 
+Epoch 5:  63%|██████▎   | 300/477 [00:27<00:16, 10.88it/s, v_num=z8of, train_total_loss_step=2.4e+3, val_total_loss=2.37e+3, train_total_loss_epoch=2.43e+3]
+Epoch 5:  63%|██████▎   | 300/477 [00:27<00:16, 10.87it/s, v_num=z8of, train_total_loss_step=2.41e+3, val_total_loss=2.37e+3, train_total_loss_epoch=2.43e+3]
+Epoch 5:  67%|██████▋   | 320/477 [00:29<00:14, 10.93it/s, v_num=z8of, train_total_loss_step=2.41e+3, val_total_loss=2.37e+3, train_total_loss_epoch=2.43e+3]
+Epoch 5:  67%|██████▋   | 320/477 [00:29<00:14, 10.92it/s, v_num=z8of, train_total_loss_step=2.41e+3, val_total_loss=2.37e+3, train_total_loss_epoch=2.43e+3]
+Epoch 5:  71%|███████▏  | 340/477 [00:30<00:12, 10.98it/s, v_num=z8of, train_total_loss_step=2.41e+3, val_total_loss=2.37e+3, train_total_loss_epoch=2.43e+3]
+Epoch 5:  71%|███████▏  | 340/477 [00:31<00:12, 10.97it/s, v_num=z8of, train_total_loss_step=2.38e+3, val_total_loss=2.37e+3, train_total_loss_epoch=2.43e+3]
+Epoch 5:  75%|███████▌  | 360/477 [00:32<00:10, 10.94it/s, v_num=z8of, train_total_loss_step=2.38e+3, val_total_loss=2.37e+3, train_total_loss_epoch=2.43e+3]
+Epoch 5:  75%|███████▌  | 360/477 [00:32<00:10, 10.94it/s, v_num=z8of, train_total_loss_step=2.43e+3, val_total_loss=2.37e+3, train_total_loss_epoch=2.43e+3]
+Epoch 5:  80%|███████▉  | 380/477 [00:34<00:08, 10.99it/s, v_num=z8of, train_total_loss_step=2.43e+3, val_total_loss=2.37e+3, train_total_loss_epoch=2.43e+3]
+Epoch 5:  80%|███████▉  | 380/477 [00:34<00:08, 10.98it/s, v_num=z8of, train_total_loss_step=2.48e+3, val_total_loss=2.37e+3, train_total_loss_epoch=2.43e+3]
+Epoch 5:  84%|████████▍ | 400/477 [00:36<00:07, 11.00it/s, v_num=z8of, train_total_loss_step=2.48e+3, val_total_loss=2.37e+3, train_total_loss_epoch=2.43e+3]
+Epoch 5:  84%|████████▍ | 400/477 [00:36<00:07, 10.99it/s, v_num=z8of, train_total_loss_step=2.32e+3, val_total_loss=2.37e+3, train_total_loss_epoch=2.43e+3]
+Epoch 5:  88%|████████▊ | 420/477 [00:38<00:05, 10.94it/s, v_num=z8of, train_total_loss_step=2.32e+3, val_total_loss=2.37e+3, train_total_loss_epoch=2.43e+3]
+Epoch 5:  88%|████████▊ | 420/477 [00:38<00:05, 10.94it/s, v_num=z8of, train_total_loss_step=2.34e+3, val_total_loss=2.37e+3, train_total_loss_epoch=2.43e+3]
+Epoch 5:  92%|█████████▏| 440/477 [00:40<00:03, 10.93it/s, v_num=z8of, train_total_loss_step=2.34e+3, val_total_loss=2.37e+3, train_total_loss_epoch=2.43e+3]
+Epoch 5:  92%|█████████▏| 440/477 [00:40<00:03, 10.92it/s, v_num=z8of, train_total_loss_step=2.42e+3, val_total_loss=2.37e+3, train_total_loss_epoch=2.43e+3]
+Epoch 5:  96%|█████████▋| 460/477 [00:41<00:01, 10.96it/s, v_num=z8of, train_total_loss_step=2.42e+3, val_total_loss=2.37e+3, train_total_loss_epoch=2.43e+3]
+Epoch 5:  96%|█████████▋| 460/477 [00:41<00:01, 10.95it/s, v_num=z8of, train_total_loss_step=2.37e+3, val_total_loss=2.37e+3, train_total_loss_epoch=2.43e+3]
+Epoch 5: 100%|██████████| 477/477 [00:43<00:00, 11.03it/s, v_num=z8of, train_total_loss_step=2.37e+3, val_total_loss=2.37e+3, train_total_loss_epoch=2.43e+3]
+Epoch 5: 100%|██████████| 477/477 [00:43<00:00, 11.02it/s, v_num=z8of, train_total_loss_step=2.61e+3, val_total_loss=2.37e+3, train_total_loss_epoch=2.43e+3]
+
+Validation: |          | 0/? [00:00<?, ?it/s][A
+
+Validation:   0%|          | 0/120 [00:00<?, ?it/s][A
+
+Validation DataLoader 0:   0%|          | 0/120 [00:00<?, ?it/s][A
+
+Validation DataLoader 0:  17%|█▋        | 20/120 [00:20<01:44,  0.96it/s][A
+
+Validation DataLoader 0:  33%|███▎      | 40/120 [00:38<01:17,  1.03it/s][A
+
+Validation DataLoader 0:  50%|█████     | 60/120 [00:57<00:57,  1.04it/s][A
+
+Validation DataLoader 0:  67%|██████▋   | 80/120 [01:16<00:38,  1.05it/s][A
+
+Validation DataLoader 0:  83%|████████▎ | 100/120 [01:35<00:19,  1.05it/s][A
+
+Validation DataLoader 0: 100%|██████████| 120/120 [01:53<00:00,  1.06it/s][A
+
+                                                                          [A
+Epoch 5: 100%|██████████| 477/477 [02:39<00:00,  2.98it/s, v_num=z8of, train_total_loss_step=2.61e+3, val_total_loss=2.35e+3, train_total_loss_epoch=2.43e+3]
+Epoch 5: 100%|██████████| 477/477 [02:39<00:00,  2.98it/s, v_num=z8of, train_total_loss_step=2.61e+3, val_total_loss=2.35e+3, train_total_loss_epoch=2.41e+3]Metric val_total_loss improved by 18.150 >= min_delta = 0.0001. New best score: 2354.168
+
+Epoch 5:   0%|          | 0/477 [00:00<?, ?it/s, v_num=z8of, train_total_loss_step=2.61e+3, val_total_loss=2.35e+3, train_total_loss_epoch=2.41e+3]          
+Epoch 6:   0%|          | 0/477 [00:00<?, ?it/s, v_num=z8of, train_total_loss_step=2.61e+3, val_total_loss=2.35e+3, train_total_loss_epoch=2.41e+3]
+Epoch 6:   4%|▍         | 20/477 [00:01<00:33, 13.47it/s, v_num=z8of, train_total_loss_step=2.61e+3, val_total_loss=2.35e+3, train_total_loss_epoch=2.41e+3]
+Epoch 6:   4%|▍         | 20/477 [00:01<00:34, 13.29it/s, v_num=z8of, train_total_loss_step=2.46e+3, val_total_loss=2.35e+3, train_total_loss_epoch=2.41e+3]
+Epoch 6:   8%|▊         | 40/477 [00:02<00:32, 13.54it/s, v_num=z8of, train_total_loss_step=2.46e+3, val_total_loss=2.35e+3, train_total_loss_epoch=2.41e+3]
+Epoch 6:   8%|▊         | 40/477 [00:02<00:32, 13.44it/s, v_num=z8of, train_total_loss_step=2.46e+3, val_total_loss=2.35e+3, train_total_loss_epoch=2.41e+3]
+Epoch 6:  13%|█▎        | 60/477 [00:04<00:28, 14.57it/s, v_num=z8of, train_total_loss_step=2.46e+3, val_total_loss=2.35e+3, train_total_loss_epoch=2.41e+3]
+Epoch 6:  13%|█▎        | 60/477 [00:04<00:28, 14.48it/s, v_num=z8of, train_total_loss_step=2.45e+3, val_total_loss=2.35e+3, train_total_loss_epoch=2.41e+3]
+Epoch 6:  17%|█▋        | 80/477 [00:05<00:26, 15.08it/s, v_num=z8of, train_total_loss_step=2.45e+3, val_total_loss=2.35e+3, train_total_loss_epoch=2.41e+3]
+Epoch 6:  17%|█▋        | 80/477 [00:05<00:26, 15.02it/s, v_num=z8of, train_total_loss_step=2.39e+3, val_total_loss=2.35e+3, train_total_loss_epoch=2.41e+3]
+Epoch 6:  21%|██        | 100/477 [00:06<00:24, 15.30it/s, v_num=z8of, train_total_loss_step=2.39e+3, val_total_loss=2.35e+3, train_total_loss_epoch=2.41e+3]
+Epoch 6:  21%|██        | 100/477 [00:06<00:24, 15.25it/s, v_num=z8of, train_total_loss_step=2.46e+3, val_total_loss=2.35e+3, train_total_loss_epoch=2.41e+3]
+Epoch 6:  25%|██▌       | 120/477 [00:07<00:22, 15.53it/s, v_num=z8of, train_total_loss_step=2.46e+3, val_total_loss=2.35e+3, train_total_loss_epoch=2.41e+3]
+Epoch 6:  25%|██▌       | 120/477 [00:07<00:23, 15.49it/s, v_num=z8of, train_total_loss_step=2.42e+3, val_total_loss=2.35e+3, train_total_loss_epoch=2.41e+3]
+Epoch 6:  29%|██▉       | 140/477 [00:08<00:21, 15.58it/s, v_num=z8of, train_total_loss_step=2.42e+3, val_total_loss=2.35e+3, train_total_loss_epoch=2.41e+3]
+Epoch 6:  29%|██▉       | 140/477 [00:09<00:21, 15.55it/s, v_num=z8of, train_total_loss_step=2.35e+3, val_total_loss=2.35e+3, train_total_loss_epoch=2.41e+3]
+Epoch 6:  34%|███▎      | 160/477 [00:10<00:20, 15.73it/s, v_num=z8of, train_total_loss_step=2.35e+3, val_total_loss=2.35e+3, train_total_loss_epoch=2.41e+3]
+Epoch 6:  34%|███▎      | 160/477 [00:10<00:20, 15.70it/s, v_num=z8of, train_total_loss_step=2.37e+3, val_total_loss=2.35e+3, train_total_loss_epoch=2.41e+3]
+Epoch 6:  38%|███▊      | 180/477 [00:11<00:18, 15.81it/s, v_num=z8of, train_total_loss_step=2.37e+3, val_total_loss=2.35e+3, train_total_loss_epoch=2.41e+3]
+Epoch 6:  38%|███▊      | 180/477 [00:11<00:18, 15.78it/s, v_num=z8of, train_total_loss_step=2.38e+3, val_total_loss=2.35e+3, train_total_loss_epoch=2.41e+3]
+Epoch 6:  42%|████▏     | 200/477 [00:12<00:17, 15.82it/s, v_num=z8of, train_total_loss_step=2.38e+3, val_total_loss=2.35e+3, train_total_loss_epoch=2.41e+3]
+Epoch 6:  42%|████▏     | 200/477 [00:12<00:17, 15.80it/s, v_num=z8of, train_total_loss_step=2.34e+3, val_total_loss=2.35e+3, train_total_loss_epoch=2.41e+3]
+Epoch 6:  46%|████▌     | 220/477 [00:13<00:16, 15.92it/s, v_num=z8of, train_total_loss_step=2.34e+3, val_total_loss=2.35e+3, train_total_loss_epoch=2.41e+3]
+Epoch 6:  46%|████▌     | 220/477 [00:13<00:16, 15.90it/s, v_num=z8of, train_total_loss_step=2.33e+3, val_total_loss=2.35e+3, train_total_loss_epoch=2.41e+3]
+Epoch 6:  50%|█████     | 240/477 [00:15<00:14, 15.91it/s, v_num=z8of, train_total_loss_step=2.33e+3, val_total_loss=2.35e+3, train_total_loss_epoch=2.41e+3]
+Epoch 6:  50%|█████     | 240/477 [00:15<00:14, 15.89it/s, v_num=z8of, train_total_loss_step=2.38e+3, val_total_loss=2.35e+3, train_total_loss_epoch=2.41e+3]
+Epoch 6:  55%|█████▍    | 260/477 [00:16<00:13, 16.00it/s, v_num=z8of, train_total_loss_step=2.38e+3, val_total_loss=2.35e+3, train_total_loss_epoch=2.41e+3]
+Epoch 6:  55%|█████▍    | 260/477 [00:16<00:13, 15.97it/s, v_num=z8of, train_total_loss_step=2.4e+3, val_total_loss=2.35e+3, train_total_loss_epoch=2.41e+3] 
+Epoch 6:  59%|█████▊    | 280/477 [00:17<00:12, 16.04it/s, v_num=z8of, train_total_loss_step=2.4e+3, val_total_loss=2.35e+3, train_total_loss_epoch=2.41e+3]
+Epoch 6:  59%|█████▊    | 280/477 [00:17<00:12, 16.02it/s, v_num=z8of, train_total_loss_step=2.4e+3, val_total_loss=2.35e+3, train_total_loss_epoch=2.41e+3]
+Epoch 6:  63%|██████▎   | 300/477 [00:18<00:11, 15.92it/s, v_num=z8of, train_total_loss_step=2.4e+3, val_total_loss=2.35e+3, train_total_loss_epoch=2.41e+3]
+Epoch 6:  63%|██████▎   | 300/477 [00:18<00:11, 15.89it/s, v_num=z8of, train_total_loss_step=2.48e+3, val_total_loss=2.35e+3, train_total_loss_epoch=2.41e+3]
+Epoch 6:  67%|██████▋   | 320/477 [00:20<00:09, 15.94it/s, v_num=z8of, train_total_loss_step=2.48e+3, val_total_loss=2.35e+3, train_total_loss_epoch=2.41e+3]
+Epoch 6:  67%|██████▋   | 320/477 [00:20<00:09, 15.93it/s, v_num=z8of, train_total_loss_step=2.38e+3, val_total_loss=2.35e+3, train_total_loss_epoch=2.41e+3]
+Epoch 6:  71%|███████▏  | 340/477 [00:21<00:08, 15.82it/s, v_num=z8of, train_total_loss_step=2.38e+3, val_total_loss=2.35e+3, train_total_loss_epoch=2.41e+3]
+Epoch 6:  71%|███████▏  | 340/477 [00:21<00:08, 15.80it/s, v_num=z8of, train_total_loss_step=2.39e+3, val_total_loss=2.35e+3, train_total_loss_epoch=2.41e+3]
+Epoch 6:  75%|███████▌  | 360/477 [00:22<00:07, 15.82it/s, v_num=z8of, train_total_loss_step=2.39e+3, val_total_loss=2.35e+3, train_total_loss_epoch=2.41e+3]
+Epoch 6:  75%|███████▌  | 360/477 [00:22<00:07, 15.80it/s, v_num=z8of, train_total_loss_step=2.4e+3, val_total_loss=2.35e+3, train_total_loss_epoch=2.41e+3] 
+Epoch 6:  80%|███████▉  | 380/477 [00:23<00:06, 15.86it/s, v_num=z8of, train_total_loss_step=2.4e+3, val_total_loss=2.35e+3, train_total_loss_epoch=2.41e+3]
+Epoch 6:  80%|███████▉  | 380/477 [00:23<00:06, 15.85it/s, v_num=z8of, train_total_loss_step=2.36e+3, val_total_loss=2.35e+3, train_total_loss_epoch=2.41e+3]
+Epoch 6:  84%|████████▍ | 400/477 [00:25<00:04, 15.77it/s, v_num=z8of, train_total_loss_step=2.36e+3, val_total_loss=2.35e+3, train_total_loss_epoch=2.41e+3]
+Epoch 6:  84%|████████▍ | 400/477 [00:25<00:04, 15.76it/s, v_num=z8of, train_total_loss_step=2.4e+3, val_total_loss=2.35e+3, train_total_loss_epoch=2.41e+3] 
+Epoch 6:  88%|████████▊ | 420/477 [00:26<00:03, 15.80it/s, v_num=z8of, train_total_loss_step=2.4e+3, val_total_loss=2.35e+3, train_total_loss_epoch=2.41e+3]
+Epoch 6:  88%|████████▊ | 420/477 [00:26<00:03, 15.79it/s, v_num=z8of, train_total_loss_step=2.44e+3, val_total_loss=2.35e+3, train_total_loss_epoch=2.41e+3]
+Epoch 6:  92%|█████████▏| 440/477 [00:27<00:02, 15.73it/s, v_num=z8of, train_total_loss_step=2.44e+3, val_total_loss=2.35e+3, train_total_loss_epoch=2.41e+3]
+Epoch 6:  92%|█████████▏| 440/477 [00:27<00:02, 15.71it/s, v_num=z8of, train_total_loss_step=2.45e+3, val_total_loss=2.35e+3, train_total_loss_epoch=2.41e+3]
+Epoch 6:  96%|█████████▋| 460/477 [00:29<00:01, 15.75it/s, v_num=z8of, train_total_loss_step=2.45e+3, val_total_loss=2.35e+3, train_total_loss_epoch=2.41e+3]
+Epoch 6:  96%|█████████▋| 460/477 [00:29<00:01, 15.74it/s, v_num=z8of, train_total_loss_step=2.38e+3, val_total_loss=2.35e+3, train_total_loss_epoch=2.41e+3]
+Epoch 6: 100%|██████████| 477/477 [00:30<00:00, 15.87it/s, v_num=z8of, train_total_loss_step=2.38e+3, val_total_loss=2.35e+3, train_total_loss_epoch=2.41e+3]
+Epoch 6: 100%|██████████| 477/477 [00:30<00:00, 15.85it/s, v_num=z8of, train_total_loss_step=2.4e+3, val_total_loss=2.35e+3, train_total_loss_epoch=2.41e+3] 
+
+Validation: |          | 0/? [00:00<?, ?it/s][A
+
+Validation:   0%|          | 0/120 [00:00<?, ?it/s][A
+
+Validation DataLoader 0:   0%|          | 0/120 [00:00<?, ?it/s][A
+
+Validation DataLoader 0:  17%|█▋        | 20/120 [00:18<01:31,  1.09it/s][A
+
+Validation DataLoader 0:  33%|███▎      | 40/120 [00:36<01:13,  1.09it/s][A
+
+Validation DataLoader 0:  50%|█████     | 60/120 [00:55<00:55,  1.09it/s][A
+
+Validation DataLoader 0:  67%|██████▋   | 80/120 [01:12<00:36,  1.10it/s][A
+
+Validation DataLoader 0:  83%|████████▎ | 100/120 [01:31<00:18,  1.10it/s][A
+
+Validation DataLoader 0: 100%|██████████| 120/120 [01:48<00:00,  1.11it/s][A
+
+                                                                          [A
+Epoch 6: 100%|██████████| 477/477 [02:18<00:00,  3.43it/s, v_num=z8of, train_total_loss_step=2.4e+3, val_total_loss=2.35e+3, train_total_loss_epoch=2.41e+3]
+Epoch 6: 100%|██████████| 477/477 [02:18<00:00,  3.43it/s, v_num=z8of, train_total_loss_step=2.4e+3, val_total_loss=2.35e+3, train_total_loss_epoch=2.4e+3] Metric val_total_loss improved by 3.008 >= min_delta = 0.0001. New best score: 2351.160
+
+Epoch 6:   0%|          | 0/477 [00:00<?, ?it/s, v_num=z8of, train_total_loss_step=2.4e+3, val_total_loss=2.35e+3, train_total_loss_epoch=2.4e+3]          
+Epoch 7:   0%|          | 0/477 [00:00<?, ?it/s, v_num=z8of, train_total_loss_step=2.4e+3, val_total_loss=2.35e+3, train_total_loss_epoch=2.4e+3]
+Epoch 7:   4%|▍         | 20/477 [00:01<00:38, 11.95it/s, v_num=z8of, train_total_loss_step=2.4e+3, val_total_loss=2.35e+3, train_total_loss_epoch=2.4e+3]
+Epoch 7:   4%|▍         | 20/477 [00:01<00:38, 11.80it/s, v_num=z8of, train_total_loss_step=2.46e+3, val_total_loss=2.35e+3, train_total_loss_epoch=2.4e+3]
+Epoch 7:   8%|▊         | 40/477 [00:02<00:31, 13.85it/s, v_num=z8of, train_total_loss_step=2.46e+3, val_total_loss=2.35e+3, train_total_loss_epoch=2.4e+3]
+Epoch 7:   8%|▊         | 40/477 [00:02<00:31, 13.75it/s, v_num=z8of, train_total_loss_step=2.39e+3, val_total_loss=2.35e+3, train_total_loss_epoch=2.4e+3]
+Epoch 7:  13%|█▎        | 60/477 [00:04<00:28, 14.57it/s, v_num=z8of, train_total_loss_step=2.39e+3, val_total_loss=2.35e+3, train_total_loss_epoch=2.4e+3]
+Epoch 7:  13%|█▎        | 60/477 [00:04<00:28, 14.50it/s, v_num=z8of, train_total_loss_step=2.49e+3, val_total_loss=2.35e+3, train_total_loss_epoch=2.4e+3]
+Epoch 7:  17%|█▋        | 80/477 [00:05<00:27, 14.61it/s, v_num=z8of, train_total_loss_step=2.49e+3, val_total_loss=2.35e+3, train_total_loss_epoch=2.4e+3]
+Epoch 7:  17%|█▋        | 80/477 [00:05<00:27, 14.55it/s, v_num=z8of, train_total_loss_step=2.34e+3, val_total_loss=2.35e+3, train_total_loss_epoch=2.4e+3]
+Epoch 7:  21%|██        | 100/477 [00:06<00:25, 15.02it/s, v_num=z8of, train_total_loss_step=2.34e+3, val_total_loss=2.35e+3, train_total_loss_epoch=2.4e+3]
+Epoch 7:  21%|██        | 100/477 [00:06<00:25, 14.97it/s, v_num=z8of, train_total_loss_step=2.35e+3, val_total_loss=2.35e+3, train_total_loss_epoch=2.4e+3]
+Epoch 7:  25%|██▌       | 120/477 [00:07<00:23, 15.11it/s, v_num=z8of, train_total_loss_step=2.35e+3, val_total_loss=2.35e+3, train_total_loss_epoch=2.4e+3]
+Epoch 7:  25%|██▌       | 120/477 [00:07<00:23, 15.07it/s, v_num=z8of, train_total_loss_step=2.33e+3, val_total_loss=2.35e+3, train_total_loss_epoch=2.4e+3]
+Epoch 7:  29%|██▉       | 140/477 [00:09<00:22, 15.30it/s, v_num=z8of, train_total_loss_step=2.33e+3, val_total_loss=2.35e+3, train_total_loss_epoch=2.4e+3]
+Epoch 7:  29%|██▉       | 140/477 [00:09<00:22, 15.27it/s, v_num=z8of, train_total_loss_step=2.29e+3, val_total_loss=2.35e+3, train_total_loss_epoch=2.4e+3]
+Epoch 7:  34%|███▎      | 160/477 [00:10<00:20, 15.43it/s, v_num=z8of, train_total_loss_step=2.29e+3, val_total_loss=2.35e+3, train_total_loss_epoch=2.4e+3]
+Epoch 7:  34%|███▎      | 160/477 [00:10<00:20, 15.40it/s, v_num=z8of, train_total_loss_step=2.38e+3, val_total_loss=2.35e+3, train_total_loss_epoch=2.4e+3]
+Epoch 7:  38%|███▊      | 180/477 [00:11<00:19, 15.49it/s, v_num=z8of, train_total_loss_step=2.38e+3, val_total_loss=2.35e+3, train_total_loss_epoch=2.4e+3]
+Epoch 7:  38%|███▊      | 180/477 [00:11<00:19, 15.46it/s, v_num=z8of, train_total_loss_step=2.45e+3, val_total_loss=2.35e+3, train_total_loss_epoch=2.4e+3]
+Epoch 7:  42%|████▏     | 200/477 [00:12<00:17, 15.66it/s, v_num=z8of, train_total_loss_step=2.45e+3, val_total_loss=2.35e+3, train_total_loss_epoch=2.4e+3]
+Epoch 7:  42%|████▏     | 200/477 [00:12<00:17, 15.64it/s, v_num=z8of, train_total_loss_step=2.45e+3, val_total_loss=2.35e+3, train_total_loss_epoch=2.4e+3]
+Epoch 7:  46%|████▌     | 220/477 [00:14<00:16, 15.65it/s, v_num=z8of, train_total_loss_step=2.45e+3, val_total_loss=2.35e+3, train_total_loss_epoch=2.4e+3]
+Epoch 7:  46%|████▌     | 220/477 [00:14<00:16, 15.62it/s, v_num=z8of, train_total_loss_step=2.36e+3, val_total_loss=2.35e+3, train_total_loss_epoch=2.4e+3]
+Epoch 7:  50%|█████     | 240/477 [00:15<00:15, 15.70it/s, v_num=z8of, train_total_loss_step=2.36e+3, val_total_loss=2.35e+3, train_total_loss_epoch=2.4e+3]
+Epoch 7:  50%|█████     | 240/477 [00:15<00:15, 15.68it/s, v_num=z8of, train_total_loss_step=2.37e+3, val_total_loss=2.35e+3, train_total_loss_epoch=2.4e+3]
+Epoch 7:  55%|█████▍    | 260/477 [00:16<00:13, 15.79it/s, v_num=z8of, train_total_loss_step=2.37e+3, val_total_loss=2.35e+3, train_total_loss_epoch=2.4e+3]
+Epoch 7:  55%|█████▍    | 260/477 [00:16<00:13, 15.77it/s, v_num=z8of, train_total_loss_step=2.34e+3, val_total_loss=2.35e+3, train_total_loss_epoch=2.4e+3]
+Epoch 7:  59%|█████▊    | 280/477 [00:17<00:12, 15.81it/s, v_num=z8of, train_total_loss_step=2.34e+3, val_total_loss=2.35e+3, train_total_loss_epoch=2.4e+3]
+Epoch 7:  59%|█████▊    | 280/477 [00:17<00:12, 15.79it/s, v_num=z8of, train_total_loss_step=2.38e+3, val_total_loss=2.35e+3, train_total_loss_epoch=2.4e+3]
+Epoch 7:  63%|██████▎   | 300/477 [00:18<00:11, 15.87it/s, v_num=z8of, train_total_loss_step=2.38e+3, val_total_loss=2.35e+3, train_total_loss_epoch=2.4e+3]
+Epoch 7:  63%|██████▎   | 300/477 [00:18<00:11, 15.86it/s, v_num=z8of, train_total_loss_step=2.44e+3, val_total_loss=2.35e+3, train_total_loss_epoch=2.4e+3]
+Epoch 7:  67%|██████▋   | 320/477 [00:20<00:09, 15.90it/s, v_num=z8of, train_total_loss_step=2.44e+3, val_total_loss=2.35e+3, train_total_loss_epoch=2.4e+3]
+Epoch 7:  67%|██████▋   | 320/477 [00:20<00:09, 15.88it/s, v_num=z8of, train_total_loss_step=2.33e+3, val_total_loss=2.35e+3, train_total_loss_epoch=2.4e+3]
+Epoch 7:  71%|███████▏  | 340/477 [00:21<00:08, 15.95it/s, v_num=z8of, train_total_loss_step=2.33e+3, val_total_loss=2.35e+3, train_total_loss_epoch=2.4e+3]
+Epoch 7:  71%|███████▏  | 340/477 [00:21<00:08, 15.93it/s, v_num=z8of, train_total_loss_step=2.37e+3, val_total_loss=2.35e+3, train_total_loss_epoch=2.4e+3]
+Epoch 7:  75%|███████▌  | 360/477 [00:22<00:07, 15.99it/s, v_num=z8of, train_total_loss_step=2.37e+3, val_total_loss=2.35e+3, train_total_loss_epoch=2.4e+3]
+Epoch 7:  75%|███████▌  | 360/477 [00:22<00:07, 15.98it/s, v_num=z8of, train_total_loss_step=2.37e+3, val_total_loss=2.35e+3, train_total_loss_epoch=2.4e+3]
+Epoch 7:  80%|███████▉  | 380/477 [00:23<00:06, 16.00it/s, v_num=z8of, train_total_loss_step=2.37e+3, val_total_loss=2.35e+3, train_total_loss_epoch=2.4e+3]
+Epoch 7:  80%|███████▉  | 380/477 [00:23<00:06, 15.98it/s, v_num=z8of, train_total_loss_step=2.48e+3, val_total_loss=2.35e+3, train_total_loss_epoch=2.4e+3]
+Epoch 7:  84%|████████▍ | 400/477 [00:25<00:04, 15.91it/s, v_num=z8of, train_total_loss_step=2.48e+3, val_total_loss=2.35e+3, train_total_loss_epoch=2.4e+3]
+Epoch 7:  84%|████████▍ | 400/477 [00:25<00:04, 15.90it/s, v_num=z8of, train_total_loss_step=2.39e+3, val_total_loss=2.35e+3, train_total_loss_epoch=2.4e+3]
+Epoch 7:  88%|████████▊ | 420/477 [00:26<00:03, 15.93it/s, v_num=z8of, train_total_loss_step=2.39e+3, val_total_loss=2.35e+3, train_total_loss_epoch=2.4e+3]
+Epoch 7:  88%|████████▊ | 420/477 [00:26<00:03, 15.92it/s, v_num=z8of, train_total_loss_step=2.38e+3, val_total_loss=2.35e+3, train_total_loss_epoch=2.4e+3]
+Epoch 7:  92%|█████████▏| 440/477 [00:27<00:02, 15.97it/s, v_num=z8of, train_total_loss_step=2.38e+3, val_total_loss=2.35e+3, train_total_loss_epoch=2.4e+3]
+Epoch 7:  92%|█████████▏| 440/477 [00:27<00:02, 15.96it/s, v_num=z8of, train_total_loss_step=2.35e+3, val_total_loss=2.35e+3, train_total_loss_epoch=2.4e+3]
+Epoch 7:  96%|█████████▋| 460/477 [00:28<00:01, 16.00it/s, v_num=z8of, train_total_loss_step=2.35e+3, val_total_loss=2.35e+3, train_total_loss_epoch=2.4e+3]
+Epoch 7:  96%|█████████▋| 460/477 [00:28<00:01, 15.99it/s, v_num=z8of, train_total_loss_step=2.35e+3, val_total_loss=2.35e+3, train_total_loss_epoch=2.4e+3]
+Epoch 7: 100%|██████████| 477/477 [00:29<00:00, 16.04it/s, v_num=z8of, train_total_loss_step=2.35e+3, val_total_loss=2.35e+3, train_total_loss_epoch=2.4e+3]
+Epoch 7: 100%|██████████| 477/477 [00:29<00:00, 16.03it/s, v_num=z8of, train_total_loss_step=2.35e+3, val_total_loss=2.35e+3, train_total_loss_epoch=2.4e+3]
+
+Validation: |          | 0/? [00:00<?, ?it/s][A
+
+Validation:   0%|          | 0/120 [00:00<?, ?it/s][A
+
+Validation DataLoader 0:   0%|          | 0/120 [00:00<?, ?it/s][A
+
+Validation DataLoader 0:  17%|█▋        | 20/120 [00:18<01:31,  1.09it/s][A
+
+Validation DataLoader 0:  33%|███▎      | 40/120 [00:36<01:13,  1.09it/s][A
+
+Validation DataLoader 0:  50%|█████     | 60/120 [00:54<00:54,  1.10it/s][A
+
+Validation DataLoader 0:  67%|██████▋   | 80/120 [01:12<00:36,  1.10it/s][A
+
+Validation DataLoader 0:  83%|████████▎ | 100/120 [01:31<00:18,  1.10it/s][A
+
+Validation DataLoader 0: 100%|██████████| 120/120 [01:48<00:00,  1.10it/s][A
+
+                                                                          [A
+Epoch 7: 100%|██████████| 477/477 [02:18<00:00,  3.44it/s, v_num=z8of, train_total_loss_step=2.35e+3, val_total_loss=2.35e+3, train_total_loss_epoch=2.4e+3]
+Epoch 7: 100%|██████████| 477/477 [02:18<00:00,  3.44it/s, v_num=z8of, train_total_loss_step=2.35e+3, val_total_loss=2.35e+3, train_total_loss_epoch=2.39e+3]Metric val_total_loss improved by 2.483 >= min_delta = 0.0001. New best score: 2348.677
+
+Epoch 7:   0%|          | 0/477 [00:00<?, ?it/s, v_num=z8of, train_total_loss_step=2.35e+3, val_total_loss=2.35e+3, train_total_loss_epoch=2.39e+3]          
+Epoch 8:   0%|          | 0/477 [00:00<?, ?it/s, v_num=z8of, train_total_loss_step=2.35e+3, val_total_loss=2.35e+3, train_total_loss_epoch=2.39e+3]
+Epoch 8:   4%|▍         | 20/477 [00:01<00:34, 13.30it/s, v_num=z8of, train_total_loss_step=2.35e+3, val_total_loss=2.35e+3, train_total_loss_epoch=2.39e+3]
+Epoch 8:   4%|▍         | 20/477 [00:01<00:34, 13.12it/s, v_num=z8of, train_total_loss_step=2.42e+3, val_total_loss=2.35e+3, train_total_loss_epoch=2.39e+3]terminate called after throwing an instance of 'c10::Error'
+  what():  CUDA error: initialization error
+CUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.
+For debugging consider passing CUDA_LAUNCH_BLOCKING=1
+Compile with `TORCH_USE_CUDA_DSA` to enable device-side assertions.
+
+Exception raised from c10_cuda_check_implementation at /pytorch/c10/cuda/CUDAException.cpp:43 (most recent call first):
+frame #0: c10::Error::Error(c10::SourceLocation, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >) + 0x98 (0x7dbfafd785e8 in /workspace/vcc/.venv/lib/python3.10/site-packages/torch/lib/libc10.so)
+frame #1: c10::detail::torchCheckFail(char const*, char const*, unsigned int, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const&) + 0xe0 (0x7dbfafd0d4a2 in /workspace/vcc/.venv/lib/python3.10/site-packages/torch/lib/libc10.so)
+frame #2: c10::cuda::c10_cuda_check_implementation(int, char const*, char const*, int, bool) + 0x3c2 (0x7dbfb01a5422 in /workspace/vcc/.venv/lib/python3.10/site-packages/torch/lib/libc10_cuda.so)
+frame #3: c10::cuda::ExchangeDevice(signed char) + 0x9a (0x7dbfb01a57da in /workspace/vcc/.venv/lib/python3.10/site-packages/torch/lib/libc10_cuda.so)
+frame #4: <unknown function> + 0x1032bbe (0x7dbf5a632bbe in /workspace/vcc/.venv/lib/python3.10/site-packages/torch/lib/libtorch_cuda.so)
+frame #5: <unknown function> + 0x102ee8b (0x7dbf5a62ee8b in /workspace/vcc/.venv/lib/python3.10/site-packages/torch/lib/libtorch_cuda.so)
+frame #6: <unknown function> + 0x10365a4 (0x7dbf5a6365a4 in /workspace/vcc/.venv/lib/python3.10/site-packages/torch/lib/libtorch_cuda.so)
+frame #7: <unknown function> + 0x457242 (0x7dbfa7a57242 in /workspace/vcc/.venv/lib/python3.10/site-packages/torch/lib/libtorch_python.so)
+frame #8: c10::TensorImpl::~TensorImpl() + 0x9 (0x7dbfafd52f39 in /workspace/vcc/.venv/lib/python3.10/site-packages/torch/lib/libc10.so)
+frame #9: <unknown function> + 0x7186d8 (0x7dbfa7d186d8 in /workspace/vcc/.venv/lib/python3.10/site-packages/torch/lib/libtorch_python.so)
+frame #10: <unknown function> + 0x718af1 (0x7dbfa7d18af1 in /workspace/vcc/.venv/lib/python3.10/site-packages/torch/lib/libtorch_python.so)
+frame #11: <unknown function> + 0x1f913e (0x5ec198faa13e in /workspace/vcc/.venv/bin/python3)
+frame #12: <unknown function> + 0x15d5b3 (0x5ec198f0e5b3 in /workspace/vcc/.venv/bin/python3)
+frame #13: <unknown function> + 0x256210 (0x5ec199007210 in /workspace/vcc/.venv/bin/python3)
+frame #14: PyTraceBack_Here + 0x619 (0x5ec198f44fb9 in /workspace/vcc/.venv/bin/python3)
+frame #15: _PyEval_EvalFrameDefault + 0x34d1 (0x5ec198f29741 in /workspace/vcc/.venv/bin/python3)
+frame #16: <unknown function> + 0x198791 (0x5ec198f49791 in /workspace/vcc/.venv/bin/python3)
+frame #17: _PyEval_EvalFrameDefault + 0x5642 (0x5ec198f2b8b2 in /workspace/vcc/.venv/bin/python3)
+frame #18: <unknown function> + 0x1ee3ee (0x5ec198f9f3ee in /workspace/vcc/.venv/bin/python3)
+frame #19: <unknown function> + 0x1ee21e (0x5ec198f9f21e in /workspace/vcc/.venv/bin/python3)
+frame #20: _PyEval_EvalFrameDefault + 0xc00 (0x5ec198f26e70 in /workspace/vcc/.venv/bin/python3)
+frame #21: _PyFunction_Vectorcall + 0x7c (0x5ec198f3c66c in /workspace/vcc/.venv/bin/python3)
+frame #22: _PyEval_EvalFrameDefault + 0x6bf (0x5ec198f2692f in /workspace/vcc/.venv/bin/python3)
+frame #23: _PyFunction_Vectorcall + 0x7c (0x5ec198f3c66c in /workspace/vcc/.venv/bin/python3)
+frame #24: _PyEval_EvalFrameDefault + 0x804 (0x5ec198f26a74 in /workspace/vcc/.venv/bin/python3)
+frame #25: _PyFunction_Vectorcall + 0x7c (0x5ec198f3c66c in /workspace/vcc/.venv/bin/python3)
+frame #26: _PyEval_EvalFrameDefault + 0x2a83 (0x5ec198f28cf3 in /workspace/vcc/.venv/bin/python3)
+frame #27: _PyFunction_Vectorcall + 0x7c (0x5ec198f3c66c in /workspace/vcc/.venv/bin/python3)
+frame #28: _PyEval_EvalFrameDefault + 0x804 (0x5ec198f26a74 in /workspace/vcc/.venv/bin/python3)
+frame #29: <unknown function> + 0x198791 (0x5ec198f49791 in /workspace/vcc/.venv/bin/python3)
+frame #30: _PyEval_EvalFrameDefault + 0x18d3 (0x5ec198f27b43 in /workspace/vcc/.venv/bin/python3)
+frame #31: _PyFunction_Vectorcall + 0x7c (0x5ec198f3c66c in /workspace/vcc/.venv/bin/python3)
+frame #32: _PyEval_EvalFrameDefault + 0x804 (0x5ec198f26a74 in /workspace/vcc/.venv/bin/python3)
+frame #33: _PyObject_FastCallDictTstate + 0xc4 (0x5ec198f31934 in /workspace/vcc/.venv/bin/python3)
+frame #34: <unknown function> + 0x194b04 (0x5ec198f45b04 in /workspace/vcc/.venv/bin/python3)
+frame #35: _PyObject_MakeTpCall + 0x1fc (0x5ec198f326fc in /workspace/vcc/.venv/bin/python3)
+frame #36: _PyEval_EvalFrameDefault + 0x59d7 (0x5ec198f2bc47 in /workspace/vcc/.venv/bin/python3)
+frame #37: _PyFunction_Vectorcall + 0x7c (0x5ec198f3c66c in /workspace/vcc/.venv/bin/python3)
+frame #38: _PyEval_EvalFrameDefault + 0x5642 (0x5ec198f2b8b2 in /workspace/vcc/.venv/bin/python3)
+frame #39: _PyFunction_Vectorcall + 0x7c (0x5ec198f3c66c in /workspace/vcc/.venv/bin/python3)
+frame #40: _PyEval_EvalFrameDefault + 0x5642 (0x5ec198f2b8b2 in /workspace/vcc/.venv/bin/python3)
+frame #41: _PyFunction_Vectorcall + 0x7c (0x5ec198f3c66c in /workspace/vcc/.venv/bin/python3)
+frame #42: _PyEval_EvalFrameDefault + 0x804 (0x5ec198f26a74 in /workspace/vcc/.venv/bin/python3)
+frame #43: _PyObject_FastCallDictTstate + 0xc4 (0x5ec198f31934 in /workspace/vcc/.venv/bin/python3)
+frame #44: <unknown function> + 0x194b04 (0x5ec198f45b04 in /workspace/vcc/.venv/bin/python3)
+frame #45: _PyObject_MakeTpCall + 0x1fc (0x5ec198f326fc in /workspace/vcc/.venv/bin/python3)
+frame #46: _PyEval_EvalFrameDefault + 0x59d7 (0x5ec198f2bc47 in /workspace/vcc/.venv/bin/python3)
+frame #47: _PyFunction_Vectorcall + 0x7c (0x5ec198f3c66c in /workspace/vcc/.venv/bin/python3)
+frame #48: _PyEval_EvalFrameDefault + 0x804 (0x5ec198f26a74 in /workspace/vcc/.venv/bin/python3)
+frame #49: <unknown function> + 0x1d28d3 (0x5ec198f838d3 in /workspace/vcc/.venv/bin/python3)
+frame #50: <unknown function> + 0x2a26a3 (0x5ec1990536a3 in /workspace/vcc/.venv/bin/python3)
+frame #51: PyObject_GetIter + 0x18 (0x5ec198f18d78 in /workspace/vcc/.venv/bin/python3)
+frame #52: <unknown function> + 0x18b8c9 (0x5ec198f3c8c9 in /workspace/vcc/.venv/bin/python3)
+frame #53: _PyEval_EvalFrameDefault + 0x6bf (0x5ec198f2692f in /workspace/vcc/.venv/bin/python3)
+frame #54: _PyFunction_Vectorcall + 0x7c (0x5ec198f3c66c in /workspace/vcc/.venv/bin/python3)
+frame #55: _PyEval_EvalFrameDefault + 0x6bf (0x5ec198f2692f in /workspace/vcc/.venv/bin/python3)
+frame #56: <unknown function> + 0x198791 (0x5ec198f49791 in /workspace/vcc/.venv/bin/python3)
+frame #57: _PyEval_EvalFrameDefault + 0x5642 (0x5ec198f2b8b2 in /workspace/vcc/.venv/bin/python3)
+frame #58: <unknown function> + 0x1d28d3 (0x5ec198f838d3 in /workspace/vcc/.venv/bin/python3)
+frame #59: <unknown function> + 0x2a26a3 (0x5ec1990536a3 in /workspace/vcc/.venv/bin/python3)
+frame #60: PyObject_GetIter + 0x18 (0x5ec198f18d78 in /workspace/vcc/.venv/bin/python3)
+frame #61: <unknown function> + 0x18b8c9 (0x5ec198f3c8c9 in /workspace/vcc/.venv/bin/python3)
+frame #62: _PyEval_EvalFrameDefault + 0x6bf (0x5ec198f2692f in /workspace/vcc/.venv/bin/python3)
+
+terminate called after throwing an instance of 'c10::Error'
+  what():  CUDA error: initialization error
+CUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.
+For debugging consider passing CUDA_LAUNCH_BLOCKING=1
+Compile with `TORCH_USE_CUDA_DSA` to enable device-side assertions.
+
+Exception raised from c10_cuda_check_implementation at /pytorch/c10/cuda/CUDAException.cpp:43 (most recent call first):
+frame #0: c10::Error::Error(c10::SourceLocation, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >) + 0x98 (0x7dbfafd785e8 in /workspace/vcc/.venv/lib/python3.10/site-packages/torch/lib/libc10.so)
+frame #1: c10::detail::torchCheckFail(char const*, char const*, unsigned int, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const&) + 0xe0 (0x7dbfafd0d4a2 in /workspace/vcc/.venv/lib/python3.10/site-packages/torch/lib/libc10.so)
+frame #2: c10::cuda::c10_cuda_check_implementation(int, char const*, char const*, int, bool) + 0x3c2 (0x7dbfb01a5422 in /workspace/vcc/.venv/lib/python3.10/site-packages/torch/lib/libc10_cuda.so)
+frame #3: c10::cuda::ExchangeDevice(signed char) + 0x9a (0x7dbfb01a57da in /workspace/vcc/.venv/lib/python3.10/site-packages/torch/lib/libc10_cuda.so)
+frame #4: <unknown function> + 0x1032bbe (0x7dbf5a632bbe in /workspace/vcc/.venv/lib/python3.10/site-packages/torch/lib/libtorch_cuda.so)
+frame #5: <unknown function> + 0x102ee8b (0x7dbf5a62ee8b in /workspace/vcc/.venv/lib/python3.10/site-packages/torch/lib/libtorch_cuda.so)
+frame #6: <unknown function> + 0x10365a4 (0x7dbf5a6365a4 in /workspace/vcc/.venv/lib/python3.10/site-packages/torch/lib/libtorch_cuda.so)
+frame #7: <unknown function> + 0x457242 (0x7dbfa7a57242 in /workspace/vcc/.venv/lib/python3.10/site-packages/torch/lib/libtorch_python.so)
+frame #8: c10::TensorImpl::~TensorImpl() + 0x9 (0x7dbfafd52f39 in /workspace/vcc/.venv/lib/python3.10/site-packages/torch/lib/libc10.so)
+frame #9: <unknown function> + 0x7186d8 (0x7dbfa7d186d8 in /workspace/vcc/.venv/lib/python3.10/site-packages/torch/lib/libtorch_python.so)
+frame #10: <unknown function> + 0x718af1 (0x7dbfa7d18af1 in /workspace/vcc/.venv/lib/python3.10/site-packages/torch/lib/libtorch_python.so)
+frame #11: <unknown function> + 0x1f913e (0x5ec198faa13e in /workspace/vcc/.venv/bin/python3)
+frame #12: <unknown function> + 0x15d5b3 (0x5ec198f0e5b3 in /workspace/vcc/.venv/bin/python3)
+frame #13: <unknown function> + 0x256210 (0x5ec199007210 in /workspace/vcc/.venv/bin/python3)
+frame #14: PyTraceBack_Here + 0x619 (0x5ec198f44fb9 in /workspace/vcc/.venv/bin/python3)
+frame #15: _PyEval_EvalFrameDefault + 0x34d1 (0x5ec198f29741 in /workspace/vcc/.venv/bin/python3)
+frame #16: <unknown function> + 0x198791 (0x5ec198f49791 in /workspace/vcc/.venv/bin/python3)
+frame #17: _PyEval_EvalFrameDefault + 0x5642 (0x5ec198f2b8b2 in /workspace/vcc/.venv/bin/python3)
+frame #18: <unknown function> + 0x1ee3ee (0x5ec198f9f3ee in /workspace/vcc/.venv/bin/python3)
+frame #19: <unknown function> + 0x1ee21e (0x5ec198f9f21e in /workspace/vcc/.venv/bin/python3)
+frame #20: _PyEval_EvalFrameDefault + 0xc00 (0x5ec198f26e70 in /workspace/vcc/.venv/bin/python3)
+frame #21: _PyFunction_Vectorcall + 0x7c (0x5ec198f3c66c in /workspace/vcc/.venv/bin/python3)
+frame #22: _PyEval_EvalFrameDefault + 0x6bf (0x5ec198f2692f in /workspace/vcc/.venv/bin/python3)
+frame #23: _PyFunction_Vectorcall + 0x7c (0x5ec198f3c66c in /workspace/vcc/.venv/bin/python3)
+frame #24: _PyEval_EvalFrameDefault + 0x804 (0x5ec198f26a74 in /workspace/vcc/.venv/bin/python3)
+frame #25: _PyFunction_Vectorcall + 0x7c (0x5ec198f3c66c in /workspace/vcc/.venv/bin/python3)
+frame #26: _PyEval_EvalFrameDefault + 0x2a83 (0x5ec198f28cf3 in /workspace/vcc/.venv/bin/python3)
+frame #27: _PyFunction_Vectorcall + 0x7c (0x5ec198f3c66c in /workspace/vcc/.venv/bin/python3)
+frame #28: _PyEval_EvalFrameDefault + 0x804 (0x5ec198f26a74 in /workspace/vcc/.venv/bin/python3)
+frame #29: <unknown function> + 0x198791 (0x5ec198f49791 in /workspace/vcc/.venv/bin/python3)
+frame #30: _PyEval_EvalFrameDefault + 0x18d3 (0x5ec198f27b43 in /workspace/vcc/.venv/bin/python3)
+frame #31: _PyFunction_Vectorcall + 0x7c (0x5ec198f3c66c in /workspace/vcc/.venv/bin/python3)
+frame #32: _PyEval_EvalFrameDefault + 0x804 (0x5ec198f26a74 in /workspace/vcc/.venv/bin/python3)
+frame #33: _PyObject_FastCallDictTstate + 0xc4 (0x5ec198f31934 in /workspace/vcc/.venv/bin/python3)
+frame #34: <unknown function> + 0x194b04 (0x5ec198f45b04 in /workspace/vcc/.venv/bin/python3)
+frame #35: _PyObject_MakeTpCall + 0x1fc (0x5ec198f326fc in /workspace/vcc/.venv/bin/python3)
+frame #36: _PyEval_EvalFrameDefault + 0x59d7 (0x5ec198f2bc47 in /workspace/vcc/.venv/bin/python3)
+frame #37: _PyFunction_Vectorcall + 0x7c (0x5ec198f3c66c in /workspace/vcc/.venv/bin/python3)
+frame #38: _PyEval_EvalFrameDefault + 0x5642 (0x5ec198f2b8b2 in /workspace/vcc/.venv/bin/python3)
+frame #39: _PyFunction_Vectorcall + 0x7c (0x5ec198f3c66c in /workspace/vcc/.venv/bin/python3)
+frame #40: _PyEval_EvalFrameDefault + 0x5642 (0x5ec198f2b8b2 in /workspace/vcc/.venv/bin/python3)
+frame #41: _PyFunction_Vectorcall + 0x7c (0x5ec198f3c66c in /workspace/vcc/.venv/bin/python3)
+frame #42: _PyEval_EvalFrameDefault + 0x804 (0x5ec198f26a74 in /workspace/vcc/.venv/bin/python3)
+frame #43: _PyObject_FastCallDictTstate + 0xc4 (0x5ec198f31934 in /workspace/vcc/.venv/bin/python3)
+frame #44: <unknown function> + 0x194b04 (0x5ec198f45b04 in /workspace/vcc/.venv/bin/python3)
+frame #45: _PyObject_MakeTpCall + 0x1fc (0x5ec198f326fc in /workspace/vcc/.venv/bin/python3)
+frame #46: _PyEval_EvalFrameDefault + 0x59d7 (0x5ec198f2bc47 in /workspace/vcc/.venv/bin/python3)
+frame #47: _PyFunction_Vectorcall + 0x7c (0x5ec198f3c66c in /workspace/vcc/.venv/bin/python3)
+frame #48: _PyEval_EvalFrameDefault + 0x804 (0x5ec198f26a74 in /workspace/vcc/.venv/bin/python3)
+frame #49: <unknown function> + 0x1d28d3 (0x5ec198f838d3 in /workspace/vcc/.venv/bin/python3)
+frame #50: <unknown function> + 0x2a26a3 (0x5ec1990536a3 in /workspace/vcc/.venv/bin/python3)
+frame #51: PyObject_GetIter + 0x18 (0x5ec198f18d78 in /workspace/vcc/.venv/bin/python3)
+frame #52: <unknown function> + 0x18b8c9 (0x5ec198f3c8c9 in /workspace/vcc/.venv/bin/python3)
+frame #53: _PyEval_EvalFrameDefault + 0x6bf (0x5ec198f2692f in /workspace/vcc/.venv/bin/python3)
+frame #54: _PyFunction_Vectorcall + 0x7c (0x5ec198f3c66c in /workspace/vcc/.venv/bin/python3)
+frame #55: _PyEval_EvalFrameDefault + 0x6bf (0x5ec198f2692f in /workspace/vcc/.venv/bin/python3)
+frame #56: <unknown function> + 0x198791 (0x5ec198f49791 in /workspace/vcc/.venv/bin/python3)
+frame #57: _PyEval_EvalFrameDefault + 0x5642 (0x5ec198f2b8b2 in /workspace/vcc/.venv/bin/python3)
+frame #58: <unknown function> + 0x1d28d3 (0x5ec198f838d3 in /workspace/vcc/.venv/bin/python3)
+frame #59: <unknown function> + 0x2a26a3 (0x5ec1990536a3 in /workspace/vcc/.venv/bin/python3)
+frame #60: PyObject_GetIter + 0x18 (0x5ec198f18d78 in /workspace/vcc/.venv/bin/python3)
+frame #61: <unknown function> + 0x18b8c9 (0x5ec198f3c8c9 in /workspace/vcc/.venv/bin/python3)
+frame #62: _PyEval_EvalFrameDefault + 0x6bf (0x5ec198f2692f in /workspace/vcc/.venv/bin/python3)
+
+terminate called after throwing an instance of 'c10::Error'
+  what():  CUDA error: initialization error
+CUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.
+For debugging consider passing CUDA_LAUNCH_BLOCKING=1
+Compile with `TORCH_USE_CUDA_DSA` to enable device-side assertions.
+
+Exception raised from c10_cuda_check_implementation at /pytorch/c10/cuda/CUDAException.cpp:43 (most recent call first):
+frame #0: c10::Error::Error(c10::SourceLocation, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >) + 0x98 (0x7dbfafd785e8 in /workspace/vcc/.venv/lib/python3.10/site-packages/torch/lib/libc10.so)
+frame #1: c10::detail::torchCheckFail(char const*, char const*, unsigned int, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const&) + 0xe0 (0x7dbfafd0d4a2 in /workspace/vcc/.venv/lib/python3.10/site-packages/torch/lib/libc10.so)
+frame #2: c10::cuda::c10_cuda_check_implementation(int, char const*, char const*, int, bool) + 0x3c2 (0x7dbfb01a5422 in /workspace/vcc/.venv/lib/python3.10/site-packages/torch/lib/libc10_cuda.so)
+frame #3: c10::cuda::ExchangeDevice(signed char) + 0x9a (0x7dbfb01a57da in /workspace/vcc/.venv/lib/python3.10/site-packages/torch/lib/libc10_cuda.so)
+frame #4: <unknown function> + 0x1032bbe (0x7dbf5a632bbe in /workspace/vcc/.venv/lib/python3.10/site-packages/torch/lib/libtorch_cuda.so)
+frame #5: <unknown function> + 0x102ee8b (0x7dbf5a62ee8b in /workspace/vcc/.venv/lib/python3.10/site-packages/torch/lib/libtorch_cuda.so)
+frame #6: <unknown function> + 0x10365a4 (0x7dbf5a6365a4 in /workspace/vcc/.venv/lib/python3.10/site-packages/torch/lib/libtorch_cuda.so)
+frame #7: <unknown function> + 0x457242 (0x7dbfa7a57242 in /workspace/vcc/.venv/lib/python3.10/site-packages/torch/lib/libtorch_python.so)
+frame #8: c10::TensorImpl::~TensorImpl() + 0x9 (0x7dbfafd52f39 in /workspace/vcc/.venv/lib/python3.10/site-packages/torch/lib/libc10.so)
+frame #9: <unknown function> + 0x7186d8 (0x7dbfa7d186d8 in /workspace/vcc/.venv/lib/python3.10/site-packages/torch/lib/libtorch_python.so)
+frame #10: <unknown function> + 0x718af1 (0x7dbfa7d18af1 in /workspace/vcc/.venv/lib/python3.10/site-packages/torch/lib/libtorch_python.so)
+frame #11: <unknown function> + 0x1f913e (0x5ec198faa13e in /workspace/vcc/.venv/bin/python3)
+frame #12: <unknown function> + 0x15d5b3 (0x5ec198f0e5b3 in /workspace/vcc/.venv/bin/python3)
+frame #13: <unknown function> + 0x256210 (0x5ec199007210 in /workspace/vcc/.venv/bin/python3)
+frame #14: PyTraceBack_Here + 0x619 (0x5ec198f44fb9 in /workspace/vcc/.venv/bin/python3)
+frame #15: _PyEval_EvalFrameDefault + 0x34d1 (0x5ec198f29741 in /workspace/vcc/.venv/bin/python3)
+frame #16: <unknown function> + 0x198791 (0x5ec198f49791 in /workspace/vcc/.venv/bin/python3)
+frame #17: _PyEval_EvalFrameDefault + 0x5642 (0x5ec198f2b8b2 in /workspace/vcc/.venv/bin/python3)
+frame #18: <unknown function> + 0x1ee3ee (0x5ec198f9f3ee in /workspace/vcc/.venv/bin/python3)
+frame #19: <unknown function> + 0x1ee21e (0x5ec198f9f21e in /workspace/vcc/.venv/bin/python3)
+frame #20: _PyEval_EvalFrameDefault + 0xc00 (0x5ec198f26e70 in /workspace/vcc/.venv/bin/python3)
+frame #21: _PyFunction_Vectorcall + 0x7c (0x5ec198f3c66c in /workspace/vcc/.venv/bin/python3)
+frame #22: _PyEval_EvalFrameDefault + 0x6bf (0x5ec198f2692f in /workspace/vcc/.venv/bin/python3)
+frame #23: _PyFunction_Vectorcall + 0x7c (0x5ec198f3c66c in /workspace/vcc/.venv/bin/python3)
+frame #24: _PyEval_EvalFrameDefault + 0x804 (0x5ec198f26a74 in /workspace/vcc/.venv/bin/python3)
+frame #25: _PyFunction_Vectorcall + 0x7c (0x5ec198f3c66c in /workspace/vcc/.venv/bin/python3)
+frame #26: _PyEval_EvalFrameDefault + 0x2a83 (0x5ec198f28cf3 in /workspace/vcc/.venv/bin/python3)
+frame #27: _PyFunction_Vectorcall + 0x7c (0x5ec198f3c66c in /workspace/vcc/.venv/bin/python3)
+frame #28: _PyEval_EvalFrameDefault + 0x804 (0x5ec198f26a74 in /workspace/vcc/.venv/bin/python3)
+frame #29: <unknown function> + 0x198791 (0x5ec198f49791 in /workspace/vcc/.venv/bin/python3)
+frame #30: _PyEval_EvalFrameDefault + 0x18d3 (0x5ec198f27b43 in /workspace/vcc/.venv/bin/python3)
+frame #31: _PyFunction_Vectorcall + 0x7c (0x5ec198f3c66c in /workspace/vcc/.venv/bin/python3)
+frame #32: _PyEval_EvalFrameDefault + 0x804 (0x5ec198f26a74 in /workspace/vcc/.venv/bin/python3)
+frame #33: _PyObject_FastCallDictTstate + 0xc4 (0x5ec198f31934 in /workspace/vcc/.venv/bin/python3)
+frame #34: <unknown function> + 0x194b04 (0x5ec198f45b04 in /workspace/vcc/.venv/bin/python3)
+frame #35: _PyObject_MakeTpCall + 0x1fc (0x5ec198f326fc in /workspace/vcc/.venv/bin/python3)
+frame #36: _PyEval_EvalFrameDefault + 0x59d7 (0x5ec198f2bc47 in /workspace/vcc/.venv/bin/python3)
+frame #37: _PyFunction_Vectorcall + 0x7c (0x5ec198f3c66c in /workspace/vcc/.venv/bin/python3)
+frame #38: _PyEval_EvalFrameDefault + 0x5642 (0x5ec198f2b8b2 in /workspace/vcc/.venv/bin/python3)
+frame #39: _PyFunction_Vectorcall + 0x7c (0x5ec198f3c66c in /workspace/vcc/.venv/bin/python3)
+frame #40: _PyEval_EvalFrameDefault + 0x5642 (0x5ec198f2b8b2 in /workspace/vcc/.venv/bin/python3)
+frame #41: _PyFunction_Vectorcall + 0x7c (0x5ec198f3c66c in /workspace/vcc/.venv/bin/python3)
+frame #42: _PyEval_EvalFrameDefault + 0x804 (0x5ec198f26a74 in /workspace/vcc/.venv/bin/python3)
+frame #43: _PyObject_FastCallDictTstate + 0xc4 (0x5ec198f31934 in /workspace/vcc/.venv/bin/python3)
+frame #44: <unknown function> + 0x194b04 (0x5ec198f45b04 in /workspace/vcc/.venv/bin/python3)
+frame #45: _PyObject_MakeTpCall + 0x1fc (0x5ec198f326fc in /workspace/vcc/.venv/bin/python3)
+frame #46: _PyEval_EvalFrameDefault + 0x59d7 (0x5ec198f2bc47 in /workspace/vcc/.venv/bin/python3)
+frame #47: _PyFunction_Vectorcall + 0x7c (0x5ec198f3c66c in /workspace/vcc/.venv/bin/python3)
+frame #48: _PyEval_EvalFrameDefault + 0x804 (0x5ec198f26a74 in /workspace/vcc/.venv/bin/python3)
+frame #49: <unknown function> + 0x1d28d3 (0x5ec198f838d3 in /workspace/vcc/.venv/bin/python3)
+frame #50: <unknown function> + 0x2a26a3 (0x5ec1990536a3 in /workspace/vcc/.venv/bin/python3)
+frame #51: PyObject_GetIter + 0x18 (0x5ec198f18d78 in /workspace/vcc/.venv/bin/python3)
+frame #52: <unknown function> + 0x18b8c9 (0x5ec198f3c8c9 in /workspace/vcc/.venv/bin/python3)
+frame #53: _PyEval_EvalFrameDefault + 0x6bf (0x5ec198f2692f in /workspace/vcc/.venv/bin/python3)
+frame #54: _PyFunction_Vectorcall + 0x7c (0x5ec198f3c66c in /workspace/vcc/.venv/bin/python3)
+frame #55: _PyEval_EvalFrameDefault + 0x6bf (0x5ec198f2692f in /workspace/vcc/.venv/bin/python3)
+frame #56: <unknown function> + 0x198791 (0x5ec198f49791 in /workspace/vcc/.venv/bin/python3)
+frame #57: _PyEval_EvalFrameDefault + 0x5642 (0x5ec198f2b8b2 in /workspace/vcc/.venv/bin/python3)
+frame #58: <unknown function> + 0x1d28d3 (0x5ec198f838d3 in /workspace/vcc/.venv/bin/python3)
+frame #59: <unknown function> + 0x2a26a3 (0x5ec1990536a3 in /workspace/vcc/.venv/bin/python3)
+frame #60: PyObject_GetIter + 0x18 (0x5ec198f18d78 in /workspace/vcc/.venv/bin/python3)
+frame #61: <unknown function> + 0x18b8c9 (0x5ec198f3c8c9 in /workspace/vcc/.venv/bin/python3)
+frame #62: _PyEval_EvalFrameDefault + 0x6bf (0x5ec198f2692f in /workspace/vcc/.venv/bin/python3)
+
+2025-08-02 13:21:05,955 - __main__ - ERROR - Training failed: DataLoader worker (pid(s) 5026) exited unexpectedly
+Traceback (most recent call last):
+  File "/workspace/vcc/.venv/lib/python3.10/site-packages/torch/utils/data/dataloader.py", line 1284, in _try_get_data
+    data = self._data_queue.get(timeout=timeout)
+  File "/usr/lib/python3.10/queue.py", line 180, in get
+    self.not_empty.wait(remaining)
+  File "/usr/lib/python3.10/threading.py", line 324, in wait
+    gotit = waiter.acquire(True, timeout)
+  File "/workspace/vcc/.venv/lib/python3.10/site-packages/torch/utils/data/_utils/signal_handling.py", line 73, in handler
+    _error_if_any_worker_fails()
+RuntimeError: DataLoader worker (pid 5026) is killed by signal: Aborted. 
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/workspace/vcc/train_baseVAE.py", line 770, in <module>
+    main()
+  File "/workspace/vcc/train_baseVAE.py", line 756, in main
+    trainer.fit(model, data_module)
+  File "/workspace/vcc/.venv/lib/python3.10/site-packages/pytorch_lightning/trainer/trainer.py", line 561, in fit
+    call._call_and_handle_interrupt(
+  File "/workspace/vcc/.venv/lib/python3.10/site-packages/pytorch_lightning/trainer/call.py", line 48, in _call_and_handle_interrupt
+    return trainer_fn(*args, **kwargs)
+  File "/workspace/vcc/.venv/lib/python3.10/site-packages/pytorch_lightning/trainer/trainer.py", line 599, in _fit_impl
+    self._run(model, ckpt_path=ckpt_path)
+  File "/workspace/vcc/.venv/lib/python3.10/site-packages/pytorch_lightning/trainer/trainer.py", line 1012, in _run
+    results = self._run_stage()
+  File "/workspace/vcc/.venv/lib/python3.10/site-packages/pytorch_lightning/trainer/trainer.py", line 1056, in _run_stage
+    self.fit_loop.run()
+  File "/workspace/vcc/.venv/lib/python3.10/site-packages/pytorch_lightning/loops/fit_loop.py", line 216, in run
+    self.advance()
+  File "/workspace/vcc/.venv/lib/python3.10/site-packages/pytorch_lightning/loops/fit_loop.py", line 455, in advance
+    self.epoch_loop.run(self._data_fetcher)
+  File "/workspace/vcc/.venv/lib/python3.10/site-packages/pytorch_lightning/loops/training_epoch_loop.py", line 152, in run
+    self.advance(data_fetcher)
+  File "/workspace/vcc/.venv/lib/python3.10/site-packages/pytorch_lightning/loops/training_epoch_loop.py", line 306, in advance
+    batch, _, __ = next(data_fetcher)
+  File "/workspace/vcc/.venv/lib/python3.10/site-packages/pytorch_lightning/loops/fetchers.py", line 134, in __next__
+    batch = super().__next__()
+  File "/workspace/vcc/.venv/lib/python3.10/site-packages/pytorch_lightning/loops/fetchers.py", line 61, in __next__
+    batch = next(self.iterator)
+  File "/workspace/vcc/.venv/lib/python3.10/site-packages/pytorch_lightning/utilities/combined_loader.py", line 341, in __next__
+    out = next(self._iterator)
+  File "/workspace/vcc/.venv/lib/python3.10/site-packages/pytorch_lightning/utilities/combined_loader.py", line 78, in __next__
+    out[i] = next(self.iterators[i])
+  File "/workspace/vcc/.venv/lib/python3.10/site-packages/torch/utils/data/dataloader.py", line 733, in __next__
+    data = self._next_data()
+  File "/workspace/vcc/.venv/lib/python3.10/site-packages/torch/utils/data/dataloader.py", line 1491, in _next_data
+    idx, data = self._get_data()
+  File "/workspace/vcc/.venv/lib/python3.10/site-packages/torch/utils/data/dataloader.py", line 1443, in _get_data
+    success, data = self._try_get_data()
+  File "/workspace/vcc/.venv/lib/python3.10/site-packages/torch/utils/data/dataloader.py", line 1297, in _try_get_data
+    raise RuntimeError(
+RuntimeError: DataLoader worker (pid(s) 5026) exited unexpectedly
+Traceback (most recent call last):
+  File "/workspace/vcc/.venv/lib/python3.10/site-packages/torch/utils/data/dataloader.py", line 1284, in _try_get_data
+    data = self._data_queue.get(timeout=timeout)
+  File "/usr/lib/python3.10/queue.py", line 180, in get
+    self.not_empty.wait(remaining)
+  File "/usr/lib/python3.10/threading.py", line 324, in wait
+    gotit = waiter.acquire(True, timeout)
+  File "/workspace/vcc/.venv/lib/python3.10/site-packages/torch/utils/data/_utils/signal_handling.py", line 73, in handler
+    _error_if_any_worker_fails()
+RuntimeError: DataLoader worker (pid 5026) is killed by signal: Aborted. 
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/workspace/vcc/train_baseVAE.py", line 770, in <module>
+    main()
+  File "/workspace/vcc/train_baseVAE.py", line 756, in main
+    trainer.fit(model, data_module)
+  File "/workspace/vcc/.venv/lib/python3.10/site-packages/pytorch_lightning/trainer/trainer.py", line 561, in fit
+    call._call_and_handle_interrupt(
+  File "/workspace/vcc/.venv/lib/python3.10/site-packages/pytorch_lightning/trainer/call.py", line 48, in _call_and_handle_interrupt
+    return trainer_fn(*args, **kwargs)
+  File "/workspace/vcc/.venv/lib/python3.10/site-packages/pytorch_lightning/trainer/trainer.py", line 599, in _fit_impl
+    self._run(model, ckpt_path=ckpt_path)
+  File "/workspace/vcc/.venv/lib/python3.10/site-packages/pytorch_lightning/trainer/trainer.py", line 1012, in _run
+    results = self._run_stage()
+  File "/workspace/vcc/.venv/lib/python3.10/site-packages/pytorch_lightning/trainer/trainer.py", line 1056, in _run_stage
+    self.fit_loop.run()
+  File "/workspace/vcc/.venv/lib/python3.10/site-packages/pytorch_lightning/loops/fit_loop.py", line 216, in run
+    self.advance()
+  File "/workspace/vcc/.venv/lib/python3.10/site-packages/pytorch_lightning/loops/fit_loop.py", line 455, in advance
+    self.epoch_loop.run(self._data_fetcher)
+  File "/workspace/vcc/.venv/lib/python3.10/site-packages/pytorch_lightning/loops/training_epoch_loop.py", line 152, in run
+    self.advance(data_fetcher)
+  File "/workspace/vcc/.venv/lib/python3.10/site-packages/pytorch_lightning/loops/training_epoch_loop.py", line 306, in advance
+    batch, _, __ = next(data_fetcher)
+  File "/workspace/vcc/.venv/lib/python3.10/site-packages/pytorch_lightning/loops/fetchers.py", line 134, in __next__
+    batch = super().__next__()
+  File "/workspace/vcc/.venv/lib/python3.10/site-packages/pytorch_lightning/loops/fetchers.py", line 61, in __next__
+    batch = next(self.iterator)
+  File "/workspace/vcc/.venv/lib/python3.10/site-packages/pytorch_lightning/utilities/combined_loader.py", line 341, in __next__
+    out = next(self._iterator)
+  File "/workspace/vcc/.venv/lib/python3.10/site-packages/pytorch_lightning/utilities/combined_loader.py", line 78, in __next__
+    out[i] = next(self.iterators[i])
+  File "/workspace/vcc/.venv/lib/python3.10/site-packages/torch/utils/data/dataloader.py", line 733, in __next__
+    data = self._next_data()
+  File "/workspace/vcc/.venv/lib/python3.10/site-packages/torch/utils/data/dataloader.py", line 1491, in _next_data
+    idx, data = self._get_data()
+  File "/workspace/vcc/.venv/lib/python3.10/site-packages/torch/utils/data/dataloader.py", line 1443, in _get_data
+    success, data = self._try_get_data()
+  File "/workspace/vcc/.venv/lib/python3.10/site-packages/torch/utils/data/dataloader.py", line 1297, in _try_get_data
+    raise RuntimeError(
+RuntimeError: DataLoader worker (pid(s) 5026) exited unexpectedly
+[1;34mwandb[0m: 
+[1;34mwandb[0m: 🚀 View run [33mbaseVAE_CTRL_pretraining_RunPod_envtest[0m at: [34mhttps://wandb.ai/minjunes/ag_vc/runs/2lbwz8of[0m

@@ -323,14 +323,33 @@ class BaseVAE(nn.Module):
             - logvar: Latent log variances  
             - z: Sampled latent representation
         """
+        # Check for NaN in input
+        if torch.isnan(gene_expression).any():
+            logger.warning("NaN detected in input gene_expression")
+            gene_expression = torch.nan_to_num(gene_expression, nan=0.0)
+        
         # Encode to latent space
         mu, logvar = self.encoder(gene_expression)
+        
+        # Clamp to prevent NaN/inf
+        mu = torch.clamp(mu, min=-10, max=10)
+        logvar = torch.clamp(logvar, min=-10, max=10)
         
         # Sample latent representation
         z = self.reparameterize(mu, logvar)
         
+        # Check for NaN in latent
+        if torch.isnan(z).any():
+            logger.warning("NaN detected in latent z, replacing with zeros")
+            z = torch.nan_to_num(z, nan=0.0)
+        
         # Decode with optional perturbation
         reconstructed = self.decoder(z)
+        
+        # Check and fix NaN in output
+        if torch.isnan(reconstructed).any():
+            logger.warning("NaN detected in reconstructed output, replacing with zeros")
+            reconstructed = torch.nan_to_num(reconstructed, nan=0.0)
         
         return {
             'reconstructed': reconstructed,

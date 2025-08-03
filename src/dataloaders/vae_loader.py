@@ -99,7 +99,7 @@ class DatasetConfig:
     
     # === Memory Management ===
     preload_to_shared_memory: bool = True  # Preload data to shared memory for multiprocessing
-    max_memory_gb: float = 8.0  # Maximum memory usage before switching to disk-based loading
+    max_memory_gb: float = 16.0  # Maximum memory usage before switching to disk-based loading
     chunk_size: int = 10000  # Chunk size for processing large datasets
     
     transform: Optional[torch.nn.Module] = None  # Optional transform to apply to data
@@ -321,6 +321,15 @@ def load_and_preprocess_data(data_path: str,
             # Prevent overflow and handle problematic values
             chunk = np.clip(chunk, 0, 1e6)  # Clip to prevent overflow
             chunk = np.nan_to_num(chunk, nan=0.0, posinf=1e6, neginf=0.0)  # Handle NaN/Inf
+            
+                
+            if np.isnan(chunk).any():
+                logger.warning(f"Still found NaN after cleaning in chunk {start_idx//chunk_size}")
+                chunk = np.where(np.isnan(chunk), 0.0, chunk)
+            if np.isinf(chunk).any():
+                logger.warning(f"Still found Inf after cleaning in chunk {start_idx//chunk_size}")
+                chunk = np.where(np.isinf(chunk), 0.0, chunk)
+            
             chunk = chunk.astype(np.float32)  # Use float32 to save memory
             
             data_list.append(torch.from_numpy(chunk))
