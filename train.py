@@ -409,13 +409,20 @@ def main():
             train_notes="Brain Test",
             full_eval=False,
             target_is_delta=False,
+            train_notes="Brain Test",
+            full_eval=False,
+            target_is_delta=False,
 
             dim=512,
             n_head=8,
             n_layer=8,
             ffn_mult=4,
+            n_layer=8,
+            ffn_mult=4,
 
             vocab_size=256,
+            n_genes=2000,
+            n_total_genes=2000,
             n_genes=2000,
             n_total_genes=2000,
             gene_embed_dim=256,
@@ -427,6 +434,8 @@ def main():
             control_set_dim_hidden=512,
 
             # BS
+            pretrain_batch_size=16,
+            vcc_set_size=16,
             pretrain_batch_size=16,
             vcc_set_size=16,
 
@@ -443,14 +452,18 @@ def main():
             
             # LR
             learning_rate=3e-4,
+            learning_rate=3e-4,
             weight_decay=0.01,
+            warmup_steps=1000,
             warmup_steps=1000,
             finetune_learning_rate=3e-5,
             finetune_warmup_steps=250,
 
             # DATA
             pretrain_data_dir="/scRNA_brain_norm/processed",
+            pretrain_data_dir="/scRNA_brain_norm/processed",
             finetune_data_path="/competition_train.h5",
+            hvg_info_path="/workspace/vcc/hvg_seuratv3_brain_2000.txt",
             hvg_info_path="/workspace/vcc/hvg_seuratv3_brain_2000.txt",
             esm_matrix_path="/esm_all.pt",
             blacklist_path="data/blacklist.txt",
@@ -601,7 +614,8 @@ def main():
             config.hvg_info_path,
         )
     
-    global_step = 0
+    # Initialise global_step based on checkpoint to continue LR schedule smoothly
+    global_step = ckpt_state.get('global_step', 0) if ckpt_state else 0
     
     # Calculate total training steps for learning rate schedule
     pretrain_steps = config.pretrain_epochs * len(pretrain_dataloader) if config.pretrain_epochs > 0 else 0
