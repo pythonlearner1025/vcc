@@ -54,7 +54,7 @@ import torch
 # Local imports – reuse code from the training script and model package
 # -----------------------------------------------------------------------------
 
-from train import create_simple_tokenizer  # noqa: E402  – defined at top-level
+from tokenizer import create_logbin_tokenizer  # noqa: E402  – defined at top-level
 from models.diffusion import (
     ConditionalDiffusionTransformer,
     ConditionalModelConfig,
@@ -310,10 +310,10 @@ def _run_test_generation(
     # ---------------------------------------------------------------------
     # Build helper objects: tokenizer and control-cell iterator
     # ---------------------------------------------------------------------
-    from train import create_simple_tokenizer  # local import to avoid circular deps
+    from tokenizer import create_logbin_tokenizer  # local import to avoid circular deps
     import itertools
 
-    tokenizer, _ = create_simple_tokenizer(cfg.vocab_size)
+    tokenizer, _ = create_logbin_tokenizer(cfg.vocab_size)
 
     # Re-use the paired dataloader to fetch real control cells (non-targeting)
     (_, _), (val_ds, val_dl) = create_train_val_dataloaders(
@@ -460,7 +460,7 @@ def main():
     # ---------------------------------------------------------------------
     # 2. Tokeniser / detokeniser
     # ---------------------------------------------------------------------
-    tokenizer, detokenizer = create_simple_tokenizer(cfg.vocab_size)
+    tokenizer, detokenizer = create_logbin_tokenizer(cfg.vocab_size)
 
     # ---------------------------------------------------------------------
     # 3. Gene mappings (18k list + HVG idx mapping)

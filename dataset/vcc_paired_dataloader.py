@@ -57,7 +57,7 @@ class VCCPairedDataset(Dataset):
         print(f"Loading VCC data from {adata_path}...")
         self.adata = sc.read_h5ad(adata_path)
 
-              # Apply normalization if requested
+        # Apply normalization if requested
         if self.normalize:
             print("Applying CP10K normalization + log1p transformation...")
             # Make a copy to avoid modifying the original data
@@ -67,7 +67,19 @@ class VCCPairedDataset(Dataset):
             # Log1p transformation
             sc.pp.log1p(self.adata)
             print(f"  Normalization complete. Expression values now in range [0, {self.adata.X.max():.2f}]")
-        
+        else:
+            # Sanity check for log1p normalization using the same approach as scrna_hvg_dataset.py
+            X = self.adata.X
+            
+            # Basic range check - should be non-negative with reasonable max
+            X_min, X_max = (X.min(), X.max()) if not hasattr(X, 'toarray') else (X.min(), X.max())
+            print(f"  Expression value range: [{X_min:.6f}, {X_max:.2f}]")
+            
+            # Print mean statistics across the cells
+            mean_values = self.adata.X.mean(axis=0)
+            print(f"Mean expression values across cells: {mean_values}")
+            print(f"Overall mean expression value: {mean_values.mean():.2f}")
+
         # Create gene name <-> ID mappings
         self.gene_name_to_id = dict(zip(self.adata.var.index, self.adata.var['gene_id']))
         self.gene_id_to_name = dict(zip(self.adata.var['gene_id'], self.adata.var.index))

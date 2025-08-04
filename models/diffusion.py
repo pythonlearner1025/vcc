@@ -9,6 +9,12 @@ including the model architecture, diffusion process, and associated utilities.
 import math
 import json
 import torch
+
+# Enable fast TensorFloat-32 matmul on Ampere+
+if torch.cuda.is_available():
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
@@ -33,6 +39,7 @@ class ConditionalModelConfig:
     n_layer: int = 8
     ffn_mult: int = 8
     vocab_size: int = 64  # 64 expression bins
+    token_max_value: float = 9.2
     n_genes: int = 2000  # Number of HVGs
 
     # Training target type
@@ -204,12 +211,12 @@ class MultiQueryAttention(nn.Module):
             k = k.unsqueeze(1).expand(-1, self.n_head, -1, -1)  # (B, H, M, HD)
             v = v.unsqueeze(1).expand(-1, self.n_head, -1, -1)  # (B, H, M, HD)
             
-            # Attention
-            scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)  # (B, H, N, M)
-            attn = F.softmax(scores, dim=-1)
-            out = torch.matmul(attn, v)  # (B, H, N, HD)
-            
-            # Reshape
+            # Scaled-Dot-Product Attention (flash-aware, PyTorch ≥2.1)
+            out = F.scaled_dot_product_attention(
+                q, k, v, dropout_p=0.0, is_causal=False
+            )  # (B, H, N, HD)
+
+            # Reshape back to (B, N, D)
             out = out.transpose(1, 2).contiguous().view(B, N, D)
         
         # Project output
@@ -519,10 +526,16 @@ class ConditionalDiffusionTransformer(nn.Module):
         use_ckpt = self.training and torch.is_grad_enabled()
         for block in self.blocks:
             if use_ckpt:
-                # Activation checkpointing to trade compute for memory
-                x = torch.utils.checkpoint.checkpoint(
-                    lambda _x, _ctx=context, _blk=block: _blk(_x, context=_ctx), x
-                )
+                # Activation checkpointing to trade compute for memory.
+                # Pass the context tensor explicitly to avoid it being captured
+                # by the Python closure which breaks checkpointing and leads
+                # to "Trying to backward through the graph a second time" errors.
+                def _forward(_x, _ctx):
+                    # Ensure recomputation happens under the same AMP context as the first pass
+                    with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                        return block(_x, context=_ctx)
+                # Use the newer non-re-entrant checkpointing so AMP state is preserved
+                x = torch.utils.checkpoint.checkpoint(_forward, x, context, use_reentrant=False)
             else:
                 x = block(x, context=context)
 

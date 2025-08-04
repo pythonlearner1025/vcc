@@ -5,6 +5,7 @@ env/
 assets/
 data/
 data_normalized/
+scRNA_norm/
 artifacts/
 __pycache__/
 wandb/
