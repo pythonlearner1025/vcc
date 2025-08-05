@@ -12,7 +12,7 @@ import scanpy as sc
 from torch.utils.data import Dataset, DataLoader
 from typing import List, Tuple
 import warnings
-from dataset.vcc_collator import VCCCollator
+from dataset.collators import VCCCollator
 
 class VCCPairedDataset(Dataset):
     """
@@ -69,6 +69,7 @@ class VCCPairedDataset(Dataset):
             print(f"  Normalization complete. Expression values now in range [0, {self.adata.X.max():.2f}]")
         else:
             # Sanity check for log1p normalization using the same approach as scrna_hvg_dataset.py
+            pass
             X = self.adata.X
             
             # Basic range check - should be non-negative with reasonable max
@@ -251,11 +252,6 @@ class VCCPairedDataset(Dataset):
         ctrl_gene_expr_log = ctrl_expr[:, gene_idx_in_adata].mean()
         log2fc = (pert_gene_expr_log - ctrl_gene_expr_log) / np.log(2)
 
-        # Exponentiate log1p values back to counts (range ~0–10k)
-        pert_expr = np.expm1(pert_expr)
-        ctrl_expr = np.expm1(ctrl_expr)
-
-        # Convert to torch tensors
         pert_expr = torch.from_numpy(pert_expr).float()
         ctrl_expr = torch.from_numpy(ctrl_expr).float()
 
@@ -275,7 +271,6 @@ def create_vcc_paired_dataloader(
     adata_path: str = "data/competition_support/competition_train.h5",
     hvg_gene_ids: List[str] = None,
     set_size: int = 16,
-    batch_size: int = 4,
     n_samples_per_gene: int = 10,
     train_split: float = 0.8,
     is_train: bool = True,
@@ -305,14 +300,14 @@ def create_vcc_paired_dataloader(
     collate_fn = VCCCollator(tokenizer, dataset.batch_to_idx, set_size) if tokenizer else None
 
     dataloader_kwargs = dict(
-        batch_size=batch_size,
+        batch_size=1,
         shuffle=shuffle and is_train,  # Only shuffle training data
         num_workers=num_workers,
         drop_last=True,
         pin_memory=pin_memory,
     )
-    if collate_fn is not None:
-        dataloader_kwargs['collate_fn'] = collate_fn
+    assert collate_fn is not None
+    dataloader_kwargs['collate_fn'] = collate_fn
     if num_workers > 0:
         dataloader_kwargs['prefetch_factor'] = prefetch_factor
 
@@ -321,12 +316,11 @@ def create_vcc_paired_dataloader(
     return dataset, dataloader
 
 
-def create_train_val_dataloaders(
+def create_vcc_train_val_dataloaders(
     *,
     adata_path: str = "data/competition_support/competition_train.h5",
     hvg_gene_ids: List[str] = None,
     set_size: int = 16,
-    batch_size: int = 4,
     n_samples_per_gene_train: int = 10,
     n_samples_per_gene_val: int = 1,
     train_split: float = 0.8,
@@ -344,7 +338,6 @@ def create_train_val_dataloaders(
         adata_path=adata_path,
         hvg_gene_ids=hvg_gene_ids,
         set_size=set_size,
-        batch_size=batch_size,
         n_samples_per_gene=n_samples_per_gene_train,
         train_split=train_split,
         is_train=True,
@@ -363,7 +356,6 @@ def create_train_val_dataloaders(
         adata_path=adata_path,
         hvg_gene_ids=hvg_gene_ids,
         set_size=set_size,
-        batch_size=batch_size,
         n_samples_per_gene=n_samples_per_gene_val,
         train_split=train_split,
         is_train=False,

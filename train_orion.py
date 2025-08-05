@@ -32,6 +32,7 @@ from models.diffusion import (
 )
 # Updated imports for cross-dataset HVGs
 from dataset.scrna_hvg_dataset import ScRNADatasetWithHVGs, create_scrna_hvg_dataloader
+from dataset.orion_paired import create_orion_train_val_dataloaders
 from dataset.vcc_paired_dataloader import create_vcc_train_val_dataloaders
 from tokenizer import (
     create_delta_tokenizer,
@@ -87,26 +88,18 @@ def train_epoch_st(
             if max_cells and cells_processed >= max_cells:
                 break
 
-            # finetune / validation 
-            if isinstance(batch, dict) and 'tokens' in batch:
-                tokens = batch['tokens'].to(device, non_blocking=True)
-                X_ctrl = batch.get('control', None)
-                if X_ctrl is not None:
-                    X_ctrl = X_ctrl.cuda()
-                target_gene_idx = batch.get('target_gene_idx', None)
-                if target_gene_idx is not None:
-                    target_gene_idx = target_gene_idx.cuda()
-                batch_indices = batch.get('batch_idx', None)
-                if batch_indices is not None:
-                    batch_indices = batch_indices.cuda()
-                cells_processed += tokens.shape[0]
-            # pretrain
-            else:
-                tokens = batch.to(device, non_blocking=True)
-                X_ctrl = None
-                target_gene_idx = None
-                batch_indices = None
-                cells_processed += tokens.shape[0]
+            tokens = batch['tokens'].to(device, non_blocking=True)
+            X_ctrl = batch.get('control', None)
+            if X_ctrl is not None:
+                X_ctrl = X_ctrl.cuda()
+            target_gene_idx = batch.get('target_gene_idx', None)
+            if target_gene_idx is not None:
+                target_gene_idx = target_gene_idx.cuda()
+            batch_indices = batch.get('batch_idx', None)
+            if batch_indices is not None:
+                batch_indices = batch_indices.cuda()
+            cells_processed += tokens.shape[0]
+      
             
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                 loss = diffusion.compute_loss(
@@ -253,10 +246,10 @@ def main():
         # Fresh training run – create default config
         config = ConditionalModelConfig(
             # DATA
-            pretrain_data_dir="/scRNA_norm/processed",
+            pretrain_data_dir="/batched",
             finetune_data_path="/competition_train.h5",
             esm_matrix_path="/esm_all.pt",
-            hvg_info_path="assets/hvg_seuratv3_3000.txt",
+            hvg_info_path="assets/hvg_seuratv3_6297.txt",
             blacklist_path="assets/blacklist.txt",
             token_distribution_json="assets/token_distribution.json",
 
@@ -338,55 +331,19 @@ def main():
     if args.continue_from == "finetune":
         config.pretrain_epochs = 0
 
-    # Create tokenizer – use delta-aware tokenizer when fine-tuning on perturbations
-    if getattr(config, 'target_is_delta', False):
-        ft_tokenizer, ft_detokenizer = create_delta_tokenizer(
-            config.vocab_size, max_abs=config.token_max_value, min_abs=1e-3)
-    else:
-        ft_tokenizer, ft_detokenizer = create_logbin_tokenizer(
-            config.vocab_size, max_value=config.token_max_value)
-
-    pt_tokenizer, pt_detokenizer = create_logbin_tokenizer(
-        config.vocab_size, max_value=config.token_max_value)
+    tokenizer, detokenizer = create_delta_tokenizer(
+        config.vocab_size, max_abs=config.token_max_value, min_abs=1e-3)
 
     with open(config.hvg_info_path, 'r') as f:
         hvg_gene_ensemble = [line.strip() for line in f.readlines()]
 
     print("\n=== Creating Dataloaders ===")
-    # Create pretrain dataloader using cross-dataset HVGs
-    print("Creating scRNA pretrain dataloader with cross-dataset HVGs...")
-    scrna_dataset, _ = create_scrna_hvg_dataloader(
-        data_dir=config.pretrain_data_dir,
-        hvg_genes=hvg_gene_ensemble,
-        batch_size=1,  # We'll batch in the wrapper
-        shuffle=False,
-        num_workers=0,
-        use_cache=True,
-        normalize=False
-    )
-    
-    # Wrap with tokenizer
-    pretrain_dataset = TokenizedScRNADataset(scrna_dataset, pt_tokenizer)
-    
-    # NOTE: Using multiple worker processes duplicates the HDF5 reads 
-    # and actually slows down pre-training. A single worker keeps the
-    # per-batch cache in one process so each expression batch is read
-    # exactly once and then reused, giving a 3-4× speed-up versus 4 workers.
-    pretrain_dataloader = DataLoader(
-        pretrain_dataset,
-        batch_size=config.pretrain_batch_size,
-        shuffle=True,
-        num_workers=0,  # avoid redundant IO / RAM
-        pin_memory=True,
-        drop_last=True
-    )
-    
-    print(f"Pretrain dataset: {len(pretrain_dataset):,} cells, {scrna_dataset.n_hvgs} HVG genes")
+
     # ------------------------------------------------------------------
     #  Update config & create model now that we know the final HVG count
     # ------------------------------------------------------------------
-    config.n_genes = scrna_dataset.n_hvgs
-    hvg_gene_ensemble = scrna_dataset.get_gene_names()
+    config.n_genes 
+    hvg_gene_ensemble
 
     # Initialise wandb AFTER we have the final config
     if args.wandb_run_id:
@@ -427,14 +384,24 @@ def main():
         except Exception as e:
             print(f"Could not load optimizer state: {e}")
     print(f"\nModel created with {sum(p.numel() for p in model.parameters()):,} parameters")
+
+    # Create Orion pretrain and validation dataloaders
+    (orion_dataset, orion_dataloader), (orion_dataset, orion_dataloader) = create_orion_train_val_dataloaders(
+        batches_dir=config.pretrain_data_dir,
+        hvg_gene_ids=hvg_gene_ensemble,
+        tokenizer=tokenizer,
+        set_size=config.vcc_set_size,
+        train_split=0.8,
+        num_workers=0,
+        random_seed=42
+    )
     
-    # Create VCC train and validation dataloaders
+     # Create VCC train and validation dataloaders
     (vcc_dataset, vcc_dataloader), (val_dataset, val_dataloader) = create_vcc_train_val_dataloaders(
-        tokenizer=ft_tokenizer,
         adata_path=config.finetune_data_path,
         hvg_gene_ids=hvg_gene_ensemble,
+        tokenizer=tokenizer,
         set_size=config.vcc_set_size,
-        batch_size=config.vcc_batch_size,
         n_samples_per_gene_train=10,  # Multiple samples per gene for training
         n_samples_per_gene_val=1,      # Single sample per gene for validation
         train_split=0.8,
@@ -444,6 +411,7 @@ def main():
         blacklist_path=config.blacklist_path
     )
     
+
     # Create gene to index mapping
     vcc_gene_to_idx = {gene: idx for idx, gene in enumerate(hvg_gene_ensemble)}
     
@@ -465,7 +433,7 @@ def main():
     global_step = ckpt_state.get('global_step', 0) if ckpt_state else 0
     
     # Calculate total training steps for learning rate schedule
-    pretrain_steps = config.pretrain_epochs * len(pretrain_dataloader) if config.pretrain_epochs > 0 else 0
+    pretrain_steps = config.pretrain_epochs * len(orion_dataloader) if config.pretrain_epochs > 0 else 0
     finetune_steps = config.finetune_epochs * len(vcc_dataloader)
     print(f"\nTotal training steps: {pretrain_steps+finetune_steps:,} (pretrain: {pretrain_steps:,}, finetune: {finetune_steps:,})")
     
@@ -487,13 +455,13 @@ def main():
     # Phase 1: Pretraining on single cells
     if config.pretrain_epochs > 0:
         print(f"\n=== Phase 1: Pretraining on scRNA data ({config.pretrain_epochs} epochs) ===")
-        print(f"Using {len(pretrain_dataset):,} cells for pretraining")
+        print(f"Using {len(orion_dataset):,} cells for pretraining")
         
         for epoch in range(config.pretrain_epochs):
             global_step = train_epoch_st(
-                model, diffusion, pretrain_dataloader, optimizer, config,
+                model, diffusion, orion_dataloader, optimizer, config,
                 epoch, global_step, pretrain_steps, checkpoint_dir,
-                tokenizer=None,  # Pretrain data is already tokenized
+                tokenizer=tokenizer,  # TODO 
                 batch_to_idx=None,  # No batch conditioning for pretraining
                 use_control_sets=False,  # No control sets in pretraining
                 max_cells=config.debug_pretrain_max_cells
@@ -512,21 +480,7 @@ def main():
     else:
         print("\n=== Skipping Phase 1: Pretraining (pretrain_epochs=0) ===")
     
-    # ------------------------------------------------------------------
-    # Re-initialise token embeddings if we switch objective to Δ (fine-tune)
-    # ------------------------------------------------------------------
-    if getattr(config, "target_is_delta", False) and args.reinit_weights:
-        print("Re-initialising token embeddings and head for Δ objective (fine-tune phase)")
-        torch.nn.init.normal_(model.token_emb.weight, mean=0.0, std=0.02)
-        # Re-initialise output head (both weight and bias) to prevent early-step bias toward pre-training bins
-        if hasattr(model, "head"):
-            torch.nn.init.normal_(model.head.weight, mean=0.0, std=0.02)
-            if model.head.bias is not None:
-                torch.nn.init.zeros_(model.head.bias)
-    # Alternative: To completely remove bias, modify the model architecture in models/diffusion.py:
-    # self.head = nn.Linear(config.dim, config.vocab_size, bias=False)
     print("\n=== Phase 2: Fine-tuning with Control Sets ===")
-    print(f"Using batch_size={config.pretrain_batch_size} optimized for {config.n_genes}-gene sequences")
     global_step = 0
     config_ft = config
     config_ft.learning_rate = config.finetune_learning_rate
@@ -537,7 +491,7 @@ def main():
         global_step = train_epoch_st(
             model, diffusion, vcc_dataloader, optimizer, config,
             epoch, global_step, finetune_steps, checkpoint_dir,
-            tokenizer=ft_tokenizer,  # VCC data needs tokenization
+            tokenizer=tokenizer,  # VCC data needs tokenization
             batch_to_idx=batch_to_idx,  # Pass batch mapping for conditioning
             use_control_sets=True,
             max_cells=config.debug_finetune_max_cells
@@ -548,7 +502,7 @@ def main():
             print("\n=== Validation Set Evaluation ===")
             val_metrics = val_epoch_st(
                 model, diffusion, val_dataloader,
-                epoch, ft_tokenizer, batch_to_idx,
+                epoch, tokenizer, batch_to_idx,
                 max_cells=config.debug_eval_max_cells
             )
             print(f"Validation loss: {val_metrics['val_loss']:.4f} ({val_metrics['val_batches_evaluated']} batches)")
@@ -570,8 +524,8 @@ def main():
                     config,
                     model,
                     diffusion,
-                    ft_tokenizer,
-                    ft_detokenizer,
+                    tokenizer,
+                    detokenizer,
                     gene_names,
                     hvg_to_full,
                     hvg_gene_ids,

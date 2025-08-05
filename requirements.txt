@@ -1,0 +1,6 @@
+scanpy>=1.9
+anndata>=0.10
+torch
+numpy
+scipy
+pandas
