@@ -42,6 +42,9 @@ import os
 # Add scripts directory to Python path to import fast_hvg
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import warnings
+warnings.filterwarnings("ignore", message="Variable names are not unique*", category=UserWarning)
+
 import numpy as np
 import pandas as pd
 import fast_hvg

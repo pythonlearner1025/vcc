@@ -22,6 +22,7 @@ import argparse
 from torch.profiler import profile, ProfilerActivity
 import contextlib
 from torch.utils.data import Dataset, DataLoader
+from types import SimpleNamespace
 
 from models.diffusion import (
     ConditionalModelConfig, 
@@ -31,14 +32,13 @@ from models.diffusion import (
     cosine_lr_schedule,
 )
 # Updated imports for cross-dataset HVGs
-from dataset.scrna_hvg_dataset import ScRNADatasetWithHVGs, create_scrna_hvg_dataloader
 from dataset.orion_paired import create_orion_train_val_dataloaders
 from dataset.vcc_paired_dataloader import create_vcc_train_val_dataloaders
 from tokenizer import (
     create_delta_tokenizer,
-    create_logbin_tokenizer,
-    TokenizedScRNADataset
+    create_logbin_tokenizer
 )
+from dataset.collators import OrionCollator
 
 def train_epoch_st(
     model: torch.nn.Module,
@@ -256,9 +256,9 @@ def main():
             full_eval=True,
             target_is_delta=True,
 
-            dim=640,
-            n_head=16,
-            n_layer=18,
+            dim=512,
+            n_head=8,
+            n_layer=8,
             ffn_mult=4,
 
             # tokenizer
@@ -266,8 +266,8 @@ def main():
             # max log1p value
             token_max_value=round(math.log1p(10000), 1),
             
-            n_genes=3000,
-            n_total_genes=3000,
+            n_genes=6297,
+            n_total_genes=6297,
             gene_embed_dim=512,
 
             use_batch_conditioning=True,
@@ -277,8 +277,8 @@ def main():
             control_set_dim_hidden=512,
 
             # BS
-            pretrain_batch_size=128,
-            vcc_set_size=128,
+            pretrain_batch_size=64,
+            vcc_set_size=64,
 
             # Diffusion
             n_timesteps=16,
@@ -305,16 +305,16 @@ def main():
             esm_proj_dim=512,
             
             # 1e6 cells x 5
-            pretrain_epochs=3,
-            finetune_epochs=3,
+            pretrain_epochs=1,
+            finetune_epochs=1,
 
             save_every=1500,
             eval_every=1,
             vcc_eval_interval=5000,
 
             # DEBUG
-            debug_pretrain_max_cells=None,
-            debug_finetune_max_cells=None,
+            debug_pretrain_max_cells=1,
+            debug_finetune_max_cells=1,
             debug_eval_max_cells=1000
         )
 
@@ -391,7 +391,7 @@ def main():
         hvg_gene_ids=hvg_gene_ensemble,
         tokenizer=tokenizer,
         set_size=config.vcc_set_size,
-        train_split=0.8,
+        train_split=0.9,
         num_workers=0,
         random_seed=42
     )
@@ -405,7 +405,7 @@ def main():
         n_samples_per_gene_train=10,  # Multiple samples per gene for training
         n_samples_per_gene_val=1,      # Single sample per gene for validation
         train_split=0.8,
-        num_workers=4,
+        num_workers=0,
         random_seed=42,
         normalize=False,
         blacklist_path=config.blacklist_path
@@ -416,10 +416,37 @@ def main():
     vcc_gene_to_idx = {gene: idx for idx, gene in enumerate(hvg_gene_ensemble)}
     
     # Create batch name to index mapping for conditioning
-    # Get unique batch names from the VCC dataset
-    unique_batches = sorted(list(set(vcc_dataset.adata.obs['batch'].values)))
+    # -- Complicated global batch index creating logic below --- 
+    # Merge unique batch names from both VCC and Orion datasets
+    vcc_batches = sorted(list(set(vcc_dataset.adata.obs['batch'].values)))
+
+    # Extract unique batch / sample names from Orion dataset
+    def _extract_unique_batches(ds):
+        base_ds = ds.dataset if hasattr(ds, 'dataset') else ds
+        return getattr(base_ds, 'unique_batches', [])
+
+    orion_batches = _extract_unique_batches(orion_dataloader.dataset)
+
+    unique_batches = sorted(set(vcc_batches) | set(orion_batches))
     batch_to_idx = {batch_name: idx for idx, batch_name in enumerate(unique_batches)}
+
+    # Update collate functions to use global batch mapping
+    if orion_dataloader is not None and hasattr(orion_dataloader, 'collate_fn'):
+        orion_dataloader.collate_fn = OrionCollator(tokenizer, config.vcc_set_size, batch_to_idx)
+    if vcc_dataloader is not None and hasattr(vcc_dataloader, 'collate_fn'):
+        if hasattr(vcc_dataloader.collate_fn, 'batch_to_idx'):
+            vcc_dataloader.collate_fn.batch_to_idx = batch_to_idx
+    # Also update the dataset attribute so other components (e.g., evaluation) can access it
+    if vcc_dataset is not None:
+        vcc_dataset.batch_to_idx = batch_to_idx
+    if val_dataset is not None:
+        val_dataset.batch_to_idx = batch_to_idx
+    if val_dataloader is not None and hasattr(val_dataloader, 'collate_fn'):
+        if hasattr(val_dataloader.collate_fn, 'batch_to_idx'):
+            val_dataloader.collate_fn.batch_to_idx = batch_to_idx
     print(f"Found {len(unique_batches)} unique batches for batch conditioning")
+    # -- end creating global batches --
+
     # Prepare gene mappings for full evaluation (optional)
     if getattr(config, "full_eval", False):
         from evaluate import _prepare_gene_mappings, _run_validation_merged
@@ -428,7 +455,6 @@ def main():
             config.finetune_data_path,
             config.hvg_info_path,
         )
-    
     # Initialise global_step based on checkpoint to continue LR schedule smoothly
     global_step = ckpt_state.get('global_step', 0) if ckpt_state else 0
     
@@ -454,18 +480,51 @@ def main():
     
     # Phase 1: Pretraining on single cells
     if config.pretrain_epochs > 0:
-        print(f"\n=== Phase 1: Pretraining on scRNA data ({config.pretrain_epochs} epochs) ===")
-        print(f"Using {len(orion_dataset):,} cells for pretraining")
+        print(f"\n=== Phase 1: Pretraining on Orion data ({config.pretrain_epochs} epochs) ===")
+        print(f"Using {len(orion_dataset):,} sets for Orion pretraining")
         
         for epoch in range(config.pretrain_epochs):
             global_step = train_epoch_st(
                 model, diffusion, orion_dataloader, optimizer, config,
                 epoch, global_step, pretrain_steps, checkpoint_dir,
                 tokenizer=tokenizer,  # TODO 
-                batch_to_idx=None,  # No batch conditioning for pretraining
+                batch_to_idx=batch_to_idx,  # Use global batch mapping for pretraining
                 use_control_sets=False,  # No control sets in pretraining
                 max_cells=config.debug_pretrain_max_cells
             )
+
+            # Evaluate on training set
+            if epoch % config.eval_every == 0:
+                print("\n=== Pretraining Validation ===")
+                val_metrics = val_epoch_st(
+                    model, diffusion, val_dataloader,
+                    epoch, tokenizer, batch_to_idx,
+                    max_cells=config.debug_eval_max_cells
+                )
+                print(f"Pretraining validation loss: {val_metrics['val_loss']:.4f} ({val_metrics['val_batches_evaluated']} batches)")
+                wandb.log(val_metrics)
+                if config.full_eval:
+                    eval_dir = checkpoint_dir / f"eval_pt_epoch{epoch}"
+                    eval_dir.mkdir(exist_ok=True)
+                    args_eval = SimpleNamespace(
+                        val_genes_number=10,
+                        val_set_size=config.vcc_set_size,
+                        blacklist_path=config.blacklist_path,
+                    )
+                    device_eval = next(model.parameters()).device
+                    _run_validation_merged(
+                        config,
+                        model,
+                        diffusion,
+                        tokenizer,
+                        detokenizer,
+                        gene_names,
+                        hvg_to_full,
+                        hvg_gene_ids,
+                        args_eval,
+                        device_eval,
+                        eval_dir,
+                    )
             
         # Save checkpoint after pretraining
         pretrain_checkpoint = checkpoint_dir / "checkpoint_st_pretrained.pt"
@@ -499,13 +558,13 @@ def main():
         
         # Evaluate on validation set
         if epoch % config.eval_every == 0:
-            print("\n=== Validation Set Evaluation ===")
+            print("\n=== Finetuning Validation ===")
             val_metrics = val_epoch_st(
                 model, diffusion, val_dataloader,
                 epoch, tokenizer, batch_to_idx,
                 max_cells=config.debug_eval_max_cells
             )
-            print(f"Validation loss: {val_metrics['val_loss']:.4f} ({val_metrics['val_batches_evaluated']} batches)")
+            print(f"Finetuning validation loss: {val_metrics['val_loss']:.4f} ({val_metrics['val_batches_evaluated']} batches)")
             wandb.log(val_metrics)
             # ------------------------------------------------------------------
             # Full evaluation (cell-eval metrics) – optional
@@ -513,7 +572,6 @@ def main():
             if getattr(config, "full_eval", False):
                 eval_dir = checkpoint_dir / f"eval_ft_epoch{epoch}"
                 eval_dir.mkdir(exist_ok=True)
-                from types import SimpleNamespace
                 args_eval = SimpleNamespace(
                     val_genes_number=10,
                     val_set_size=config.vcc_set_size,

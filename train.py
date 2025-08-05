@@ -312,16 +312,16 @@ def main():
             esm_proj_dim=512,
             
             # 1e6 cells x 5
-            pretrain_epochs=3,
-            finetune_epochs=3,
+            pretrain_epochs=1,
+            finetune_epochs=1,
 
             save_every=1500,
             eval_every=1,
             vcc_eval_interval=5000,
 
             # DEBUG
-            debug_pretrain_max_cells=None,
-            debug_finetune_max_cells=None,
+            debug_pretrain_max_cells=1,
+            debug_finetune_max_cells=1,
             debug_eval_max_cells=1000
         )
 
@@ -367,11 +367,6 @@ def main():
     
     # Wrap with tokenizer
     pretrain_dataset = TokenizedScRNADataset(scrna_dataset, pt_tokenizer)
-    
-    # NOTE: Using multiple worker processes duplicates the HDF5 reads 
-    # and actually slows down pre-training. A single worker keeps the
-    # per-batch cache in one process so each expression batch is read
-    # exactly once and then reused, giving a 3-4× speed-up versus 4 workers.
     pretrain_dataloader = DataLoader(
         pretrain_dataset,
         batch_size=config.pretrain_batch_size,
@@ -487,7 +482,7 @@ def main():
     # Phase 1: Pretraining on single cells
     if config.pretrain_epochs > 0:
         print(f"\n=== Phase 1: Pretraining on scRNA data ({config.pretrain_epochs} epochs) ===")
-        print(f"Using {len(pretrain_dataset):,} cells for pretraining")
+        print(f"Using {len(pretrain_dataset):,}  for pretraining")
         
         for epoch in range(config.pretrain_epochs):
             global_step = train_epoch_st(

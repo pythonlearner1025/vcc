@@ -197,7 +197,6 @@ def _run_validation_merged(
         adata_path=cfg.finetune_data_path,
         hvg_gene_ids=hvg_gene_ids,
         set_size=args.val_set_size,
-        batch_size=1,
         n_samples_per_gene_val=1,
         train_split=0.8,
         tokenizer=None,
@@ -332,8 +331,8 @@ def _run_test_generation(
         full.index_copy_(1, full_idx_t, expr_2k[:, valid_mask_t])
         return full
 
-    # Tokeniser still runs on CPU – pinned output lets us use non‑blocking copy
-    tokenizer, _ = create_logbin_tokenizer(cfg.vocab_size)
+    # Use Dleta tokenizer
+    tokenizer, _ = create_delta_tokenizer(cfg.vocab_size)
 
     # ------------------------------------------------------------------
     # Load control cells once, keep in backed mode

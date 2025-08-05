@@ -70,6 +70,7 @@ class VCCPairedDataset(Dataset):
         else:
             # Sanity check for log1p normalization using the same approach as scrna_hvg_dataset.py
             pass
+            '''
             X = self.adata.X
             
             # Basic range check - should be non-negative with reasonable max
@@ -80,6 +81,7 @@ class VCCPairedDataset(Dataset):
             mean_values = self.adata.X.mean(axis=0)
             print(f"Mean expression values across cells: {mean_values}")
             print(f"Overall mean expression value: {mean_values.mean():.2f}")
+            '''
 
         # Create gene name <-> ID mappings
         self.gene_name_to_id = dict(zip(self.adata.var.index, self.adata.var['gene_id']))

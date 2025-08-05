@@ -21,6 +21,9 @@ from pathlib import Path
 from typing import Dict, List, Sequence, Tuple
 from tqdm import tqdm
 
+import warnings
+warnings.filterwarnings("ignore", message="Variable names are not unique*", category=UserWarning)
+
 import numpy as np
 import scanpy as sc
 import torch
@@ -95,6 +98,8 @@ class OrionPairedDataset(Dataset):  # noqa: E501
                 self._ctrl_pool = cache["ctrl_pool"]
                 self._ctrl_file_to_count = defaultdict(int, cache["ctrl_file_to_count"])
                 self.gene_list = cache["gene_list"]
+                self._keep_gene_idx = cache.get("keep_gene_idx")
+                self.unique_batches = cache["unique_batches"]
                 return  # loaded successfully – skip expensive scan
             except Exception as e:
                 # Cache may be corrupted or incompatible with current code – rebuild
@@ -169,6 +174,13 @@ class OrionPairedDataset(Dataset):  # noqa: E501
             self._keep_gene_idx = None
 
         # ------------------------------------------------------------------
+        # Collect unique batch / sample names for downstream conditioning
+        # ------------------------------------------------------------------
+        pert_samples_all = [s for cells in self._pert_cells_by_gene.values() for _fp, _idx, s in cells]
+        ctrl_samples_all = list(self._ctrl_by_sample.keys())
+        self.unique_batches = sorted(set(pert_samples_all) | set(ctrl_samples_all))
+
+        # ------------------------------------------------------------------
         # Save the newly built index for future runs
         # ------------------------------------------------------------------
         try:
@@ -178,6 +190,8 @@ class OrionPairedDataset(Dataset):  # noqa: E501
                 "ctrl_pool": self._ctrl_pool,
                 "ctrl_file_to_count": dict(self._ctrl_file_to_count),
                 "gene_list": self.gene_list,
+                "keep_gene_idx": self._keep_gene_idx,
+                "unique_batches": self.unique_batches
             }
             with cache_path.open("wb") as f:
                 pickle.dump(cache, f)
