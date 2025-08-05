@@ -54,7 +54,7 @@ import torch
 # Local imports – reuse code from the training script and model package
 # -----------------------------------------------------------------------------
 
-from train import create_simple_tokenizer  # noqa: E402  – defined at top-level
+from tokenizer import create_logbin_tokenizer  # noqa: E402  – defined at top-level
 from models.diffusion import (
     ConditionalDiffusionTransformer,
     ConditionalModelConfig,
@@ -198,6 +198,7 @@ def _run_validation_merged(
         tokenizer=None,
         num_workers=0,
         normalize=False,
+        blacklist_path=args.blacklist_path,
     )
 
     X_true_parts = []
@@ -231,7 +232,13 @@ def _run_validation_merged(
             device=device,
         )
 
-        pred_expr_2k = _tokens_to_expression(pred_tokens, detokenizer)
+        # Convert tokens → expression.  For Δ-training we need to add the predicted
+        # change back to the control-cell baseline.
+        if cfg.target_is_delta:
+            pred_delta_2k = _tokens_to_expression(pred_tokens, detokenizer)
+            pred_expr_2k = np.clip(ctrl_expr.numpy() + pred_delta_2k, 0, None)
+        else:
+            pred_expr_2k = _tokens_to_expression(pred_tokens, detokenizer)
         true_expr_2k = pert_expr.numpy()
 
         # Map to 18 k space
@@ -250,8 +257,8 @@ def _run_validation_merged(
     X_pred = np.concatenate(X_pred_parts, axis=0)
     obs_df = pd.DataFrame({"target_gene": obs_labels})
 
-    pred_path = out_dir / "val_pred.h5ad"
-    true_path = out_dir / "val_true.h5ad"
+    pred_path = (out_dir / "val_pred.h5ad").resolve()
+    true_path = (out_dir / "val_true.h5ad").resolve()
     ad.AnnData(X_pred, obs=obs_df.copy(), var=pd.DataFrame(index=gene_names)).write_h5ad(pred_path, compression="gzip")
     ad.AnnData(X_true, obs=obs_df.copy(), var=pd.DataFrame(index=gene_names)).write_h5ad(true_path, compression="gzip")
 
@@ -264,7 +271,14 @@ def _run_validation_merged(
         "--profile", "full",
     ]
     subprocess.run(cmd, check=True)
-    print("Validation complete – results in cell-eval-outdir/")
+    # Move cell-eval results to correct output directory
+    import shutil
+    if Path("cell-eval-outdir").exists():
+        cell_eval_dest = out_dir / "cell-eval-outdir"
+        if cell_eval_dest.exists():
+            shutil.rmtree(cell_eval_dest)
+        shutil.move("cell-eval-outdir", cell_eval_dest)
+    print(f"Validation complete – results in {out_dir}/cell-eval-outdir/")
 
 
 # -----------------------------------------------------------------------------
@@ -286,9 +300,45 @@ def _run_test_generation(
     import pandas as pd
 
     test_df = pd.read_csv(args.test_genes_path)
-    target_genes = [g for g in test_df["target_gene"].values if g != "non-targeting"]
-    print(f"Generating predictions for {len(target_genes)} test genes")
+    # ---------------------------------------------------------------------
+    # Build full gene list **including** the negative control label
+    # ---------------------------------------------------------------------
+    target_genes = test_df["target_gene"].values.tolist()
+    print(f"Generating predictions for {len(target_genes)} test genes (incl. non-targeting)")
     mask_token = cfg.vocab_size - 1
+
+    # ---------------------------------------------------------------------
+    # Build helper objects: tokenizer and control-cell iterator
+    # ---------------------------------------------------------------------
+    from tokenizer import create_logbin_tokenizer  # local import to avoid circular deps
+    import itertools
+
+    tokenizer, _ = create_logbin_tokenizer(cfg.vocab_size)
+
+    # Re-use the paired dataloader to fetch real control cells (non-targeting)
+    (_, _), (val_ds, val_dl) = create_train_val_dataloaders(
+        adata_path=cfg.finetune_data_path,
+        hvg_gene_ids=hvg_gene_ids,
+        set_size=cfg.vcc_set_size,
+        batch_size=1,
+        n_samples_per_gene_val=1,
+        train_split=0.8,
+        tokenizer=None,
+        num_workers=0,
+        normalize=False,
+        blacklist_path=args.blacklist_path,
+    )
+    # Endless iterator cycling over validation samples
+    control_cycle = itertools.cycle(val_dl)
+
+    def _next_control_expr():
+        """Return a control-expression matrix (S,N) from a non-targeting sample."""
+        for sample in control_cycle:
+            # sample["control_expr"] has shape (1,S,N)
+            if sample["target_gene"][0] == "non-targeting":
+                return sample["control_expr"].squeeze(0)
+        # Should never happen but keeps mypy happy
+        raise RuntimeError("Could not find non-targeting control sample")
 
     all_expr_full = []
     all_obs_labels = []
@@ -301,6 +351,25 @@ def _run_test_generation(
             gene_name_to_hvg_idx[gene_names[name_idx]] = i
 
     for gene in target_genes:
+        # -----------------------------------------------------------------
+        # Special handling for the negative-control class.  For evaluation
+        # purposes we only need the label to be present – but to remain
+        # consistent with validation we output **real control cells**,
+        # sampled from the dataset via the helper iterator defined above.
+        # -----------------------------------------------------------------
+        if gene == "non-targeting":
+            S = cfg.vcc_set_size
+            n_needed = args.test_sample_size
+            n_batches = math.ceil(n_needed / S)
+            for _ in range(n_batches):
+                ctrl_expr = _next_control_expr()  # (S,N)
+                expr_full = _build_18k_matrix(ctrl_expr.numpy(), hvg_to_full, len(gene_names))
+
+                take = min(S, n_needed - len(all_obs_labels))
+                all_expr_full.append(expr_full[:take])
+                all_obs_labels.extend(["non-targeting"] * take)
+            continue
+
         if gene not in gene_name_to_hvg_idx:
             print(f"WARNING  gene {gene} not part of HVG list – skipping")
             continue
@@ -312,13 +381,18 @@ def _run_test_generation(
         n_needed = args.test_sample_size
         n_batches = math.ceil(n_needed / S)
 
-        for b in range(n_batches):
+        for _ in range(n_batches):
+            # Fetch a fresh control set (sampled from non-targeting cells)
+            ctrl_expr = _next_control_expr()  # (S,N)
+            tokens_ctrl = tokenizer(ctrl_expr).to(device)
+            ctrl_expanded = tokens_ctrl.unsqueeze(0).expand(S, -1, -1)
+
             # Always sample with batch size S to match training, then truncate later
             pred_tokens = diffusion.p_sample_loop(
                 model,
                 mask_token=mask_token,
                 shape=(S, cfg.n_genes),
-                control_set=None,
+                control_set=ctrl_expanded,
                 target_gene_idx=torch.full((S,), hvg_idx, dtype=torch.long, device=device),
                 batch_idx=torch.zeros(S, dtype=torch.long, device=device),
                 device=device,
@@ -330,7 +404,7 @@ def _run_test_generation(
             take = min(S, n_needed - len(all_obs_labels))
             all_expr_full.append(expr_full[:take])
             all_obs_labels.extend([gene] * take)
-        # end for b
+        # end for batches
     # end for gene
 
     if not all_expr_full:
@@ -365,6 +439,7 @@ def main():
     p.add_argument("--test_sample_size", type=int, default=64)
     p.add_argument("--test_gene_names_path", default="data/vcc_data/gene_names.csv", type=Path)
     p.add_argument("--hvg_ids_path", default="hvg_seuratv3_global_scRNA1e5_2000.txt", type=Path)
+    p.add_argument("--blacklist_path", default="data/blacklist.txt", type=Path)
     args = p.parse_args()
 
     ts = time.strftime("%Y%m%d_%H%M%S")
@@ -385,7 +460,7 @@ def main():
     # ---------------------------------------------------------------------
     # 2. Tokeniser / detokeniser
     # ---------------------------------------------------------------------
-    tokenizer, detokenizer = create_simple_tokenizer(cfg.vocab_size)
+    tokenizer, detokenizer = create_logbin_tokenizer(cfg.vocab_size)
 
     # ---------------------------------------------------------------------
     # 3. Gene mappings (18k list + HVG idx mapping)
@@ -430,3 +505,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+'''
+cell-eval prep -i /workspace/vcc/evals/eval_20250802_051921/test_predictions.h5ad -g /workspace/vcc/data/vcc_data/gene_names.csv
+'''

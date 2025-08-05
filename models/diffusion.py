@@ -9,8 +9,15 @@ including the model architecture, diffusion process, and associated utilities.
 import math
 import json
 import torch
+
+# Enable fast TensorFloat-32 matmul on Ampere+
+if torch.cuda.is_available():
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+
 import torch.nn as nn
 import torch.nn.functional as F
+from adam_atan2 import AdamATan2
 import numpy as np
 from typing import Dict, List, Tuple, Optional
 from dataclasses import dataclass
@@ -33,6 +40,7 @@ class ConditionalModelConfig:
     n_layer: int = 8
     ffn_mult: int = 8
     vocab_size: int = 64  # 64 expression bins
+    token_max_value: float = 9.2
     n_genes: int = 2000  # Number of HVGs
 
     # Training target type
@@ -98,6 +106,8 @@ class ConditionalModelConfig:
     debug_pretrain_max_cells: Optional[int] = None 
     debug_finetune_max_cells: Optional[int] = None
     debug_eval_max_cells: int = 3200  # ~50 batches with batch_size=64
+    full_eval: bool = False  # Run full cell-eval suite each epoch
+    blacklist_path: str = "data/blacklist.txt"
     
     @property
     def n_params(self) -> int:
@@ -202,12 +212,12 @@ class MultiQueryAttention(nn.Module):
             k = k.unsqueeze(1).expand(-1, self.n_head, -1, -1)  # (B, H, M, HD)
             v = v.unsqueeze(1).expand(-1, self.n_head, -1, -1)  # (B, H, M, HD)
             
-            # Attention
-            scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)  # (B, H, N, M)
-            attn = F.softmax(scores, dim=-1)
-            out = torch.matmul(attn, v)  # (B, H, N, HD)
-            
-            # Reshape
+            # Scaled-Dot-Product Attention (flash-aware, PyTorch ≥2.1)
+            out = F.scaled_dot_product_attention(
+                q, k, v, dropout_p=0.0, is_causal=False
+            )  # (B, H, N, HD)
+
+            # Reshape back to (B, N, D)
             out = out.transpose(1, 2).contiguous().view(B, N, D)
         
         # Project output
@@ -514,8 +524,21 @@ class ConditionalDiffusionTransformer(nn.Module):
         # ------------------------------------------------------------------
         #  (5) Transformer
         # ------------------------------------------------------------------
+        use_ckpt = self.training and torch.is_grad_enabled()
         for block in self.blocks:
-            x = block(x, context=context)
+            if use_ckpt:
+                # Activation checkpointing to trade compute for memory.
+                # Pass the context tensor explicitly to avoid it being captured
+                # by the Python closure which breaks checkpointing and leads
+                # to "Trying to backward through the graph a second time" errors.
+                def _forward(_x, _ctx):
+                    # Ensure recomputation happens under the same AMP context as the first pass
+                    with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                        return block(_x, context=_ctx)
+                # Use the newer non-re-entrant checkpointing so AMP state is preserved
+                x = torch.utils.checkpoint.checkpoint(_forward, x, context, use_reentrant=False)
+            else:
+                x = block(x, context=context)
 
         # ------------------------------------------------------------------
         #  (6) Output head
@@ -769,7 +792,7 @@ class PartialMaskingDiffusion:
 
 
 def create_optimizer(model: nn.Module, config: ConditionalModelConfig):
-    """Create AdamW optimizer with weight decay."""
+    """Create AdamAtan2 optimizer with weight decay."""
     decay = set()
     no_decay = set()
     
@@ -790,7 +813,14 @@ def create_optimizer(model: nn.Module, config: ConditionalModelConfig):
         {"params": [param_dict[pn] for pn in sorted(no_decay)], "weight_decay": 0.0},
     ]
     
-    return torch.optim.AdamW(optim_groups, lr=config.learning_rate, betas=(0.9, 0.95))
+    # Prefer 8-bit Adam if bitsandbytes is available
+    try:
+        from adam_atan2 import AdamATan2 as _AdamW
+        print("Using AdamATan2 optimizer")
+    except ImportError:
+        _AdamW = AdamATan2
+    
+    return _AdamW(optim_groups, lr=config.learning_rate, betas=(0.9, 0.95))
 
 
 def cosine_lr_schedule(optimizer, step: int, total_steps: int, config: ConditionalModelConfig):
