@@ -9,6 +9,8 @@ scRNA_norm/
 artifacts/
 __pycache__/
 wandb/
+models/diffusion.py.backup
+*.backup
 
 # out dirs
 checkpoints/
