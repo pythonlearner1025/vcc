@@ -514,7 +514,7 @@ def main():
     # ------------------------------------------------------------------
     # Re-initialise token embeddings if we switch objective to Δ (fine-tune)
     # ------------------------------------------------------------------
-    if getattr(config, "target_is_delta", False) and args.continue_from != "finetune":
+    if getattr(config, 'target_is_delta', False):
         print("Re-initialising token embeddings for Δ objective (fine-tune phase)")
         torch.nn.init.normal_(model.token_emb.weight, mean=0.0, std=0.02)
         # Re-initialise output head as well so logits match new embedding

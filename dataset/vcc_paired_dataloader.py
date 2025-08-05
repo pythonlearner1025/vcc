@@ -186,8 +186,9 @@ class VCCPairedDataset(Dataset):
                         continue
 
                 pert_cells = obs.index[ct_mask].values
-                if len(pert_cells) < self.set_size:
-                    skipped_entries.append((f"{gene}/{cell_type}", f"only {len(pert_cells)} perturbed cells"))
+                # If there are no perturbed cells for this gene / cell-type combo, skip it entirely
+                if len(pert_cells) == 0:
+                    skipped_entries.append((f"{gene}/{cell_type}", "no perturbed cells"))
                     continue
 
                 # batches where this gene was perturbed within this cell_type
@@ -200,13 +201,19 @@ class VCCPairedDataset(Dataset):
                     (obs['cell_type'] == cell_type)
                 )
                 ctrl_cells = obs.index[ctrl_mask].values
-                if len(ctrl_cells) < self.set_size:
-                    skipped_entries.append((f"{gene}/{cell_type}", f"only {len(ctrl_cells)} control cells"))
+                # If there are no control cells available, skip this entry
+                if len(ctrl_cells) == 0:
+                    skipped_entries.append((f"{gene}/{cell_type}", "no control cells"))
                     continue
 
                 for _ in range(self.n_samples_per_gene):
-                    pert_sample = rng.choice(pert_cells, self.set_size, replace=False)
-                    ctrl_sample = rng.choice(ctrl_cells, self.set_size, replace=False)
+                    # Dynamically allow sampling **with replacement** when the available cells are fewer than the
+                    # desired set size. This guarantees that we still create a set of exactly ``self.set_size``
+                    # cells while making use of every unique cell that exists.
+                    replace_pert = len(pert_cells) < self.set_size
+                    replace_ctrl = len(ctrl_cells) < self.set_size
+                    pert_sample = rng.choice(pert_cells, self.set_size, replace=replace_pert)
+                    ctrl_sample = rng.choice(ctrl_cells, self.set_size, replace=replace_ctrl)
                     self.samples.append({
                         'gene': gene,
                         'gene_idx': self.gene_to_hvg_idx[gene],

@@ -17,7 +17,6 @@ if torch.cuda.is_available():
 
 import torch.nn as nn
 import torch.nn.functional as F
-from adam_atan2 import AdamATan2
 import numpy as np
 from typing import Dict, List, Tuple, Optional
 from dataclasses import dataclass
@@ -792,7 +791,7 @@ class PartialMaskingDiffusion:
 
 
 def create_optimizer(model: nn.Module, config: ConditionalModelConfig):
-    """Create AdamAtan2 optimizer with weight decay."""
+    """Create AdamW optimizer with weight decay."""
     decay = set()
     no_decay = set()
     
@@ -815,10 +814,10 @@ def create_optimizer(model: nn.Module, config: ConditionalModelConfig):
     
     # Prefer 8-bit Adam if bitsandbytes is available
     try:
-        from adam_atan2 import AdamATan2 as _AdamW
-        print("Using AdamATan2 optimizer")
+        from bitsandbytes.optim import Adam8bit as _AdamW
+        print("Using bitsandbytes Adam8bit optimizer")
     except ImportError:
-        _AdamW = AdamATan2
+        _AdamW = torch.optim.AdamW
     
     return _AdamW(optim_groups, lr=config.learning_rate, betas=(0.9, 0.95))
 
