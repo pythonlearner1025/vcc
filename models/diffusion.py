@@ -101,7 +101,7 @@ class ConditionalModelConfig:
     log_every: int = 100
     eval_every: int = 1000
     save_every: int = 5000
-    vcc_eval_interval: int = 5000
+    max_eval_steps: int = 25
 
     debug_pretrain_max_cells: Optional[int] = None 
     debug_finetune_max_cells: Optional[int] = None
@@ -258,10 +258,12 @@ class TransformerBlock(nn.Module):
         
         # Cross-attention (if context provided)
         if context is not None:
+            #print(f"block context.shape: {context.shape}")
             x = x + self.cross_attn(self.ln2(x), kv=context)
         
         # FFN
         x = x + self.mlp(self.ln3(x))
+        #print(f"block x.shape: {x.shape}")
         
         return x
 
@@ -501,7 +503,13 @@ class ConditionalDiffusionTransformer(nn.Module):
         # ------------------------------------------------------------------
         context = None
         if control_set is not None:
+            # Broadcast if collator provided a single control set for the whole batch
+            #if control_set.dim() == 3 and control_set.size(0) == 1 and control_set.size(0) != tokens.size(0):
+                #control_set = control_set.expand(tokens.size(0), -1, -1)
+                #print(f"")
             context = self.control_encoder(control_set.float())  # (B, S, D)
+        
+        #print(f"context.shape: {context.shape}")
 
         # ------------------------------------------------------------------
         #  (4) Conditioning vector (target gene + batch) if provided

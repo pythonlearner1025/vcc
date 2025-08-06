@@ -89,18 +89,16 @@ def train_epoch_st(
                 break
 
             tokens = batch['tokens'].to(device, non_blocking=True)
-            X_ctrl = batch.get('control', None)
-            if X_ctrl is not None:
-                X_ctrl = X_ctrl.cuda()
-            target_gene_idx = batch.get('target_gene_idx', None)
-            if target_gene_idx is not None:
-                target_gene_idx = target_gene_idx.cuda()
-            batch_indices = batch.get('batch_idx', None)
-            if batch_indices is not None:
-                batch_indices = batch_indices.cuda()
+            X_ctrl = batch['control'] if 'control' in batch else None
+            X_ctrl = X_ctrl.to(device, non_blocking=True)
+            target_gene_idx = batch['target_gene_idx'] if 'target_gene_idx' in batch else None 
+            target_gene_idx = target_gene_idx.to(device, non_blocking=True)
+            batch_indices = batch['batch_idx'] if 'batch_idx' in batch else None
+            batch_indices = batch_indices.to(device, non_blocking=True)
             cells_processed += tokens.shape[0]
-      
-            
+
+            #print(f"X_ctrl shape: {X_ctrl.shape}")
+
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                 loss = diffusion.compute_loss(
                     model,
@@ -310,7 +308,7 @@ def main():
 
             save_every=1500,
             eval_every=1,
-            vcc_eval_interval=5000,
+            max_eval_steps=1,
 
             # DEBUG
             debug_pretrain_max_cells=1,
@@ -386,7 +384,7 @@ def main():
     print(f"\nModel created with {sum(p.numel() for p in model.parameters()):,} parameters")
 
     # Create Orion pretrain and validation dataloaders
-    (orion_dataset, orion_dataloader), (orion_dataset, orion_dataloader) = create_orion_train_val_dataloaders(
+    (orion_train_ds, orion_train_dl), (orion_val_ds, orion_val_dl) = create_orion_train_val_dataloaders(
         batches_dir=config.pretrain_data_dir,
         hvg_gene_ids=hvg_gene_ensemble,
         tokenizer=tokenizer,
@@ -395,6 +393,9 @@ def main():
         num_workers=0,
         random_seed=42
     )
+    # Backward-compatibility aliases for existing variable names
+    orion_dataloader = orion_train_dl
+    orion_dataset = orion_train_ds
     
      # Create VCC train and validation dataloaders
     (vcc_dataset, vcc_dataloader), (val_dataset, val_dataloader) = create_vcc_train_val_dataloaders(
@@ -481,7 +482,7 @@ def main():
     # Phase 1: Pretraining on single cells
     if config.pretrain_epochs > 0:
         print(f"\n=== Phase 1: Pretraining on Orion data ({config.pretrain_epochs} epochs) ===")
-        print(f"Using {len(orion_dataset):,} sets for Orion pretraining")
+        print(f"Using {len(orion_train_ds):,} sets for Orion pretraining")
         
         for epoch in range(config.pretrain_epochs):
             global_step = train_epoch_st(
@@ -524,6 +525,10 @@ def main():
                         args_eval,
                         device_eval,
                         eval_dir,
+                        batch_to_idx=batch_to_idx,
+                        max_steps=config.max_eval_steps
+                        val_ds=orion_val_ds,
+                        val_dl=orion_val_dl,
                     )
             
         # Save checkpoint after pretraining
@@ -590,6 +595,10 @@ def main():
                     args_eval,
                     device_eval,
                     eval_dir,
+                    batch_to_idx=batch_to_idx,
+                    max_steps=config.max_eval_steps,
+                    val_ds=val_dataset,
+                    val_dl=val_dataloader
                 )
     
     # Final save

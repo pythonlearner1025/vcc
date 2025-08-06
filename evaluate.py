@@ -49,6 +49,7 @@ from tqdm import tqdm
 import anndata as ad
 import numpy as np
 import scanpy as sc
+import pandas as pd
 import torch
 
 # -----------------------------------------------------------------------------
@@ -145,12 +146,24 @@ def _build_18k_matrix(
     expr_2k: np.ndarray, hvg_to_full: np.ndarray, n_full: int
 ) -> np.ndarray:
     """Insert HVG expression into zero-initialised 18,080-gene matrix."""
-    B, N = expr_2k.shape
-    out = np.zeros((B, n_full), dtype=np.float32)
+    print(expr_2k.shape)
+    S, N = expr_2k.shape
+    out = np.zeros((S, n_full), dtype=np.float32)
     # since if gname not in hvg, its -1 
     valid_mask = hvg_to_full >= 0
     out[:, hvg_to_full[valid_mask]] = expr_2k[:, valid_mask]
     return out
+
+
+def _build_global_batch_mapping(cfg: ConditionalModelConfig, vcc_batches: Sequence[str]) -> Dict[str, int]:
+    """Create merged batch_to_idx mapping identical to `train_orion.py` logic."""
+    from dataset.orion_paired import OrionPairedDataset  # local import to avoid heavy deps unless needed
+    orion_ds = OrionPairedDataset(cfg.pretrain_data_dir,
+                                  set_size=cfg.vcc_set_size,
+                                  hvg_gene_ids=None,
+                                  seed=0)
+    unique_batches = sorted(set(vcc_batches) | set(orion_ds.unique_batches))
+    return {b: idx for idx, b in enumerate(unique_batches)}
 
 
 def _write_anndata(
@@ -187,51 +200,59 @@ def _run_validation_merged(
     args,
     device: torch.device,
     out_dir: Path,
+    batch_to_idx: Dict[str, int] | None = None,
+    val_ds=None,
+    val_dl=None,
+    max_steps: int = 10
 ):
     """Generate one merged prediction/ground-truth pair for all
     validation genes and run cell-eval once."""
-    import pandas as pd
     mask_token = cfg.vocab_size - 1
+    # Default: if caller did not supply val_ds/dl we will create VCC val loader below
 
-    (_, _), (val_ds, val_dl) = create_vcc_train_val_dataloaders(
-        adata_path=cfg.finetune_data_path,
-        hvg_gene_ids=hvg_gene_ids,
-        set_size=args.val_set_size,
-        n_samples_per_gene_val=1,
-        train_split=0.8,
-        tokenizer=None,
-        num_workers=0,
-        normalize=False,
-        blacklist_path=args.blacklist_path,
-    )
+    # ------------------------------------------------------------------
+    # Build merged batch_to_idx mapping identical to training
+    # ------------------------------------------------------------------
+    if batch_to_idx is None:
+        if hasattr(val_ds, 'adata'):
+            vcc_batches = sorted(list(set(val_ds.adata.obs['batch'].values)))
+        else:
+            # Orion Subset case
+            base_ds = val_ds.dataset if hasattr(val_ds, 'dataset') else val_ds
+            vcc_batches = []
+        batch_to_idx = _build_global_batch_mapping(cfg, vcc_batches)
+    setattr(val_ds, 'batch_to_idx', batch_to_idx)
 
     X_true_parts = []
     X_pred_parts = []
     obs_labels: list[str] = []
 
+    steps = 0
     for sample in val_dl:
-        pert_expr = sample["perturbed_expr"].squeeze(0)  # (S,N)
-        ctrl_expr = sample["control_expr"].squeeze(0)
-        gene_name: str = sample["target_gene"][0]
-        gene_idx = int(sample.get("gene_idx", sample.get("target_gene_idx")).item())
-        batches = sample["pert_batches"]
+        if steps >= max_steps:
+            break
+        steps += 1
+        delta_expr = sample["tokens"].squeeze(0)  # (S,N)
+        ctrl_expr = sample["control"].squeeze(0) # (S,S,N)
+        pert_expr = ctrl_expr[0] + delta_expr
+        gene_idxs_raw = sample["target_gene_idx"]
+        gene_idxs = gene_idxs_raw.to(device, non_blocking=True)
+        batches = sample["batch_idx"]
         S, N = pert_expr.shape
 
         # Tokenise
-        tokens_pert = tokenizer(pert_expr).to(device)
-        tokens_ctrl = tokenizer(ctrl_expr).to(device)
-        ctrl_expanded = tokens_ctrl.unsqueeze(0).expand(S, -1, -1)
+        tokens_ctrl = tokenizer(ctrl_expr).to(device, non_blocking=True).unsqueeze(0)
+        print(f"eval tokens_ctrl.shape: {tokens_ctrl.shape}")
 
         batch_to_idx = val_ds.batch_to_idx
-        batch_idx = torch.tensor([batch_to_idx.get(b, 0) for b in batches], dtype=torch.long, device=device)
-        target_gene_idx = torch.full((S,), gene_idx, dtype=torch.long, device=device)
+        batch_idx = torch.tensor([batch_to_idx.get(b, 0) for b in batches], dtype=torch.long).to(device, non_blocking=True)
 
         pred_tokens = diffusion.p_sample_loop(
             model,
             mask_token=mask_token,
             shape=(S, cfg.n_genes),
-            control_set=ctrl_expanded,
-            target_gene_idx=target_gene_idx,
+            control_set=tokens_ctrl,
+            target_gene_idx=gene_idxs,
             batch_idx=batch_idx,
             device=device,
         )
@@ -252,7 +273,9 @@ def _run_validation_merged(
 
         X_true_parts.extend([ctrl_full, true_full])
         X_pred_parts.extend([ctrl_full, pred_full])
-        obs_labels.extend(["non-targeting"] * S + [gene_name] * S)
+        print(gene_idxs_raw)
+        # Append labels for control and perturbed cells (S each)
+        obs_labels.extend(["non-targeting"] * S + [gene_names[i] for i in gene_idxs_raw])
 
         if len(X_true_parts) // 2 >= args.val_genes_number:
             break
@@ -396,7 +419,6 @@ def _run_test_generation(
             tokens_ctrl   = tokenizer(ctrl_expr_cpu)             # CPU LongTensor
             tokens_ctrl   = tokens_ctrl.pin_memory()             # allow async copy
             tokens_ctrl_t = tokens_ctrl.to(device, non_blocking=True)
-            ctrl_pad_t    = tokens_ctrl_t.unsqueeze(0).expand(S, -1, -1)
 
             if is_control:
                 # Simply return real control cells – still scatter on GPU
@@ -409,7 +431,7 @@ def _run_test_generation(
                     model,
                     mask_token     = mask_token,
                     shape          = (S, cfg.n_genes),
-                    control_set    = ctrl_pad_t,
+                    control_set    = tokens_ctrl_t,
                     target_gene_idx= tgt_idx_t,
                     batch_idx      = torch.zeros(S, dtype=torch.long,
                                                  device=device),

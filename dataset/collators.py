@@ -49,17 +49,16 @@ class OrionCollator:
 
         # Tokenise (vectorised over set)
         delta_tok = self.tokenizer((pert - ctrl).unsqueeze(0)).squeeze(0)  # (S,N)
-        ctrl_tok = self.tokenizer(ctrl.unsqueeze(0)).squeeze(0)            # (S,N)
+        ctrl_tok = self.tokenizer(ctrl.unsqueeze(0))            # (1,S,N)
 
         # Expand control set so each perturbed cell gets full control matrix
-        ctrl_tok_expanded = ctrl_tok.unsqueeze(0).expand(S, -1, -1)  # (S,S,N)
 
         # Batch indices
         batch_idx = torch.tensor([self._map_batch(b) for b in sample["pert_batches"]], dtype=torch.long)
 
         return {
             "tokens": delta_tok.long(),              # (S,N)
-            "control": ctrl_tok_expanded.long(),     # (S,S,N)
+            "control": ctrl_tok.long(),     # (S,S,N)
             "batch_idx": batch_idx,                  # (S,)
             "target_gene_idx": torch.tensor(sample["target_gene_idx"], dtype=torch.long).repeat(S),
         }
@@ -93,16 +92,14 @@ class VCCCollator:
 
         delta_expr = pert - ctrl  # (S,N)
         delta_tok = self.tokenizer(delta_expr.unsqueeze(0)).squeeze(0)  # (S,N)
-        ctrl_tok = self.tokenizer(ctrl.unsqueeze(0)).squeeze(0)         # (S,N)
-
-        ctrl_tok_expanded = ctrl_tok.unsqueeze(0).expand(S, -1, -1)  # (S,S,N)
+        ctrl_tok = self.tokenizer(ctrl.unsqueeze(0))         # (S,N)
 
         # Map batch names to integer indices
         batch_idx = torch.tensor([self.batch_to_idx.get(b, 0) for b in sample["pert_batches"]], dtype=torch.long)
 
         return {
             "tokens": delta_tok.long(),
-            "control": ctrl_tok_expanded.long(),
+            "control": ctrl_tok.long(),
             "batch_idx": batch_idx,  # (S,)
             "target_gene_idx": torch.tensor(sample["target_gene_idx"], dtype=torch.long).repeat(S),
         }
