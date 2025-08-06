@@ -44,8 +44,8 @@ from models.diffusion import (
     ConditionalModelConfig, 
     ConditionalDiffusionTransformer,
     PartialMaskingDiffusion,
-    create_optimizer,
-    cosine_lr_schedule,
+    create_muon_optimizer,
+    get_lr,
 )
 # Updated imports for cross-dataset HVGs
 from dataset.orion_paired import create_orion_train_val_dataloaders
@@ -73,7 +73,7 @@ def train_epoch_st(
     model: torch.nn.Module,
     diffusion: PartialMaskingDiffusion,
     dataloader: torch.utils.data.DataLoader,
-    optimizer: torch.optim.Optimizer,
+    opts: Tuple[torch.optim.Optimizer, torch.optim.lr_scheduler.LambdaLR],
     config: ConditionalModelConfig,
     epoch: int,
     global_step: int,
@@ -147,19 +147,22 @@ def train_epoch_st(
                 )
             e2 = time.time()
             print(f'step time: {(e2-e1)*1000:.0f}ms')
-            
+
+            optimizer, scheduler = opts 
             optimizer.zero_grad()
-            lr = cosine_lr_schedule(optimizer, global_step, total_training_steps, config)
             loss.backward()
-            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            #grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0) no grad when using Muon
             optimizer.step()
+            scheduler.step()
             
             epoch_losses.append(loss.item())
             e3 = time.time()
             print(f'backward time: {(e3-e2)*1000:.0f}ms')
             
             if global_step % 1 == 0:
-                print(f"grad_norm: {grad_norm}")
+                # Get current learning rate from scheduler
+                lr = scheduler.get_last_lr()[0]
+                
                 avg_loss = np.mean(epoch_losses[-100:] if len(epoch_losses) > 100 else epoch_losses)
                 print(f"Epoch {epoch:3d} [{batch_idx+1:4d}/{len(dataloader):4d}] | "
                     f"Step {global_step:6d} | Loss: {loss.item():.4f} | "
@@ -335,8 +338,8 @@ def main():
             vcc_batch_size=1,
             
             # LR
-            learning_rate=2e-4,
-            weight_decay=0.01,
+            adam_lr=2e-4,
+            muon_lr=2e-2,
             warmup_steps=1000,
             finetune_learning_rate=5e-5,
             finetune_warmup_steps=500,
@@ -502,7 +505,8 @@ def main():
     else:
         print("Torch compilation disabled (TORCH_COMPILE_MODE=disable)")
     diffusion = PartialMaskingDiffusion(config)
-    optimizer = create_optimizer(model, config)
+    optimizer = create_muon_optimizer(model, config)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, get_lr) 
     # If continuing from a checkpoint try to restore optimizer state
     if args.ckpt_pt and "optimizer_state_dict" in ckpt_state:
         try:
@@ -549,7 +553,7 @@ def main():
         
         for epoch in range(config.pretrain_epochs):
             global_step = train_epoch_st(
-                model, diffusion, orion_dataloader, optimizer, config,
+                model, diffusion, orion_dataloader, (optimizer, scheduler), config,
                 epoch, global_step, pretrain_steps, checkpoint_dir,
                 tokenizer=tokenizer,  # TODO 
                 batch_to_idx=batch_to_idx,  # Use global batch mapping for pretraining
@@ -612,11 +616,12 @@ def main():
     config_ft = config
     config_ft.learning_rate = config.finetune_learning_rate
     config_ft.warmup_steps  = config.finetune_warmup_steps
-    optimizer = create_optimizer(model, config_ft)
+    optimizer = create_muon_optimizer(model, config_ft)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, get_lr) 
     
     for epoch in range(config.finetune_epochs):
         global_step = train_epoch_st(
-            model, diffusion, vcc_dataloader, optimizer, config,
+            model, diffusion, vcc_dataloader, (optimizer, scheduler), config,
             epoch, global_step, finetune_steps, checkpoint_dir,
             tokenizer=tokenizer,  # VCC data needs tokenization
             batch_to_idx=batch_to_idx,  # Pass batch mapping for conditioning

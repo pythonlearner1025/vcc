@@ -10,9 +10,11 @@ artifacts/
 __pycache__/
 wandb/
 models/diffusion.py.backup
+compare_metrics.py
 *.backup
 *.pkl
 *.whl
+*.tsv
 
 # out dirs
 checkpoints/

@@ -21,14 +21,7 @@ from adam_atan2 import AdamATan2
 import numpy as np
 from typing import Dict, List, Tuple, Optional
 from dataclasses import dataclass
-
-# Try to import flash_attn
-try:
-    from flash_attn import flash_attn_func
-    print("USING FLASH ATTN")
-    HAS_FLASH_ATTN = True
-except ImportError:
-    HAS_FLASH_ATTN = False
+from muon import MuonWithAuxAdam
 
 # ----------------------------------------------------------------------
 # Transformer-Engine (FP8) integration
@@ -107,9 +100,11 @@ class ConditionalModelConfig:
     
     # Training parameters
     pretrain_batch_size: int = 32
-    learning_rate: float = 1e-4
-    weight_decay: float = 0.01
-    warmup_steps: int = 500
+    adam_lr: float = 1e-4
+    muon_lr: float = 1e-4
+    warmup_steps: int = 500 # lr exp inc
+    num_steps: int = 1500 # lr constant
+    cooldown_steps: int = 500 # lr exp dec
 
     finetune_learning_rate: float = 3e-5
     finetune_warmup_steps: int = 500
@@ -199,11 +194,7 @@ class MultiQueryAttention(nn.Module):
         
         # Output projection
         self.out_proj = Linear(dim, dim)
-        
-        # We now rely on PyTorch 2.1+ scaled_dot_product_attention which automatically
-        # dispatches to FlashAttention-2 kernels on Hopper, so we no longer need the
-        # external flash_attn_func path.
-        self.use_flash_attn = False
+
         
     def forward(self, x: torch.Tensor, kv: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
@@ -289,8 +280,6 @@ class TransformerBlock(nn.Module):
         
         # FFN
         x = x + self.mlp(self.ln3(x))
-        #print(f"block x.shape: {x.shape}")
-        
         return x
 
 
@@ -826,53 +815,43 @@ class PartialMaskingDiffusion:
         
         return x
 
-
-def create_optimizer(model: nn.Module, config: ConditionalModelConfig):
-    """Create AdamAtan2 optimizer with weight decay."""
-    decay = set()
-    no_decay = set()
-    
-    for mn, m in model.named_modules():
-        for pn, p in m.named_parameters(recurse=False):
-            fpn = f"{mn}.{pn}" if mn else pn
-            
-            if pn.endswith('bias'):
-                no_decay.add(fpn)
-            elif pn.endswith('weight') and isinstance(m, (nn.LayerNorm, nn.Embedding)):
-                no_decay.add(fpn)
-            else:
-                decay.add(fpn)
-    
-    param_dict = {pn: p for pn, p in model.named_parameters()}
-    optim_groups = [
-        {"params": [param_dict[pn] for pn in sorted(decay)], "weight_decay": config.weight_decay},
-        {"params": [param_dict[pn] for pn in sorted(no_decay)], "weight_decay": 0.0},
+def create_muon_optimizer(model: nn.Module, config: ConditionalModelConfig):
+    """Create Muon optimizer with weight decay."""
+    hidden_weights = [
+        p for n, p in model.named_parameters()
+        if p.ndim == 2 and
+        not any(x in n for x in ["token_emb", "id_emb", "batch_embed"])
     ]
-    
-    # Prefer 8-bit Adam from bitsandbytes if available
-    try:
-        import bitsandbytes as bnb
-        _AdamW = bnb.optim.Adam8bit
-        print("Using 8-bit Adam optimizer")
-    except Exception:
-        try:
-            from adam_atan2 import AdamATan2 as _AdamW
-            print("Using AdamATan2 optimizer")
-        except ImportError:
-            _AdamW = AdamATan2
-    
-    return _AdamW(optim_groups, lr=config.learning_rate, betas=(0.9, 0.95))
 
+    hidden_gains_biases = [
+        p for n, p in model.named_parameters()
+        if (p.ndim == 1 or p.ndim == 0) and
+        not any(x in n for x in ["token_emb", "id_emb", "batch_embed"])
+    ]
 
-def cosine_lr_schedule(optimizer, step: int, total_steps: int, config: ConditionalModelConfig):
-    """Cosine learning rate schedule with warmup."""
-    if step < config.warmup_steps:
-        lr = config.learning_rate * step / config.warmup_steps
+    nonhidden_params = [
+        p for n, p in model.named_parameters()
+        if any(x in n for x in ["token_emb", "id_emb", "batch_embed", "ln", "norm"])
+    ]
+
+    param_groups = [
+        dict(params=hidden_weights, use_muon=True,
+            lr=config.muon_lr, weight_decay=0.01),
+        dict(params=hidden_gains_biases + nonhidden_params, use_muon=False,
+            lr=config.adam_lr, betas=(0.9, 0.95), weight_decay=0.01),
+    ]
+    optimizer = MuonWithAuxAdam(param_groups)
+    return optimizer
+
+def get_lr(optimizer, it: int, cfg: ConditionalModelConfig):
+    assert it <= cfg.num_steps
+    # 1) linear warmup for warmup_iters steps
+    if it < cfg.warmup_steps:
+        return (it+1) / cfg.warmup_steps
+    # 2) constant lr for a while
+    elif it < cfg.num_steps - cfg.cooldown_steps:
+        return 1.0
+    # 3) linear cooldown
     else:
-        progress = (step - config.warmup_steps) / (total_steps - config.warmup_steps)
-        lr = config.learning_rate * 0.5 * (1 + math.cos(math.pi * progress))
-        
-    for param_group in optimizer.param_groups:
-        param_group['lr'] = lr
-    return lr
-
+        decay_ratio = (cfg.num_steps - it) / cfg.cooldown_steps
+        return decay_ratio
