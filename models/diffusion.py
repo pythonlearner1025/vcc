@@ -495,18 +495,31 @@ class ConditionalDiffusionTransformer(nn.Module):
         )
 
                 # Optional latent context compressor
-        self.context_compressor = None
-        compressed_len = getattr(config, "context_compressed_len", 12)
-        if compressed_len and compressed_len > 0:
-            self.context_compressor = LatentContextCompressor(
-                dim=config.dim,
-                k=compressed_len,
-                n_head=config.n_head,
-            )
+        # ------------------------------------------------------------------
+        #  Latent transformer (Perceiver-style) replacing context compressor
+        # ------------------------------------------------------------------
+        self.n_latents = getattr(config, "n_latents", 512)
+        self.latents = nn.Parameter(torch.randn(1, self.n_latents, config.dim) * 0.02)
 
-        self.blocks = nn.ModuleList(
+        gqa_groups = max(1, config.n_head // 2)  # Higher grouping for cross-attention
+        self.cross_attn_q_lat_kv_genes = GroupedQueryAttention(config.dim, config.n_head, n_group=gqa_groups)
+        self.cross_attn_q_genes_kv_lat = GroupedQueryAttention(config.dim, config.n_head, n_group=gqa_groups)
+
+        # Self-attention stack that processes only the latent tokens
+        self.latent_blocks = nn.ModuleList(
             [TransformerBlock(config.dim, config.n_head, config.ffn_mult) for _ in range(config.n_layer)]
         )
+
+        # LayerNorms for clean pre/post-attention
+        self.lat_q_ln = LayerNorm(config.dim)
+        self.kv_ln = LayerNorm(config.dim)
+        self.gene_q_ln = LayerNorm(config.dim)
+        self.lat_kv_ln = LayerNorm(config.dim)
+
+        # No context compressor or gene-space transformer blocks in this variant
+        self.context_compressor = None
+        self.blocks = nn.ModuleList()
+
         self.ln_f = LayerNorm(config.dim)
         self.head = nn.Linear(config.dim, config.vocab_size)
 
@@ -541,11 +554,11 @@ class ConditionalDiffusionTransformer(nn.Module):
         #  (1) Base token embeddings (and optional gene features)
         # ------------------------------------------------------------------
         token_emb = self.token_emb(tokens)  # (B, N, D)
-        context_emb = self.token_emb(control_context)
 
-        # Apply optional compression to context sequence
-        if self.context_compressor is not None:
-            context_emb = self.context_compressor(context_emb)
+        # Encode control-set tokens (if provided)
+        context_emb = None
+        if control_context is not None:
+            context_emb = self.token_emb(control_context)
 
         # Optionally add per‑gene ESM2/ID embeddings projected to model dim.
         if self.use_esm_in_sequence:
@@ -554,7 +567,8 @@ class ConditionalDiffusionTransformer(nn.Module):
             # Expand across batch and fuse by addition to avoid extra matmul
             gene_feat = gene_feat.unsqueeze(0).expand(token_emb.size(0), -1, -1)
             x = token_emb + gene_feat  # additive fusion (faster than concat+linear)
-            context_emb += gene_feat
+            if context_emb is not None:
+                context_emb = context_emb + gene_feat
         else:
             x = token_emb
 
@@ -582,22 +596,30 @@ class ConditionalDiffusionTransformer(nn.Module):
         x = x + combined_emb.unsqueeze(1)  # (B, 1, D)
 
         # ------------------------------------------------------------------
-        #  (5) Transformer
+        #  (5) Latent transformer
         # ------------------------------------------------------------------
+        B = x.shape[0]
+        lat = self.latents.expand(B, -1, -1)  # (B, K, D)
+
+        # Combine gene and control tokens for encoder cross-attention
+        if context_emb is not None:
+            kv_all = torch.cat([x, context_emb], dim=1)
+        else:
+            kv_all = x
+
+        # Encode streams into latents
+        lat = lat + self.cross_attn_q_lat_kv_genes(self.lat_q_ln(lat), kv=self.kv_ln(kv_all))
+
+        # Latent self-attention stack
         use_ckpt = self.config.grad_ckpt and self.training and torch.is_grad_enabled()
-        for block in self.blocks:
+        for blk in self.latent_blocks:
             if use_ckpt:
-                # Activation checkpointing to trade compute for memory.
-                # Pass the context tensor explicitly to avoid it being captured
-                # by the Python closure which breaks checkpointing and leads
-                # to "Trying to backward through the graph a second time" errors.
-                def _forward(_x, _ctx):
-                    # No nested autocast - let the outer context govern precision
-                    return block(_x, context=_ctx)
-                # Use the newer non-re-entrant checkpointing (required for FP8 compatibility)
-                x = torch.utils.checkpoint.checkpoint(_forward, x, context_emb, use_reentrant=False)
+                lat = torch.utils.checkpoint.checkpoint(lambda _lat: blk(_lat, context=None), lat, use_reentrant=False)
             else:
-                x = block(x, context=context_emb)
+                lat = blk(lat, context=None)
+
+        # Decode back to gene tokens
+        x = x + self.cross_attn_q_genes_kv_lat(self.gene_q_ln(x), kv=self.lat_kv_ln(lat))
 
         # ------------------------------------------------------------------
         #  (6) Output head

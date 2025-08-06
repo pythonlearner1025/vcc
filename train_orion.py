@@ -370,7 +370,7 @@ def main():
             esm_proj_dim=512,
             
             # 1e6 cells x 5
-            pretrain_epochs=0,
+            pretrain_epochs=1,
             finetune_epochs=3,
 
             save_every=1000,
@@ -378,8 +378,8 @@ def main():
             max_eval_genes=25,
 
             # DEBUG
-            debug_pretrain_max_cells=1,
-            debug_finetune_max_cells=1,
+            debug_pretrain_max_cells=None,
+            debug_finetune_max_cells=None,
             debug_eval_max_cells=1000
         )
 
