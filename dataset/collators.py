@@ -16,7 +16,7 @@ class OrionCollator:
         - 'target_gene_idx': int
         - 'pert_batches':   List[str] length S
 
-    We convert expression matrices to tokens, build a (S, S, N) control tensor
+    We convert expression matrices to tokens, build a (1, S, N) control tensor
     and map batch names to integer indices on-the-fly.
     """
 
@@ -58,7 +58,7 @@ class OrionCollator:
 
         return {
             "tokens": delta_tok.long(),              # (S,N)
-            "control": ctrl_tok.long(),     # (S,S,N)
+            "control": ctrl_tok.long(),     # (1,S,N)
             "batch_idx": batch_idx,                  # (S,)
             "target_gene_idx": torch.tensor(sample["target_gene_idx"], dtype=torch.long).repeat(S),
         }
@@ -74,7 +74,7 @@ class VCCCollator:
         - 'pert_batches':   List[str] of length S  (batch name for each perturbed cell)
 
     The collator stacks the sets, tokenises everything in a vectorised fashion,
-    expands the control sets to shape (B·S, S, N), and maps the batch names to
+    expands the control sets to shape (1, S, N), and maps the batch names to
     integer indices used by the model.
     """
 
@@ -98,38 +98,8 @@ class VCCCollator:
         batch_idx = torch.tensor([self.batch_to_idx.get(b, 0) for b in sample["pert_batches"]], dtype=torch.long)
 
         return {
-            "tokens": delta_tok.long(),
-            "control": ctrl_tok.long(),
+            "tokens": delta_tok.long(), #(S, N)
+            "control": ctrl_tok.long(), #(1, S, N)
             "batch_idx": batch_idx,  # (S,)
-            "target_gene_idx": torch.tensor(sample["target_gene_idx"], dtype=torch.long).repeat(S),
+            "target_gene_idx": torch.tensor(sample["target_gene_idx"], dtype=torch.long).repeat(S), # (S,)
         }
-
-        # ----------------------------------------------------------------
-        # Old code retained for reference (multi-batch variant)
-        # ----------------------------------------------------------------
-        '''
-        batch_idx_list = [
-            self.batch_to_idx.get(batch_name, 0)
-            for sample in batch_list
-            for batch_name in sample["pert_batches"]
-        ]
-
-        batch_idx = torch.tensor(batch_idx_list, dtype=torch.long)
-        '''
-
-        # Target-gene indices  (B·S,)
-        '''
-        tgt_gene_idx = torch.tensor(
-            [sample["target_gene_idx"] for sample in batch_list for _ in range(self.set_size)],
-            dtype=torch.long,
-        )
-
-        return {
-            "tokens": tokens.long(),              # (S, N)
-            "control": ctrl_tok_expanded.long(),  # (S, S, N)
-            "batch_idx": batch_idx.long(),               # (S,)
-            #"batch_idx": batch_idx_list.long(),               # (B*S,)
-            #"target_gene_idx": tgt_gene_idx.long(),      # (B*S,)
-            "target_gene_idx": target_gene_idx.long(),      # (S,)
-        }
-        '''

@@ -10,8 +10,24 @@ try:
     torch.backends.cuda.enable_math_sdp(True)
     torch.set_float32_matmul_precision("high")
 except AttributeError:
-    # Older PyTorch versions will not expose these flags – skip silently.
     pass
+
+# ------------------------------------------------------------------
+# Transformer-Engine FP8 support
+# ------------------------------------------------------------------
+import os
+USE_TE = int(os.getenv("TE"))
+HAS_TE = False
+print(USE_TE)
+if USE_TE:
+    try:
+        import transformer_engine.pytorch as te
+        from transformer_engine.pytorch import fp8_autocast
+        HAS_TE = True
+    except ImportError:
+        from contextlib import nullcontext as fp8_autocast
+        HAS_TE = False
+
 import time
 import math
 from pathlib import Path
@@ -40,6 +56,19 @@ from tokenizer import (
 )
 from dataset.collators import OrionCollator
 
+# ------------------------------------------------------------------
+# Helper: choose the correct autocast context (FP8 vs BF16)
+# ------------------------------------------------------------------
+from contextlib import nullcontext as _nullctx
+
+def _autocast(model):
+    """Return FP8 or BF16 autocast context depending on model settings."""
+    if HAS_TE and hasattr(model, 'config') and model.config.use_fp8:
+        # FP8 kernels – use Transformer-Engine's context manager
+        return fp8_autocast(enabled=True)
+    # Fallback to BF16 mixed precision
+    return torch.amp.autocast("cuda", dtype=torch.bfloat16)
+
 def train_epoch_st(
     model: torch.nn.Module,
     diffusion: PartialMaskingDiffusion,
@@ -66,6 +95,8 @@ def train_epoch_st(
     # batches (after a 1-step warm-up) for CUDA time & memory.
     # ------------------------------------------------------------------
     profiler_ctx: contextlib.AbstractContextManager
+    device = next(model.parameters()).device  # target device for batches
+    
     if profile_steps > 0:
         profiler_ctx = profile(
             activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
@@ -75,8 +106,6 @@ def train_epoch_st(
     else:
         profiler_ctx = contextlib.nullcontext()
 
-        device = next(model.parameters()).device  # target device for batches
-
     # Reset counter
     cells_processed = 0
 
@@ -84,22 +113,30 @@ def train_epoch_st(
     # Enter profiler context (no-op if profiling disabled)
     # ------------------------------------------------------------------
     with profiler_ctx as prof:
+        s = time.time()
         for batch_idx, batch in enumerate(dataloader):
             if max_cells and cells_processed >= max_cells:
                 break
+            e = time.time()
+            print(f'dataload time: {(e-s)*1000:.0f}ms')
 
             tokens = batch['tokens'].to(device, non_blocking=True)
-            X_ctrl = batch['control'] if 'control' in batch else None
-            X_ctrl = X_ctrl.to(device, non_blocking=True)
-            target_gene_idx = batch['target_gene_idx'] if 'target_gene_idx' in batch else None 
-            target_gene_idx = target_gene_idx.to(device, non_blocking=True)
-            batch_indices = batch['batch_idx'] if 'batch_idx' in batch else None
-            batch_indices = batch_indices.to(device, non_blocking=True)
+            X_ctrl = batch.get('control', None)
+            if X_ctrl is not None:
+                X_ctrl = X_ctrl.to(device, non_blocking=True)
+            target_gene_idx = batch.get('target_gene_idx', None)
+            if target_gene_idx is not None:
+                target_gene_idx = target_gene_idx.to(device, non_blocking=True)
+            batch_indices = batch.get('batch_idx', None)
+            if batch_indices is not None:
+                batch_indices = batch_indices.to(device, non_blocking=True)
             cells_processed += tokens.shape[0]
+            e1 = time.time()
+            print(f'move to device time: {(e1-e)*1000:.0f}ms')
 
             #print(f"X_ctrl shape: {X_ctrl.shape}")
 
-            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+            with _autocast(model):
                 loss = diffusion.compute_loss(
                     model,
                     tokens,
@@ -108,6 +145,8 @@ def train_epoch_st(
                     batch_idx=batch_indices,
                     step=global_step
                 )
+            e2 = time.time()
+            print(f'step time: {(e2-e1)*1000:.0f}ms')
             
             optimizer.zero_grad()
             lr = cosine_lr_schedule(optimizer, global_step, total_training_steps, config)
@@ -116,8 +155,10 @@ def train_epoch_st(
             optimizer.step()
             
             epoch_losses.append(loss.item())
+            e3 = time.time()
+            print(f'backward time: {(e3-e2)*1000:.0f}ms')
             
-            if global_step % 10 == 0:
+            if global_step % 1 == 0:
                 print(f"grad_norm: {grad_norm}")
                 avg_loss = np.mean(epoch_losses[-100:] if len(epoch_losses) > 100 else epoch_losses)
                 print(f"Epoch {epoch:3d} [{batch_idx+1:4d}/{len(dataloader):4d}] | "
@@ -132,6 +173,7 @@ def train_epoch_st(
                     'global_step': global_step,
                     'use_control_sets': X_ctrl is not None,
                 })
+            s = time.time()
             
             if global_step % config.save_every == 0 and global_step > 0:
                 checkpoint_path = checkpoint_dir / f'checkpoint_st_epoch_{epoch}_step_{global_step}.pt'
@@ -187,7 +229,7 @@ def val_epoch_st(
             if batch_indices is not None:
                 batch_indices = batch_indices.to(device, non_blocking=True)
 
-            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+            with _autocast(model):
                 loss = diffusion.compute_loss(
                     model,
                     tokens,
@@ -244,19 +286,19 @@ def main():
         # Fresh training run – create default config
         config = ConditionalModelConfig(
             # DATA
-            pretrain_data_dir="/batched2",
+            pretrain_data_dir="data/batched2",
             finetune_data_path="/competition_train.h5",
             esm_matrix_path="/esm_all.pt",
-            hvg_info_path="assets/hvg_seuratv3_6297.txt",
+            hvg_info_path="assets/hvg_seuratv3_6288.txt",
             blacklist_path="assets/blacklist.txt",
             token_distribution_json="assets/token_distribution.json",
 
             full_eval=True,
             target_is_delta=True,
 
-            dim=512,
-            n_head=8,
-            n_layer=8,
+            dim=648,
+            n_head=12,
+            n_layer=12,
             ffn_mult=4,
 
             # tokenizer
@@ -266,15 +308,16 @@ def main():
             # was normalized to 50,000
             token_max_value=round(math.log1p(50000), 1),
             
-            n_genes=6297,
-            n_total_genes=6297,
-            gene_embed_dim=512,
+            n_genes=6288,
+            n_total_genes=6288,
+            gene_embed_dim=648,
+            # Ensure gene_embed_dim + batch_embed_dim is divisible by 16 for FP8
+            # 512 + 64 = 576 which is divisible by 16
+            batch_embed_dim=64,
 
             use_batch_conditioning=True,
-            n_batches=48,
-            batch_embed_dim=40,
             control_set_encoder_layers=2,
-            control_set_dim_hidden=512,
+            control_set_dim_hidden=648,
 
             # BS
             pretrain_batch_size=128,
@@ -292,14 +335,14 @@ def main():
             vcc_batch_size=1,
             
             # LR
-            learning_rate=1e-4,
+            learning_rate=2e-4,
             weight_decay=0.01,
             warmup_steps=1000,
             finetune_learning_rate=5e-5,
             finetune_warmup_steps=500,
 
             token_weighting_annealing_steps=None,
-            esm_proj_dim=512,
+            esm_proj_dim=648,
             
             # 1e6 cells x 5
             pretrain_epochs=1,
@@ -327,6 +370,12 @@ def main():
         config.vcc_set_size = args.continue_bs
     if args.continue_from == "finetune":
         config.pretrain_epochs = 0
+
+    # FP8 validation
+    if config.use_fp8 and HAS_TE:
+        cond_dim = config.gene_embed_dim + (config.batch_embed_dim if config.use_batch_conditioning else 0)
+        assert cond_dim % 16 == 0, f"FP8 requires cond_dim ({cond_dim}) divisible by 16. Adjust batch_embed_dim."
+        assert config.dim % 16 == 0, f"FP8 requires model dim ({config.dim}) divisible by 16"
 
     tokenizer, detokenizer = create_delta_tokenizer(
         config.vocab_size, max_abs=config.token_max_value, min_abs=1e-3)
@@ -360,28 +409,6 @@ def main():
             name=f"st_diffusion_{time.strftime('%Y%m%d_%H%M%S')}"
         )
 
-    # -----------------------------
-    # Create model / diffusion / optimiser
-    # -----------------------------
-    model = ConditionalDiffusionTransformer(config)
-    if args.ckpt_pt:
-        print(f"Loading weights from checkpoint: {args.ckpt_pt}")
-        ckpt_state = torch.load(args.ckpt_pt, map_location="cpu", weights_only=False)
-        model.load_state_dict(ckpt_state["model_state_dict"])
-    else:
-        ckpt_state = {}
-    # Move model to the appropriate device
-    model = model.cuda()
-    diffusion = PartialMaskingDiffusion(config)
-    optimizer = create_optimizer(model, config)
-    # If continuing from a checkpoint try to restore optimizer state
-    if args.ckpt_pt and "optimizer_state_dict" in ckpt_state:
-        try:
-            optimizer.load_state_dict(ckpt_state["optimizer_state_dict"])
-        except Exception as e:
-            print(f"Could not load optimizer state: {e}")
-    print(f"\nModel created with {sum(p.numel() for p in model.parameters()):,} parameters")
-
     # Create Orion pretrain and validation dataloaders
     (orion_train_ds, orion_train_dl), (orion_val_ds, orion_val_dl) = create_orion_train_val_dataloaders(
         batches_dir=config.pretrain_data_dir,
@@ -389,7 +416,7 @@ def main():
         tokenizer=tokenizer,
         set_size=config.vcc_set_size,
         train_split=0.9,
-        num_workers=0,
+        num_workers=4,
         random_seed=42
     )
     # Backward-compatibility aliases for existing variable names
@@ -405,7 +432,7 @@ def main():
         n_samples_per_gene_train=10,  # Multiple samples per gene for training
         n_samples_per_gene_val=1,      # Single sample per gene for validation
         train_split=0.8,
-        num_workers=0,
+        num_workers=4,
         random_seed=42,
         normalize=False,
         blacklist_path=config.blacklist_path
@@ -446,6 +473,43 @@ def main():
             val_dataloader.collate_fn.batch_to_idx = batch_to_idx
     print(f"Found {len(unique_batches)} unique batches for batch conditioning")
     # -- end creating global batches --
+
+    # -----------------------------
+    # Create model / diffusion / optimiser
+    # -----------------------------
+    n_batches = len(unique_batches)
+    while n_batches % 16 != 0:
+        n_batches += 1 
+    print(f'New batch size: {n_batches}')
+    config.n_technical_batches = n_batches
+    model = ConditionalDiffusionTransformer(config)
+    if args.ckpt_pt:
+        print(f"Loading weights from checkpoint: {args.ckpt_pt}")
+        ckpt_state = torch.load(args.ckpt_pt, map_location="cpu", weights_only=False)
+        model.load_state_dict(ckpt_state["model_state_dict"])
+    else:
+        ckpt_state = {}
+    # Move model to the appropriate device
+    model = model.cuda()
+    
+    # Torch compilation settings - can be disabled via environment variable if issues occur
+    compile_mode = os.getenv("TORCH_COMPILE_MODE", "disable")
+    if compile_mode != "disable":
+        # Use reduce-overhead mode by default to avoid Triton compilation issues
+        # max-autotune can generate invalid Triton kernels for certain operations
+        print(f"Compiling model with torch.compile (mode={compile_mode})")
+        model = torch.compile(model, mode="max-autotune", fullgraph=False)
+    else:
+        print("Torch compilation disabled (TORCH_COMPILE_MODE=disable)")
+    diffusion = PartialMaskingDiffusion(config)
+    optimizer = create_optimizer(model, config)
+    # If continuing from a checkpoint try to restore optimizer state
+    if args.ckpt_pt and "optimizer_state_dict" in ckpt_state:
+        try:
+            optimizer.load_state_dict(ckpt_state["optimizer_state_dict"])
+        except Exception as e:
+            print(f"Could not load optimizer state: {e}")
+    print(f"\nModel created with {sum(p.numel() for p in model.parameters()):,} parameters")
 
     # Prepare gene mappings for full evaluation (optional)
     if getattr(config, "full_eval", False):
@@ -525,7 +589,7 @@ def main():
                         device_eval,
                         eval_dir,
                         batch_to_idx=batch_to_idx,
-                        max_steps=config.max_eval_genes,
+                        max_genes=config.max_eval_genes,
                         val_ds=orion_val_ds,
                         val_dl=orion_val_dl,
                     )
@@ -595,7 +659,7 @@ def main():
                     device_eval,
                     eval_dir,
                     batch_to_idx=batch_to_idx,
-                    max_steps=config.max_eval_genes,
+                    max_genes=config.max_eval_genes,
                     val_ds=val_dataset,
                     val_dl=val_dataloader
                 )

@@ -127,6 +127,7 @@ def main():
 
     # --- 2) fill remaining batches with the other gene targets ------------
     ordered = sorted(groups.items(), key=lambda kv: -len(kv[1]))  # largest first
+    #data/batched_5e4_norm/batch_0644.h5ad
 
     cur_idx, cur_gts = [], []
     for gt, idx in ordered:
@@ -136,6 +137,7 @@ def main():
             cur_idx, cur_gts = [], []
         cur_idx.extend(ids)
         cur_gts.append(gt)
+
     if cur_idx:
         batches.append((cur_idx, cur_gts))
 
@@ -147,7 +149,7 @@ def main():
             str(args.input), str(args.out_dir),
             idxs, gts, orig_vars, new_vars, bid
         )
-        for bid, (idxs, gts) in enumerate(batches)
+        for bid, (idxs, gts) in enumerate(batches) if bid > 644
     )
 
     print("All done.")

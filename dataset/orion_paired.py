@@ -61,6 +61,13 @@ class OrionPairedDataset(Dataset):  # noqa: E501
 
         self._scan_batches()
 
+        # ------------------------------------------------------------------
+        # Runtime cache for opened .h5ad files (per DataLoader worker)
+        # ------------------------------------------------------------------
+        self._adata_cache: Dict[str, sc.AnnData] = {}
+        self._gene_symbols_cache: Dict[str, np.ndarray] = {}
+        self._sample_cache: Dict[str, np.ndarray] = {}
+
         # Apply HVG filtering if provided
         if hvg_gene_ids is not None:
             self._apply_hvg_filter(hvg_gene_ids)
@@ -222,32 +229,50 @@ class OrionPairedDataset(Dataset):  # noqa: E501
     # Utility helper – load one expression vector
     # ------------------------------------------------------------------
 
+    def _get_adata(self, file_path: str):
+        """Return a cached `AnnData` handle (backed mode, read-only)."""
+        adata = self._adata_cache.get(file_path)
+        if adata is None:
+            # Opening with backed='r' is fast and memory-efficient – keep handle open
+            adata = sc.read_h5ad(file_path, backed="r")
+            self._adata_cache[file_path] = adata
+            # Cache gene symbols and sample column for faster access later on
+            gene_symbols = (
+                adata.var["gene_symbol"].values
+                if "gene_symbol" in adata.var.columns
+                else adata.var_names.values
+            )
+            self._gene_symbols_cache[file_path] = gene_symbols
+            self._sample_cache[file_path] = adata.obs["sample"].values  # NumPy array – cheap to keep
+        return adata
+
     def _load_row(self, file_path: str, row_idx: int):
-        adata = sc.read_h5ad(file_path, backed="r")
+        adata = self._get_adata(file_path)
         row = adata.X[row_idx]
         expr_full = row.toarray().ravel() if hasattr(row, "toarray") else np.asarray(row).ravel()
+
         # Apply duplicate collapse
         if self._keep_gene_idx is not None:
             expr_unique = expr_full[self._keep_gene_idx]
         else:
             expr_unique = expr_full
 
+        # Apply HVG filter if requested
         if hasattr(self, "_hvg_idx"):
             expr = expr_unique[self._hvg_idx]
         else:
             expr = expr_unique
 
-        sample = str(adata.obs["sample"].iloc[row_idx] if hasattr(adata.obs["sample"], "iloc") else adata.obs["sample"][row_idx])
-        gene_symbols = (
-            adata.var["gene_symbol"].values
-            if "gene_symbol" in adata.var.columns
-            else adata.var_names.values
-        )
+        # Retrieve cached metadata (avoids repeated string conversions)
+        sample_arr = self._sample_cache[file_path]
+        sample = str(sample_arr[row_idx])
+
+        gene_symbols = self._gene_symbols_cache[file_path]
         if self._keep_gene_idx is not None:
             gene_symbols = gene_symbols[self._keep_gene_idx]
         if hasattr(self, "_hvg_idx"):
             gene_symbols = gene_symbols[self._hvg_idx]
-        adata.file.close()
+
         return expr, sample, gene_symbols
 
     # ------------------------------------------------------------------
@@ -256,6 +281,18 @@ class OrionPairedDataset(Dataset):  # noqa: E501
 
     def __len__(self):  # type: ignore[override]
         return len(self._gene_for_set)
+
+    # ------------------------------------------------------------------
+    # Resource clean-up
+    # ------------------------------------------------------------------
+    def __del__(self):
+        # Ensure we close any open AnnData file handles to avoid file descriptor leaks
+        cache = getattr(self, "_adata_cache", {})
+        for adata in cache.values():
+            try:
+                adata.file.close()
+            except Exception:
+                pass
 
     def __getitem__(self, idx: int):  # type: ignore[override]
         if idx < 0 or idx >= len(self):

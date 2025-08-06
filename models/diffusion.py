@@ -30,6 +30,33 @@ try:
 except ImportError:
     HAS_FLASH_ATTN = False
 
+# ----------------------------------------------------------------------
+# Transformer-Engine (FP8) integration
+# ----------------------------------------------------------------------
+import os
+USE_TE = int(os.getenv("TE"))
+HAS_TE = False
+if USE_TE:
+    try:
+        import transformer_engine.pytorch as te
+        from transformer_engine.pytorch import fp8_autocast
+        print("USING TRANSFORMER ENGINE FP8")
+        HAS_TE = True
+    except ImportError:
+        from contextlib import nullcontext as _nullctx
+        def fp8_autocast(enabled=True, *args, **kwargs):
+            """Fallback to no-op context manager when TE is unavailable or disabled."""
+            return _nullctx()
+        HAS_TE = False
+
+# Drop-in replacements enabling FP8 kernels when TE is available
+if HAS_TE:
+    Linear = te.Linear
+    LayerNorm = te.LayerNorm
+else:
+    Linear = torch.nn.Linear
+    LayerNorm = torch.nn.LayerNorm
+
 @dataclass
 class ConditionalModelConfig:
     """Configuration for conditional diffusion model."""
@@ -56,7 +83,7 @@ class ConditionalModelConfig:
     
     # Batch conditioning
     # TODO get true number of batches in VCC
-    n_batches: int = 100  # Estimate of unique batches across datasets
+    n_technical_batches: int = 48  # Estimate of unique batches across datasets
     batch_embed_dim: int = 64  # Batch embedding dimension
     use_batch_conditioning: bool = True
     
@@ -86,6 +113,11 @@ class ConditionalModelConfig:
 
     finetune_learning_rate: float = 3e-5
     finetune_warmup_steps: int = 500
+    # Enable FP8 execution via Transformer-Engine (if available)
+    use_fp8: bool = True  # Now working with custom-built wheel
+    
+    # Gradient checkpointing - disable for large-batch FP8 runs to see true kernel speed
+    grad_ckpt: bool = True  # Enable activation checkpointing (trades compute for memory)
 
     vcc_batch_size: int = 1
     vcc_set_size: int = 64
@@ -160,16 +192,18 @@ class MultiQueryAttention(nn.Module):
         self.head_dim = dim // n_head
         
         # Query projection for all heads
-        self.q_proj = nn.Linear(dim, dim)
+        self.q_proj = Linear(dim, dim)
         
         # Shared key/value projection (single head)
-        self.kv_proj = nn.Linear(dim, 2 * self.head_dim)
+        self.kv_proj = Linear(dim, 2 * self.head_dim)
         
         # Output projection
-        self.out_proj = nn.Linear(dim, dim)
+        self.out_proj = Linear(dim, dim)
         
-        # Use flash attention if available
-        self.use_flash_attn = HAS_FLASH_ATTN
+        # We now rely on PyTorch 2.1+ scaled_dot_product_attention which automatically
+        # dispatches to FlashAttention-2 kernels on Hopper, so we no longer need the
+        # external flash_attn_func path.
+        self.use_flash_attn = False
         
     def forward(self, x: torch.Tensor, kv: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
@@ -192,33 +226,22 @@ class MultiQueryAttention(nn.Module):
         # Project shared key/value
         kv_proj = self.kv_proj(kv)  # (B, M, 2*HD)
         k, v = kv_proj.chunk(2, dim=-1)  # Each is (B, M, HD)
-        
-        if self.use_flash_attn:
-            # For flash_attn, we need to expand k, v for all heads
-            # flash_attn expects (batch, seq_len, n_heads, head_dim)
-            k_expanded = k.unsqueeze(2).expand(-1, -1, self.n_head, -1)  # (B, M, H, HD)
-            v_expanded = v.unsqueeze(2).expand(-1, -1, self.n_head, -1)  # (B, M, H, HD)
-            
-            # Use flash attention
-            out = flash_attn_func(q, k_expanded, v_expanded, causal=False)  # (B, N, H, HD)
-            
-            # Reshape output
-            out = out.view(B, N, D)
-        else:
-            # Standard attention implementation
-            q = q.transpose(1, 2)  # (B, H, N, HD)
-            
-            # Expand k, v for all heads
-            k = k.unsqueeze(1).expand(-1, self.n_head, -1, -1)  # (B, H, M, HD)
-            v = v.unsqueeze(1).expand(-1, self.n_head, -1, -1)  # (B, H, M, HD)
-            
-            # Scaled-Dot-Product Attention (flash-aware, PyTorch ≥2.1)
-            out = F.scaled_dot_product_attention(
-                q, k, v, dropout_p=0.0, is_causal=False
-            )  # (B, H, N, HD)
 
-            # Reshape back to (B, N, D)
-            out = out.transpose(1, 2).contiguous().view(B, N, D)
+        # ------------------------------------------------------------------
+        #  Scaled-Dot-Product Attention (PyTorch 2.1+, dispatches to Flash kernels)
+        # ------------------------------------------------------------------
+        q = q.transpose(1, 2)  # (B, H, N, HD)
+
+        # Expand k, v to all heads without materialising copies (stride-aware)
+        k = k.unsqueeze(1).expand(-1, self.n_head, -1, -1)  # (B, H, M, HD)
+        v = v.unsqueeze(1).expand(-1, self.n_head, -1, -1)  # (B, H, M, HD)
+
+        out = F.scaled_dot_product_attention(
+            q, k, v, dropout_p=0.0, is_causal=False
+        )  # (B, H, N, HD)
+
+        # Reshape back to (B, N, D)
+        out = out.transpose(1, 2).contiguous().view(B, N, D)
         
         # Project output
         out = self.out_proj(out)
@@ -232,20 +255,23 @@ class TransformerBlock(nn.Module):
     def __init__(self, dim: int, n_head: int, ffn_mult: int = 4):
         super().__init__()
         # Self-attention
-        self.ln1 = nn.LayerNorm(dim)
+        self.ln1 = LayerNorm(dim)
         self.self_attn = MultiQueryAttention(dim, n_head)
         
         # Cross-attention (optional)
-        self.ln2 = nn.LayerNorm(dim)
+        self.ln2 = LayerNorm(dim)
         self.cross_attn = MultiQueryAttention(dim, n_head)
         
-        # FFN
-        self.ln3 = nn.LayerNorm(dim)
-        self.mlp = nn.Sequential(
-            nn.Linear(dim, dim * ffn_mult),
-            nn.GELU(),
-            nn.Linear(dim * ffn_mult, dim)
-        )
+        self.ln3 = LayerNorm(dim)
+        try:
+            from xformers.ops import FusedDenseGeluDense
+            self.mlp = FusedDenseGeluDense(dim, dim * ffn_mult, dim)
+            print("Built with FusedDenseGelu")
+        except ImportError:
+            self.mlp = nn.Sequential(
+                Linear(dim, dim * ffn_mult),
+                nn.GELU(),
+                Linear(dim * ffn_mult, dim))
         
     def forward(self, x: torch.Tensor, context: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
@@ -388,6 +414,8 @@ class ConditionalDiffusionTransformer(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
+        # Enable FP8 execution if requested and Transformer-Engine is available
+        self.fp8_enabled = getattr(config, "use_fp8", False) and HAS_TE
 
         # ------------------------------------------------------------------
         #  Embeddings
@@ -410,16 +438,16 @@ class ConditionalDiffusionTransformer(nn.Module):
             self.register_buffer(
                 "_hvg_idx", torch.arange(config.n_genes, dtype=torch.long), persistent=False
             )
-            self.gene_proj = nn.Linear(config.gene_embed_dim, config.dim, bias=False)
+            self.gene_proj = Linear(config.gene_embed_dim, config.dim, bias=False)
             # Fusion layer to combine token and per-gene features (token_emb || gene_feat)
-            self.fuse_proj = nn.Linear(config.dim * 2, config.dim)
+            self.fuse_proj = Linear(config.dim * 2, config.dim)
 
         # Time embedding
         self.time_emb = nn.Sequential(
             SinusoidalPosEmb(config.dim),
-            nn.Linear(config.dim, config.dim),
+            Linear(config.dim, config.dim),
             nn.GELU(),
-            nn.Linear(config.dim, config.dim),
+            Linear(config.dim, config.dim),
         )
 
         # Control‑set encoder, batch embeddings, transformer blocks ...
@@ -434,18 +462,18 @@ class ConditionalDiffusionTransformer(nn.Module):
         )
 
         if config.use_batch_conditioning:
-            self.batch_embed = nn.Embedding(config.n_batches, config.batch_embed_dim)
+            self.batch_embed = nn.Embedding(config.n_technical_batches, config.batch_embed_dim)
         batch_dim = config.batch_embed_dim if config.use_batch_conditioning else 0
         self.cond_proj = nn.Sequential(
-            nn.Linear(config.gene_embed_dim + batch_dim, config.dim),
+            Linear(config.gene_embed_dim + batch_dim, config.dim),
             nn.GELU(),
-            nn.Linear(config.dim, config.dim),
+            Linear(config.dim, config.dim),
         )
 
         self.blocks = nn.ModuleList(
             [TransformerBlock(config.dim, config.n_head, config.ffn_mult) for _ in range(config.n_layer)]
         )
-        self.ln_f = nn.LayerNorm(config.dim)
+        self.ln_f = LayerNorm(config.dim)
         self.head = nn.Linear(config.dim, config.vocab_size)
 
         self.apply(self._init_weights)
@@ -455,7 +483,7 @@ class ConditionalDiffusionTransformer(nn.Module):
     # ----------------------------------------------------------------------
     @staticmethod
     def _init_weights(m):
-        if isinstance(m, nn.Linear):
+        if isinstance(m, (nn.Linear, Linear)):
             nn.init.normal_(m.weight, mean=0.0, std=0.02)
             if m.bias is not None:
                 nn.init.zeros_(m.bias)
@@ -485,8 +513,9 @@ class ConditionalDiffusionTransformer(nn.Module):
             gene_ids = self._hvg_idx.to(tokens.device)  # (N,)
             gene_feat = self.gene_embed(gene_ids)       # (N, gene_embed_dim)
             gene_feat = self.gene_proj(gene_feat)       # (N, D)
+            # Expand across batch and fuse by addition to avoid extra matmul
             gene_feat = gene_feat.unsqueeze(0).expand(token_emb.size(0), -1, -1)
-            x = self.fuse_proj(torch.cat([token_emb, gene_feat], dim=-1))
+            x = token_emb + gene_feat  # additive fusion (faster than concat+linear)
         else:
             x = token_emb
 
@@ -520,7 +549,7 @@ class ConditionalDiffusionTransformer(nn.Module):
             gene_cond_emb = self.gene_embed(target_gene_idx)  # (B, gene_embed_dim)
             cond_parts = [gene_cond_emb]
             if self.config.use_batch_conditioning and batch_idx is not None:
-                batch_idx = torch.clamp(batch_idx, 0, self.config.n_batches - 1)
+                batch_idx = torch.clamp(batch_idx, 0, self.config.n_technical_batches - 1)
                 cond_parts.append(self.batch_embed(batch_idx))
             cond_vec = torch.cat(cond_parts, dim=-1)
             cond_vec = self.cond_proj(cond_vec)
@@ -532,7 +561,7 @@ class ConditionalDiffusionTransformer(nn.Module):
         # ------------------------------------------------------------------
         #  (5) Transformer
         # ------------------------------------------------------------------
-        use_ckpt = self.training and torch.is_grad_enabled()
+        use_ckpt = self.config.grad_ckpt and self.training and torch.is_grad_enabled()
         for block in self.blocks:
             if use_ckpt:
                 # Activation checkpointing to trade compute for memory.
@@ -540,10 +569,9 @@ class ConditionalDiffusionTransformer(nn.Module):
                 # by the Python closure which breaks checkpointing and leads
                 # to "Trying to backward through the graph a second time" errors.
                 def _forward(_x, _ctx):
-                    # Ensure recomputation happens under the same AMP context as the first pass
-                    with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                        return block(_x, context=_ctx)
-                # Use the newer non-re-entrant checkpointing so AMP state is preserved
+                    # No nested autocast - let the outer context govern precision
+                    return block(_x, context=_ctx)
+                # Use the newer non-re-entrant checkpointing (required for FP8 compatibility)
                 x = torch.utils.checkpoint.checkpoint(_forward, x, context, use_reentrant=False)
             else:
                 x = block(x, context=context)
@@ -821,12 +849,17 @@ def create_optimizer(model: nn.Module, config: ConditionalModelConfig):
         {"params": [param_dict[pn] for pn in sorted(no_decay)], "weight_decay": 0.0},
     ]
     
-    # Prefer 8-bit Adam if bitsandbytes is available
+    # Prefer 8-bit Adam from bitsandbytes if available
     try:
-        from adam_atan2 import AdamATan2 as _AdamW
-        print("Using AdamATan2 optimizer")
-    except ImportError:
-        _AdamW = AdamATan2
+        import bitsandbytes as bnb
+        _AdamW = bnb.optim.Adam8bit
+        print("Using 8-bit Adam optimizer")
+    except Exception:
+        try:
+            from adam_atan2 import AdamATan2 as _AdamW
+            print("Using AdamATan2 optimizer")
+        except ImportError:
+            _AdamW = AdamATan2
     
     return _AdamW(optim_groups, lr=config.learning_rate, betas=(0.9, 0.95))
 
