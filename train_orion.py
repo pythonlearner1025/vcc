@@ -244,7 +244,7 @@ def main():
         # Fresh training run – create default config
         config = ConditionalModelConfig(
             # DATA
-            pretrain_data_dir="data/batched2",
+            pretrain_data_dir="/batched2",
             finetune_data_path="/competition_train.h5",
             esm_matrix_path="/esm_all.pt",
             hvg_info_path="assets/hvg_seuratv3_6297.txt",
@@ -262,6 +262,8 @@ def main():
             # tokenizer
             vocab_size=128,
             # max log1p value
+            # TODO - while Orion was normalized to 10,000, VCC competition_train.h5 
+            # was normalized to 50,000
             token_max_value=round(math.log1p(50000), 1),
             
             n_genes=6297,

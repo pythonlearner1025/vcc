@@ -10,6 +10,12 @@ Changes vs previous attempt
 * Workers receive only picklable objects (no functions, no h5py handles).
 * Symbol→Ensembl dict, orig_vars and new_vars are passed as plain data.
 * Pandas `groupby` called with observed=False to silence future warning.
+python scripts/process_andata.py  \
+    --input data/anndata_file.h5ad \
+    --lookup symbol2ens.pkl \
+    --out_dir data/batched_5e4_norm \
+    --n_jobs 4
+
 """
 
 from __future__ import annotations
