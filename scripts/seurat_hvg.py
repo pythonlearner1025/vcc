@@ -33,6 +33,8 @@ import argparse
 from pathlib import Path
 import logging
 import random
+import json
+import pickle
 from typing import List, Set
 import sys
 import os
@@ -40,7 +42,11 @@ import os
 # Add scripts directory to Python path to import fast_hvg
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import warnings
+warnings.filterwarnings("ignore", message="Variable names are not unique*", category=UserWarning)
+
 import numpy as np
+import pandas as pd
 import fast_hvg
 import scanpy as sc
 import anndata as ad
@@ -57,6 +63,12 @@ logging.basicConfig(
 # ---------------------------------------------------------------------
 # I/O helpers
 # ---------------------------------------------------------------------
+
+def load_lookup(path: Path) -> Dict[str, str]:
+    if path.suffix == ".json":
+        return json.loads(path.read_text())
+    with path.open("rb") as fh:
+        return pickle.load(fh)
 
 def load_whitelist(path: str | None) -> Set[str]:
     if path is None:
@@ -97,6 +109,12 @@ def load_finetune(path: str, max_cells: int = None) -> ad.AnnData:
         # Use Ensembl IDs as var_names for intersection
         adata.var_names = adata.var['gene_id']
         logger.info("Using Ensembl IDs from 'gene_id' column for gene matching")
+
+    # Report / collapse duplicates if any
+    dup_mask = adata.var_names.duplicated()
+    if dup_mask.sum():
+        logger.warning("Finetune dataset contains %d duplicate genes – keeping first occurrence", dup_mask.sum())
+        adata = adata[:, ~dup_mask]
     
     # Ensure data is in CSR format for memory efficiency
     if hasattr(adata.X, 'tocsr'):
@@ -108,8 +126,10 @@ def load_finetune(path: str, max_cells: int = None) -> ad.AnnData:
 # Pre‑training data streaming
 # ---------------------------------------------------------------------
 
-def _collect_batch_files(scrna_dir: str) -> List[str]:
-    return sorted(glob.glob(str(Path(scrna_dir) / "batch_*.h5")))
+def _collect_batch_files(data_dir: str, ext: str = "h5") -> List[str]:
+    """Return sorted list of batch_*.<ext> files inside *data_dir*."""
+    pattern = f"batch_*.{ext}"
+    return sorted(glob.glob(str(Path(data_dir) / pattern)))
 
 
 def _sample_cells_from_batch(batch_file: str, target: int) -> tuple[np.ndarray, List[str]]:
@@ -132,7 +152,7 @@ def _sample_cells_from_batch(batch_file: str, target: int) -> tuple[np.ndarray, 
     return data, cells
 
 
-def load_pretrain_sample(scrna_dir: str, max_cells: int) -> ad.AnnData:
+def load_scrna_sample(scrna_dir: str, max_cells: int) -> ad.AnnData:
     """Return an AnnData composed of <=*max_cells* sampled uniformly over batches."""
     batch_files = _collect_batch_files(scrna_dir)
     if not batch_files:
@@ -153,6 +173,62 @@ def load_pretrain_sample(scrna_dir: str, max_cells: int) -> ad.AnnData:
     # Set gene_id as the var index so intersection works properly
     adata.var_names = adata.var["gene_id"]
     logger.info("Pretrain sample: %d cells  %d genes", *adata.shape)
+    return adata
+
+def _sample_h5ad_rows(h5ad_path: str, target: int):
+    """Sample <= target rows from a backed h5ad file; return (X, cell_ids)."""
+    adata = sc.read_h5ad(h5ad_path, backed="r")
+    n_cells = adata.n_obs
+    idx = np.random.choice(n_cells, size=min(target, n_cells), replace=False)
+    idx = np.sort(idx)
+    chunk = adata[idx].to_memory()
+    cell_ids = chunk.obs_names.tolist()
+    X = chunk.X.tocsr() if hasattr(chunk.X, "tocsr") else chunk.X
+    adata.file.close()
+    return X, cell_ids, chunk.var_names
+
+
+def load_orion_sample(orion_dir: str, max_cells: int, lookup_pkl: str | Path) -> ad.AnnData:
+    """Assemble an AnnData from Orion batch_*.h5ad files with Ensembl IDs."""
+    batch_files = _collect_batch_files(orion_dir, ext="h5ad")
+    if not batch_files:
+        raise FileNotFoundError("No batch_*.h5ad found in %s" % orion_dir)
+    logger.info("Found %d Orion batches", len(batch_files))
+
+    per_batch = max_cells // len(batch_files)
+    X_blocks, cell_ids = [], []
+    for bf in batch_files:
+        try:
+            Xb, cells_b, var_names = _sample_h5ad_rows(bf, per_batch)
+        except Exception as e:
+            print(e)
+            print(f'bad file: {bf}')
+            continue
+        X_blocks.append(Xb)
+        cell_ids.extend(cells_b)
+    X = scipy.sparse.vstack(X_blocks) if len(X_blocks) > 1 else X_blocks[0]
+
+    # Map gene symbols -> ENSG
+    symbol2ens = load_lookup(Path(lookup_pkl))
+    ens_names = [symbol2ens.get(sym, sym) for sym in var_names]
+
+    adata = ad.AnnData(X, obs=dict(cell_id=cell_ids))
+    adata.var["gene_symbol"] = var_names
+    adata.var_names = ens_names  # use ENSG where available
+
+    # ------------------------------------------------------------------
+    # Report / optionally collapse duplicate genes
+    # ------------------------------------------------------------------
+    dup_mask = pd.Index(ens_names).duplicated()
+    n_dup = dup_mask.sum()
+    if n_dup:
+        logger.warning("Orion sample contains %d duplicate gene IDs", n_dup)
+        # simple collapse: keep first occurrence
+        unique_mask = ~dup_mask
+        adata = adata[:, unique_mask]
+        logger.info("After collapsing duplicates → %d genes", adata.n_vars)
+
+    logger.info("Orion sample: %d cells  %d genes", *adata.shape)
     return adata
 
 # ---------------------------------------------------------------------
@@ -205,20 +281,19 @@ def merge_hvg_lists(
     selected_fine = only_fine[:n_fine]
     selected_pre = only_pre[:n_pre]
 
-    ordered = list(dict.fromkeys(list(whitelist) + common + selected_fine + selected_pre))
+    ordered = list(dict.fromkeys(list(whitelist) + common))
 
     logger.info("HVG composition before trimming:")
     logger.info("  Whitelisted genes: %d", len(whitelist))
     logger.info("  Common to pretrain & finetune: %d", len(common))
     logger.info("  Finetune-only: %d", len(selected_fine))
     logger.info("  Pretrain-only: %d", len(selected_pre))
+    logger.info("  Keeping only common to pretrain & finetune")
 
     if len(ordered) > n_final:
         # Retain whitelist, then top genes until budget exhausted
-        extra = [g for g in ordered if g not in whitelist][: n_final - len(whitelist)]
-        ordered = list(whitelist) + extra
-        logger.info("Trimmed to %d genes (%d whitelist + %d other)", 
-                   len(ordered), len(whitelist), len(extra))
+        ordered = ordered[:n_final]
+        logger.info("Trimmed to %d genes", len(ordered))
     elif len(ordered) < n_final:
         logger.warning(
             "Final HVG list shorter (%d) than requested %d – pad with extra pretrain genes",
@@ -239,9 +314,15 @@ def main(args):
 
     finetune = load_finetune(args.finetune_path, max_cells=args.max_cells_finetune)
     # Pretrain sampling – huge corpora → sample or stream
-    pretrain = load_pretrain_sample(
-        args.scrna_dir, max_cells=args.max_cells_pretrain
-    )
+    if args.scrna_dir is not None:
+        pretrain = load_scrna_sample(
+            args.scrna_dir, max_cells=args.max_cells_pretrain
+        )
+    else:
+        assert args.orion_dir is not None
+        pretrain = load_orion_sample(
+            args.orion_dir, max_cells=args.max_cells_orion, lookup_pkl=args.lookup_path
+        )
 
     # Intersect gene sets to ensure shared ordering
     logger.info("Pretrain first 5 genes: %s", list(pretrain.var_names[:5]))
@@ -288,11 +369,19 @@ def main(args):
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser(description="Unified HVG selection (Seurat v3)")
-    p.add_argument("--scrna_dir", default="data/scRNA/processed", help="Directory with batch_*.h5")
+    p.add_argument("--orion_dir", default="/orion/batched", help="Directory with batch_*.h5")
+    p.add_argument("--scrna_dir", default=None, help="Directory with batch_*.h5")
     p.add_argument("--finetune_path", default="data/vcc_data/adata_Training.h5ad", help="Finetune .h5ad file")
     p.add_argument("--output_dir", default=".")
     p.add_argument("--whitelist_path", default="data/vcc_perturbed_genes.txt",help="Gene list to force‑include")
     p.add_argument("--n_hvgs", type=int, default=2000, help="#HVGs to keep")
+    p.add_argument("--lookup_path", default="symbol2ens.pkl", help="Pickle/JSON symbol→Ensembl mapping file")
+    p.add_argument(
+        "--max_cells_orion",
+        type=int,
+        default=1e5,
+        help="Upper bound on sampled pre‑training cells to load",
+    )
     p.add_argument(
         "--max_cells_pretrain",
         type=int,

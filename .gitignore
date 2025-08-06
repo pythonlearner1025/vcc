@@ -11,6 +11,8 @@ __pycache__/
 wandb/
 models/diffusion.py.backup
 *.backup
+*.pkl
+*.whl
 
 # out dirs
 checkpoints/

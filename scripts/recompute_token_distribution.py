@@ -37,7 +37,7 @@ from dataset.scrna_hvg_dataset import (
     create_scrna_hvg_dataloader,
 )
 from dataset.vcc_paired_dataloader import (
-    create_train_val_dataloaders,
+    create_vcc_train_val_dataloaders,
 )
 
 # -----------------------------------------------------------------------------
@@ -145,7 +145,7 @@ def main():
     # ------------------------------------------------------------------
     # 2. Fine-tune dataset (VCC paired sets – train & val)
     # ------------------------------------------------------------------
-    (train_dataset, train_loader), (val_dataset, val_loader) = create_train_val_dataloaders(
+    (train_dataset, train_loader), (val_dataset, val_loader) = create_vcc_train_val_dataloaders(
         adata_path=args.finetune_adata_path,
         hvg_gene_ids=hvg_genes,
         set_size=config.vcc_set_size,

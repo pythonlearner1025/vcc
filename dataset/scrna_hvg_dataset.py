@@ -134,7 +134,7 @@ class ScRNADatasetWithHVGs(Dataset):
             # CP10K normalization: scale each cell to 10,000 total counts
             row_sums = X.sum(axis=1, keepdims=True)
             row_sums[row_sums == 0] = 1  # Avoid division by zero
-            X = (X / row_sums) * 10000
+            X = (X / row_sums) * 50000
             
             # Log1p transformation
             X = np.log1p(X)
@@ -142,7 +142,7 @@ class ScRNADatasetWithHVGs(Dataset):
             # Verify if data is log1p (CP10K-normalised) when `normalize=False`.
             # After CP10K + log1p, each gene value should be ≤ log1p(10000) ≈ 9.2
             # and row sums should be reasonable (much larger than 9.2)
-            max_possible_gene_value = np.log1p(10000)  # ≈ 9.2
+            max_possible_gene_value = np.log1p(50000)  # ≈ 9.2
             X_max = X.max()
             row_sums = X.sum(axis=1)
             
