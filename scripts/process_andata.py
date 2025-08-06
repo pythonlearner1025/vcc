@@ -67,7 +67,7 @@ def process_batch(input_h5ad: str,
     chunk.var["gene_symbol"] = orig_vars
     chunk.var_names = new_vars
 
-    sc.pp.normalize_total(chunk, target_sum=1e4, inplace=True)
+    sc.pp.normalize_total(chunk, target_sum=50000, inplace=True)
     sc.pp.log1p(chunk)
     chunk.X = chunk.X.astype(np.float32)
 

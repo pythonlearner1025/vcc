@@ -6,6 +6,6 @@ pip install https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.
 
 # copy data to root dir for faster loading
 #cp -r scRNA_norm /
-cp data/competition_support/competition_train.h5 /
-cp esm_all.pt /
-cp assets/token_distribution.json / 
+#cp data/competition_support/competition_train.h5 /
+#cp esm_all.pt /
+#cp assets/token_distribution.json / 

@@ -271,7 +271,7 @@ def main():
             # tokenizer
             vocab_size=128,
             # max log1p value
-            token_max_value=round(math.log1p(10000), 1),
+            token_max_value=round(math.log1p(50000), 1),
             
             n_genes=3000,
             n_total_genes=3000,

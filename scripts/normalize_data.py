@@ -17,6 +17,7 @@ from typing import List
 import json
 from tqdm import tqdm
 
+SCALE_TO = 50000 
 
 def create_directory_structure(src_dir: Path, dst_dir: Path):
     """Create the same directory structure in destination as in source."""
@@ -80,7 +81,7 @@ def normalize_h5_batch_file(src_file: Path, dst_file: Path):
         # CP10K normalization: scale each cell to 10,000 total counts
         row_sums = X.sum(axis=1, keepdims=True)
         row_sums[row_sums == 0] = 1  # Avoid division by zero
-        X = (X / row_sums) * 10000
+        X = (X / row_sums) * SCALE_TO
         
         # Log1p transformation
         X = np.log1p(X)

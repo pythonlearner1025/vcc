@@ -203,7 +203,7 @@ def _run_validation_merged(
     batch_to_idx: Dict[str, int] | None = None,
     val_ds=None,
     val_dl=None,
-    max_steps: int = 10
+    max_genes: int = 10
 ):
     """Generate one merged prediction/ground-truth pair for all
     validation genes and run cell-eval once."""
@@ -229,7 +229,7 @@ def _run_validation_merged(
 
     steps = 0
     for sample in val_dl:
-        if steps >= max_steps:
+        if steps >= max_genes:
             break
         steps += 1
         delta_expr = sample["tokens"].squeeze(0)  # (S,N)

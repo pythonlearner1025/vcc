@@ -101,7 +101,7 @@ class ConditionalModelConfig:
     log_every: int = 100
     eval_every: int = 1000
     save_every: int = 5000
-    max_eval_steps: int = 25
+    max_eval_genes: int = 25
 
     debug_pretrain_max_cells: Optional[int] = None 
     debug_finetune_max_cells: Optional[int] = None

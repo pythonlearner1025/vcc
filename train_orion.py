@@ -244,7 +244,7 @@ def main():
         # Fresh training run – create default config
         config = ConditionalModelConfig(
             # DATA
-            pretrain_data_dir="/batched",
+            pretrain_data_dir="data/batched2",
             finetune_data_path="/competition_train.h5",
             esm_matrix_path="/esm_all.pt",
             hvg_info_path="assets/hvg_seuratv3_6297.txt",
@@ -262,7 +262,7 @@ def main():
             # tokenizer
             vocab_size=128,
             # max log1p value
-            token_max_value=round(math.log1p(10000), 1),
+            token_max_value=round(math.log1p(50000), 1),
             
             n_genes=6297,
             n_total_genes=6297,
@@ -275,18 +275,15 @@ def main():
             control_set_dim_hidden=512,
 
             # BS
-            pretrain_batch_size=64,
-            vcc_set_size=64,
+            pretrain_batch_size=128,
+            vcc_set_size=128,
 
             # Diffusion
             n_timesteps=16,
             schedule="cosine",
             # MASK
-            # TODO - use BERT mask ratio 20%
-            # Use MUCH smaller finetune_mask_ratio_steps
-            # ~1000, so most of the epochs is in 90% masking regime
-            pretrain_mask_ratio=0.40,
-            finetune_mask_ratio_start=0.4,
+            pretrain_mask_ratio=0.20,
+            finetune_mask_ratio_start=0.2,
             finetune_mask_ratio_end=0.9,
             finetune_mask_ratio_steps=10000,
             finetune_full_mask_prob=0.05,
@@ -295,8 +292,8 @@ def main():
             # LR
             learning_rate=1e-4,
             weight_decay=0.01,
-            warmup_steps=500,
-            finetune_learning_rate=1e-4,
+            warmup_steps=1000,
+            finetune_learning_rate=5e-5,
             finetune_warmup_steps=500,
 
             token_weighting_annealing_steps=None,
@@ -304,15 +301,15 @@ def main():
             
             # 1e6 cells x 5
             pretrain_epochs=1,
-            finetune_epochs=1,
+            finetune_epochs=3,
 
-            save_every=1500,
+            save_every=1000,
             eval_every=1,
-            max_eval_steps=1,
+            max_eval_genes=25,
 
             # DEBUG
-            debug_pretrain_max_cells=1,
-            debug_finetune_max_cells=1,
+            debug_pretrain_max_cells=None,
+            debug_finetune_max_cells=None,
             debug_eval_max_cells=1000
         )
 
@@ -526,7 +523,7 @@ def main():
                         device_eval,
                         eval_dir,
                         batch_to_idx=batch_to_idx,
-                        max_steps=config.max_eval_steps
+                        max_steps=config.max_eval_genes,
                         val_ds=orion_val_ds,
                         val_dl=orion_val_dl,
                     )
@@ -596,7 +593,7 @@ def main():
                     device_eval,
                     eval_dir,
                     batch_to_idx=batch_to_idx,
-                    max_steps=config.max_eval_steps,
+                    max_steps=config.max_eval_genes,
                     val_ds=val_dataset,
                     val_dl=val_dataloader
                 )
