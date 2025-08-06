@@ -31,13 +31,13 @@ from torch.utils.data import DataLoader
 # Local imports – keep them here to avoid import-time GPU allocations in PyTorch
 # -----------------------------------------------------------------------------
 from models.diffusion import ConditionalModelConfig
-from train import create_simple_tokenizer  # Re-use the helper from train.py
+from tokenizer import create_logbin_tokenizer  # Re-use the helper from train.py
 from dataset.scrna_hvg_dataset import (
     ScRNADatasetWithHVGs,
     create_scrna_hvg_dataloader,
 )
 from dataset.vcc_paired_dataloader import (
-    create_train_val_dataloaders,
+    create_vcc_train_val_dataloaders,
 )
 
 # -----------------------------------------------------------------------------
@@ -75,7 +75,6 @@ def _iterate_dataloader(dl: DataLoader, counts: torch.Tensor, *, include_control
             # Plain tensor batch from pretraining DataLoader (TokenisedScRNADataset)
             _accumulate_counts(batch, counts)
 
-
 # -----------------------------------------------------------------------------
 # Main script
 # -----------------------------------------------------------------------------
@@ -85,12 +84,12 @@ def main():
     parser.add_argument("--output", type=str, default="token_distribution.json", help="Path to output JSON file")
 
     # Allow overriding any dataset-related parameters if needed
-    parser.add_argument("--hvg_info_path", type=str, default="/workspace/vcc/hvg_seuratv3_2000.txt")
-    parser.add_argument("--pretrain_data_dir", type=str, default="/data_normalized/scRNA/processed")
-    parser.add_argument("--finetune_adata_path", type=str, default="/data_normalized/vcc_data/adata_Training.h5ad")
-    parser.add_argument("--vocab_size", type=int, default=None, help="Override vocab size; defaults to config setting")
-    parser.add_argument("--debug_pretrain_max_cells", type=int, default=None, help="Limit number of pretrain cells (for quick runs)")
-    parser.add_argument("--debug_finetune_max_cells", type=int, default=None, help="Limit number of fine-tune samples (for quick runs)")
+    parser.add_argument("--pretrain_data_dir", type=str, default="/scRNA_norm/processed")
+    parser.add_argument("--finetune_adata_path", type=str, default="/competition_train.h5")
+    parser.add_argument("--hvg_info_path", type=str, default="assets/hvg_seuratv3_3000.txt")
+    parser.add_argument("--vocab_size", type=int, default=128, help="Override vocab size; defaults to config setting")
+    parser.add_argument("--debug_pretrain_max_cells", type=int, default=1e5, help="Limit number of pretrain cells (for quick runs)")
+    parser.add_argument("--debug_finetune_max_cells", type=int, default=1e5, help="Limit number of fine-tune samples (for quick runs)")
 
     args = parser.parse_args()
 
@@ -102,7 +101,7 @@ def main():
         config.vocab_size = args.vocab_size
     vocab_size = config.vocab_size
 
-    tokenizer, _ = create_simple_tokenizer(vocab_size)
+    tokenizer, _ = create_logbin_tokenizer(vocab_size)
 
     # Ensure output directory exists
     output_path = Path(args.output).expanduser().resolve()
@@ -146,7 +145,7 @@ def main():
     # ------------------------------------------------------------------
     # 2. Fine-tune dataset (VCC paired sets – train & val)
     # ------------------------------------------------------------------
-    (train_dataset, train_loader), (val_dataset, val_loader) = create_train_val_dataloaders(
+    (train_dataset, train_loader), (val_dataset, val_loader) = create_vcc_train_val_dataloaders(
         adata_path=args.finetune_adata_path,
         hvg_gene_ids=hvg_genes,
         set_size=config.vcc_set_size,

@@ -9,19 +9,55 @@ including the model architecture, diffusion process, and associated utilities.
 import math
 import json
 import torch
+
+# Enable fast TensorFloat-32 matmul on Ampere+
+if torch.cuda.is_available():
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 from typing import Dict, List, Tuple, Optional
 from dataclasses import dataclass
+from muon import MuonWithAuxAdam, SingleDeviceMuonWithAuxAdam
+from torch.nn.attention import sdpa_kernel, SDPBackend
 
-# Try to import flash_attn
+# Try to import flash_attn for native MQA support
 try:
-    from flash_attn import flash_attn_func
-    print("USING FLASH ATTN")
-    HAS_FLASH_ATTN = True
+    from flash_attn import flash_attn_func, flash_attn_varlen_qkvpacked_func
+    HAS_FLASH_ATTN = False
+    print("Using flash_attn for MQA support")
 except ImportError:
     HAS_FLASH_ATTN = False
+    print("flash_attn not available, falling back to PyTorch SDPA")
+
+# ----------------------------------------------------------------------
+# Transformer-Engine (FP8) integration
+# ----------------------------------------------------------------------
+import os
+USE_TE = int(os.getenv("TE", 0))
+HAS_TE = False
+if USE_TE:
+    try:
+        import transformer_engine.pytorch as te
+        from transformer_engine.pytorch import fp8_autocast
+        print("USING TRANSFORMER ENGINE FP8")
+        HAS_TE = True
+    except ImportError:
+        from contextlib import nullcontext as _nullctx
+        def fp8_autocast(enabled=True, *args, **kwargs):
+            """Fallback to no-op context manager when TE is unavailable or disabled."""
+            return _nullctx()
+        HAS_TE = False
+
+# Drop-in replacements enabling FP8 kernels when TE is available
+if HAS_TE:
+    Linear = te.Linear
+    LayerNorm = te.LayerNorm
+else:
+    Linear = torch.nn.Linear
+    LayerNorm = torch.nn.LayerNorm
 
 @dataclass
 class ConditionalModelConfig:
@@ -33,6 +69,7 @@ class ConditionalModelConfig:
     n_layer: int = 8
     ffn_mult: int = 8
     vocab_size: int = 64  # 64 expression bins
+    token_max_value: float = 9.2
     n_genes: int = 2000  # Number of HVGs
 
     # Training target type
@@ -48,9 +85,11 @@ class ConditionalModelConfig:
     
     # Batch conditioning
     # TODO get true number of batches in VCC
-    n_batches: int = 100  # Estimate of unique batches across datasets
+    n_technical_batches: int = 48  # Estimate of unique batches across datasets
     batch_embed_dim: int = 64  # Batch embedding dimension
     use_batch_conditioning: bool = True
+    # Latent context compression: number of latent summary tokens (0 = disabled)
+    context_compressed_len: int = 0
     
     # Control set conditioning
     control_set_encoder_layers: int = 2
@@ -72,12 +111,19 @@ class ConditionalModelConfig:
     
     # Training parameters
     pretrain_batch_size: int = 32
-    learning_rate: float = 1e-4
-    weight_decay: float = 0.01
-    warmup_steps: int = 500
+    adam_lr: float = 1e-4
+    muon_lr: float = 1e-4
+    warmup_steps: int = 500 # lr exp inc
+    num_steps: int = 1500 # lr constant
+    cooldown_steps: int = 500 # lr exp dec
 
-    finetune_learning_rate: float = 3e-5
-    finetune_warmup_steps: int = 500
+    finetune_muon_lr: float = 1e-2
+    finetune_adam_lr: float = 1e-4
+    # Enable FP8 execution via Transformer-Engine (if available)
+    use_fp8: bool = True  # Now working with custom-built wheel
+    
+    # Gradient checkpointing - disable for large-batch FP8 runs to see true kernel speed
+    grad_ckpt: bool = True  # Enable activation checkpointing (trades compute for memory)
 
     vcc_batch_size: int = 1
     vcc_set_size: int = 64
@@ -93,7 +139,7 @@ class ConditionalModelConfig:
     log_every: int = 100
     eval_every: int = 1000
     save_every: int = 5000
-    vcc_eval_interval: int = 5000
+    max_eval_genes: int = 25
 
     debug_pretrain_max_cells: Optional[int] = None 
     debug_finetune_max_cells: Optional[int] = None
@@ -141,27 +187,29 @@ class SinusoidalPosEmb(nn.Module):
         emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=-1)
         return emb
 
-
-class MultiQueryAttention(nn.Module):
-    """Multi-Query Attention (MQA) with shared key/value projections."""
+class GroupedQueryAttention(nn.Module):
+    """Grouped Query Attention (GQA) with grouped key/value projections."""
     
-    def __init__(self, dim: int, n_head: int):
+    def __init__(self, dim: int, n_head: int, n_group: int = 2):
         super().__init__()
         self.dim = dim
         self.n_head = n_head
+        self.n_group = n_group  # Store n_group as instance variable
         self.head_dim = dim // n_head
         
-        # Query projection for all heads
-        self.q_proj = nn.Linear(dim, dim)
+        # Ensure n_head is divisible by n_group
+        assert n_head % n_group == 0, f"n_head ({n_head}) must be divisible by n_group ({n_group})"
+        self.heads_per_group = n_head // n_group
         
-        # Shared key/value projection (single head)
-        self.kv_proj = nn.Linear(dim, 2 * self.head_dim)
+        # Query projection for all heads
+        self.q_proj = Linear(dim, dim)
+        
+        # Grouped key/value projections (n_group groups)
+        self.kv_proj = Linear(dim, 2 * self.n_group * self.head_dim)
         
         # Output projection
-        self.out_proj = nn.Linear(dim, dim)
-        
-        # Use flash attention if available
-        self.use_flash_attn = HAS_FLASH_ATTN
+        self.out_proj = Linear(dim, dim)
+
         
     def forward(self, x: torch.Tensor, kv: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
@@ -175,41 +223,70 @@ class MultiQueryAttention(nn.Module):
         B, N, D = x.shape
         
         # Use x for key/value if not provided
-        if kv is None:
+        if kv is None: 
             kv = x
+        #else: 1663ms fwd, 5675 back
+            #kv = kv[:,:684,:]
+        '''
+            6886->6886:2259ms fwd, 7788ms back
+            6886->684: 1663ms fwd, 5675ms back
+            # one epoch 38569 steps
+            # full 27hr diff in one epoch
+        '''
+
+        M = kv.shape[1]  # kv sequence length (6288)
         
         # Project queries for all heads
+        # (128, 6288, 12, 57)
         q = self.q_proj(x).view(B, N, self.n_head, self.head_dim)  # (B, N, H, HD)
         
-        # Project shared key/value
-        kv_proj = self.kv_proj(kv)  # (B, M, 2*HD)
-        k, v = kv_proj.chunk(2, dim=-1)  # Each is (B, M, HD)
-        
-        if self.use_flash_attn:
-            # For flash_attn, we need to expand k, v for all heads
-            # flash_attn expects (batch, seq_len, n_heads, head_dim)
-            k_expanded = k.unsqueeze(2).expand(-1, -1, self.n_head, -1)  # (B, M, H, HD)
-            v_expanded = v.unsqueeze(2).expand(-1, -1, self.n_head, -1)  # (B, M, H, HD)
+        # Project grouped key/value
+        # (128, 6288, G, 57)
+        kv_proj = self.kv_proj(kv).view(B, M, self.n_group, 2*self.head_dim)  # (B, M, G, 2*HD)
+        k, v = kv_proj.chunk(2, dim=-1)  # Each is (B, M, G, HD)
+
+        if HAS_FLASH_ATTN:
+            # Flash attention natively supports GQA when k,v have fewer heads than q
+            # Ensure k and v are contiguous after chunk operation
+            k = k.contiguous()  # (B, M, G, HD)
+            v = v.contiguous()  # (B, M, G, HD)
             
-            # Use flash attention
-            out = flash_attn_func(q, k_expanded, v_expanded, causal=False)  # (B, N, H, HD)
+            out = flash_attn_func(
+                q, k, v,
+                dropout_p=0.0,
+                softmax_scale=None,  # Will default to 1/sqrt(head_dim)
+                causal=False,
+                window_size=(-1, -1),
+                alibi_slopes=None,
+                deterministic=False
+            )  # (B, N, H, HD)
             
-            # Reshape output
-            out = out.view(B, N, D)
+            # Reshape back to (B, N, D)
+            out = out.contiguous().view(B, N, D)
         else:
-            # Standard attention implementation
+            # ------------------------------------------------------------------
+            #  Fallback: PyTorch SDPA with K/V group expansion
+            # ------------------------------------------------------------------
+            # Transpose for SDPA format: (B, H, N, HD)
             q = q.transpose(1, 2)  # (B, H, N, HD)
             
-            # Expand k, v for all heads
-            k = k.unsqueeze(1).expand(-1, self.n_head, -1, -1)  # (B, H, M, HD)
-            v = v.unsqueeze(1).expand(-1, self.n_head, -1, -1)  # (B, H, M, HD)
+            # Expand k, v from groups to all heads
+            # Each group serves heads_per_group query heads
+            k = k.unsqueeze(2).expand(-1, -1, self.heads_per_group, -1, -1)  # (B, M, heads_per_group, G, HD)
+            k = k.reshape(B, M, self.n_head, self.head_dim).transpose(1, 2)  # (B, H, M, HD)
             
-            # Attention
-            scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)  # (B, H, N, M)
-            attn = F.softmax(scores, dim=-1)
-            out = torch.matmul(attn, v)  # (B, H, N, HD)
+            v = v.unsqueeze(2).expand(-1, -1, self.heads_per_group, -1, -1)  # (B, M, heads_per_group, G, HD)
+            v = v.reshape(B, M, self.n_head, self.head_dim).transpose(1, 2)  # (B, H, M, HD)
             
-            # Reshape
+            # Use PyTorch's SDPA with optional flash attention backend
+            with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
+                out = F.scaled_dot_product_attention(
+                    q, k, v, 
+                    dropout_p=0.0, 
+                    is_causal=False
+                )  # (B, H, N, HD)
+            
+            # Reshape back to (B, N, D)
             out = out.transpose(1, 2).contiguous().view(B, N, D)
         
         # Project output
@@ -217,6 +294,40 @@ class MultiQueryAttention(nn.Module):
         
         return out
 
+class LatentContextCompressor(nn.Module):
+    """Learn **K** latent tokens that attend over the full gene sequence and
+    return an orderless summary (B, K, D). Equivalent to one Perceiver-style
+    cross-attention block.
+    """
+    def __init__(self, dim: int, k: int, n_head: int, dropout: float = 0.0):
+        super().__init__()
+        self.k = k
+        self.latents = nn.Parameter(torch.randn(1, k, dim) * 0.02)
+
+        # Q comes from latents, K/V from gene tokens using grouped-query attention
+        self.cross_attn = GroupedQueryAttention(dim, n_head, n_group=2)
+        self.ln_q = LayerNorm(dim)
+        self.ln_kv = LayerNorm(dim)
+
+        self.mlp = nn.Sequential(
+            LayerNorm(dim),
+            Linear(dim, 4 * dim),
+            nn.GELU(),
+            Linear(4 * dim, dim),
+        )
+
+    def forward(self, gene_tokens: torch.Tensor) -> torch.Tensor:
+        """gene_tokens: (B, N, D) → (B, K, D)"""
+        B, _, _ = gene_tokens.shape
+        lat = self.latents.expand(B, -1, -1)  # (B, K, D)
+
+        lat2 = self.cross_attn(
+            self.ln_q(lat),
+            kv=self.ln_kv(gene_tokens),
+        )
+        lat = lat + lat2
+        lat = lat + self.mlp(lat)
+        return lat
 
 class TransformerBlock(nn.Module):
     """Transformer block with MQA and cross-attention support."""
@@ -224,20 +335,23 @@ class TransformerBlock(nn.Module):
     def __init__(self, dim: int, n_head: int, ffn_mult: int = 4):
         super().__init__()
         # Self-attention
-        self.ln1 = nn.LayerNorm(dim)
-        self.self_attn = MultiQueryAttention(dim, n_head)
+        self.ln1 = LayerNorm(dim)
+        self.self_attn = GroupedQueryAttention(dim, n_head)
         
         # Cross-attention (optional)
-        self.ln2 = nn.LayerNorm(dim)
-        self.cross_attn = MultiQueryAttention(dim, n_head)
+        self.ln2 = LayerNorm(dim)
+        self.cross_attn = GroupedQueryAttention(dim, n_head)
         
-        # FFN
-        self.ln3 = nn.LayerNorm(dim)
-        self.mlp = nn.Sequential(
-            nn.Linear(dim, dim * ffn_mult),
-            nn.GELU(),
-            nn.Linear(dim * ffn_mult, dim)
-        )
+        self.ln3 = LayerNorm(dim)
+        try:
+            from xformers.ops import FusedDenseGeluDense
+            self.mlp = FusedDenseGeluDense(dim, dim * ffn_mult, dim)
+            print("Built with FusedDenseGelu")
+        except ImportError:
+            self.mlp = nn.Sequential(
+                Linear(dim, dim * ffn_mult),
+                nn.GELU(),
+                Linear(dim * ffn_mult, dim))
         
     def forward(self, x: torch.Tensor, context: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
@@ -250,13 +364,12 @@ class TransformerBlock(nn.Module):
         
         # Cross-attention (if context provided)
         if context is not None:
+            #print(f"block context.shape: {context.shape}")
             x = x + self.cross_attn(self.ln2(x), kv=context)
         
         # FFN
         x = x + self.mlp(self.ln3(x))
-        
         return x
-
 
 class AugmentedGeneEmbedding(nn.Module):
     """Minimal version: trainable ID embedding + frozen ESM2 table."""
@@ -321,54 +434,6 @@ class AugmentedGeneEmbedding(nn.Module):
         fused = self.mix(torch.cat([id_vec, torch.tanh(self.gate) * seq_vec], dim=-1))
         return fused
 
-class ControlSetEncoder(nn.Module):
-    """Encoder for control cell sets following ST architecture."""
-    
-    def __init__(self, n_genes: int, d_hidden: int = 128, d_out: int = 512, n_layers: int = 2, n_head: int = 4):
-        super().__init__()
-        
-        # Cell-level MLP
-        self.cell_mlp = nn.Sequential(
-            nn.Linear(n_genes, d_hidden),
-            nn.GELU(),
-            nn.Linear(d_hidden, d_hidden)
-        )
-        
-        # Set-level transformer
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=d_hidden,
-            nhead=n_head,
-            dim_feedforward=4 * d_hidden,
-            batch_first=True,
-            activation='gelu'
-        )
-        self.set_attn = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
-        
-        # Output projection
-        self.out_proj = nn.Linear(d_hidden, d_out)
-        
-    def forward(self, x_ctrl: torch.Tensor) -> torch.Tensor:
-        """
-        Encode control set.
-        
-        Args:
-            x_ctrl: Control cells (B, S, G) where S is set size, G is n_genes
-            
-        Returns:
-            Encoded control set (B, S, d_out)
-        """
-        # Cell-level encoding
-        h = self.cell_mlp(x_ctrl)  # (B, S, d_hidden)
-        
-        # Set-level attention
-        h = self.set_attn(h)  # (B, S, d_hidden)
-        
-        # Project to output dimension
-        h = self.out_proj(h)  # (B, S, d_out)
-        
-        return h
-
-
 class ConditionalDiffusionTransformer(nn.Module):
     """Conditional discrete diffusion transformer that optionally injects
     per‑gene ESM2 features into the token stream whenever the underlying
@@ -378,12 +443,13 @@ class ConditionalDiffusionTransformer(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
+        # Enable FP8 execution if requested and Transformer-Engine is available
+        self.fp8_enabled = getattr(config, "use_fp8", False) and HAS_TE
 
         # ------------------------------------------------------------------
         #  Embeddings
         # ------------------------------------------------------------------
         self.token_emb = nn.Embedding(config.vocab_size, config.dim)
-        self.pos_emb = nn.Parameter(torch.randn(1, config.n_genes, config.dim) * 0.02)
 
         # Gene‑level embeddings (trainable IDs + optional ESM2 vectors)
         self.gene_embed = AugmentedGeneEmbedding(
@@ -400,42 +466,48 @@ class ConditionalDiffusionTransformer(nn.Module):
             self.register_buffer(
                 "_hvg_idx", torch.arange(config.n_genes, dtype=torch.long), persistent=False
             )
-            self.gene_proj = nn.Linear(config.gene_embed_dim, config.dim, bias=False)
+            self.gene_proj = Linear(config.gene_embed_dim, config.dim, bias=False)
             # Fusion layer to combine token and per-gene features (token_emb || gene_feat)
-            self.fuse_proj = nn.Linear(config.dim * 2, config.dim)
+            self.fuse_proj = Linear(config.dim * 2, config.dim)
+            
+            # Pre-compute and cache the projected HVG features to avoid recomputation
+            with torch.no_grad():
+                gene_ids = torch.arange(config.n_genes, dtype=torch.long)
+                gene_feat = self.gene_embed(gene_ids)  # (N, gene_embed_dim)
+                gene_feat_proj = self.gene_proj(gene_feat)  # (N, D)
+            self.register_buffer("_cached_gene_features", gene_feat_proj, persistent=False)
 
         # Time embedding
         self.time_emb = nn.Sequential(
             SinusoidalPosEmb(config.dim),
-            nn.Linear(config.dim, config.dim),
+            Linear(config.dim, config.dim),
             nn.GELU(),
-            nn.Linear(config.dim, config.dim),
-        )
-
-        # Control‑set encoder, batch embeddings, transformer blocks ...
-        # (identical to original implementation, omitted for brevity)
-        # ------------------------------------------------------------------
-        self.control_encoder = ControlSetEncoder(
-            n_genes=config.n_genes,
-            d_hidden=config.control_set_dim_hidden,
-            d_out=config.dim,
-            n_layers=config.control_set_encoder_layers,
-            n_head=config.n_head,
+            Linear(config.dim, config.dim),
         )
 
         if config.use_batch_conditioning:
-            self.batch_embed = nn.Embedding(config.n_batches, config.batch_embed_dim)
+            self.batch_embed = nn.Embedding(config.n_technical_batches, config.batch_embed_dim)
         batch_dim = config.batch_embed_dim if config.use_batch_conditioning else 0
         self.cond_proj = nn.Sequential(
-            nn.Linear(config.gene_embed_dim + batch_dim, config.dim),
+            Linear(config.gene_embed_dim + batch_dim, config.dim),
             nn.GELU(),
-            nn.Linear(config.dim, config.dim),
+            Linear(config.dim, config.dim),
         )
+
+                # Optional latent context compressor
+        self.context_compressor = None
+        compressed_len = getattr(config, "context_compressed_len", 12)
+        if compressed_len and compressed_len > 0:
+            self.context_compressor = LatentContextCompressor(
+                dim=config.dim,
+                k=compressed_len,
+                n_head=config.n_head,
+            )
 
         self.blocks = nn.ModuleList(
             [TransformerBlock(config.dim, config.n_head, config.ffn_mult) for _ in range(config.n_layer)]
         )
-        self.ln_f = nn.LayerNorm(config.dim)
+        self.ln_f = LayerNorm(config.dim)
         self.head = nn.Linear(config.dim, config.vocab_size)
 
         self.apply(self._init_weights)
@@ -445,7 +517,7 @@ class ConditionalDiffusionTransformer(nn.Module):
     # ----------------------------------------------------------------------
     @staticmethod
     def _init_weights(m):
-        if isinstance(m, nn.Linear):
+        if isinstance(m, (nn.Linear, Linear)):
             nn.init.normal_(m.weight, mean=0.0, std=0.02)
             if m.bias is not None:
                 nn.init.zeros_(m.bias)
@@ -459,9 +531,9 @@ class ConditionalDiffusionTransformer(nn.Module):
         self,
         tokens: torch.LongTensor,  # (B, N)
         timesteps: torch.LongTensor,  # (B,)
-        control_set: Optional[torch.LongTensor] = None,  # (B, S, N)
         target_gene_idx: Optional[torch.LongTensor] = None,  # (B,)
         batch_idx: Optional[torch.LongTensor] = None,  # (B,)
+        control_context: Optional[torch.Tensor] = None,  # (B, S, D) - pre-encoded control set
     ) -> torch.Tensor:
         B, N = tokens.shape
 
@@ -469,31 +541,27 @@ class ConditionalDiffusionTransformer(nn.Module):
         #  (1) Base token embeddings (and optional gene features)
         # ------------------------------------------------------------------
         token_emb = self.token_emb(tokens)  # (B, N, D)
+        context_emb = self.token_emb(control_context)
+
+        # Apply optional compression to context sequence
+        if self.context_compressor is not None:
+            context_emb = self.context_compressor(context_emb)
 
         # Optionally add per‑gene ESM2/ID embeddings projected to model dim.
         if self.use_esm_in_sequence:
-            gene_ids = self._hvg_idx.to(tokens.device)  # (N,)
-            gene_feat = self.gene_embed(gene_ids)       # (N, gene_embed_dim)
-            gene_feat = self.gene_proj(gene_feat)       # (N, D)
+            # Use cached pre-projected gene features instead of recomputing
+            gene_feat = self._cached_gene_features.to(tokens.device)  # (N, D)
+            # Expand across batch and fuse by addition to avoid extra matmul
             gene_feat = gene_feat.unsqueeze(0).expand(token_emb.size(0), -1, -1)
-            x = self.fuse_proj(torch.cat([token_emb, gene_feat], dim=-1))
+            x = token_emb + gene_feat  # additive fusion (faster than concat+linear)
+            context_emb += gene_feat
         else:
             x = token_emb
-
-        # Add positional embeddings
-        x = x + self.pos_emb  # (B, N, D)
 
         # ------------------------------------------------------------------
         #  (2) Global time embedding
         # ------------------------------------------------------------------
         t_emb = self.time_emb(timesteps.float())  # (B, D)
-
-        # ------------------------------------------------------------------
-        #  (3) Control‑set context (ST‑style)
-        # ------------------------------------------------------------------
-        context = None
-        if control_set is not None:
-            context = self.control_encoder(control_set.float())  # (B, S, D)
 
         # ------------------------------------------------------------------
         #  (4) Conditioning vector (target gene + batch) if provided
@@ -504,7 +572,7 @@ class ConditionalDiffusionTransformer(nn.Module):
             gene_cond_emb = self.gene_embed(target_gene_idx)  # (B, gene_embed_dim)
             cond_parts = [gene_cond_emb]
             if self.config.use_batch_conditioning and batch_idx is not None:
-                batch_idx = torch.clamp(batch_idx, 0, self.config.n_batches - 1)
+                batch_idx = torch.clamp(batch_idx, 0, self.config.n_technical_batches - 1)
                 cond_parts.append(self.batch_embed(batch_idx))
             cond_vec = torch.cat(cond_parts, dim=-1)
             cond_vec = self.cond_proj(cond_vec)
@@ -516,8 +584,20 @@ class ConditionalDiffusionTransformer(nn.Module):
         # ------------------------------------------------------------------
         #  (5) Transformer
         # ------------------------------------------------------------------
+        use_ckpt = self.config.grad_ckpt and self.training and torch.is_grad_enabled()
         for block in self.blocks:
-            x = block(x, context=context)
+            if use_ckpt:
+                # Activation checkpointing to trade compute for memory.
+                # Pass the context tensor explicitly to avoid it being captured
+                # by the Python closure which breaks checkpointing and leads
+                # to "Trying to backward through the graph a second time" errors.
+                def _forward(_x, _ctx):
+                    # No nested autocast - let the outer context govern precision
+                    return block(_x, context=_ctx)
+                # Use the newer non-re-entrant checkpointing (required for FP8 compatibility)
+                x = torch.utils.checkpoint.checkpoint(_forward, x, context_emb, use_reentrant=False)
+            else:
+                x = block(x, context=context_emb)
 
         # ------------------------------------------------------------------
         #  (6) Output head
@@ -695,9 +775,9 @@ class PartialMaskingDiffusion:
         # Predict original tokens
         logits = model(
             x_noisy, t,
-            control_set=control_set,
             target_gene_idx=target_gene_idx,
-            batch_idx=batch_idx
+            batch_idx=batch_idx,
+            control_context=control_set.detach()
         )
         
         # Compute loss only on masked positions
@@ -729,16 +809,19 @@ class PartialMaskingDiffusion:
         # Start with all masks
         x = torch.full((B, N), mask_token, device=device, dtype=torch.long)
         
+        # Pre-encode control set once before denoising loop
+        control_context = control_set.detach()
         # Iterative denoising
         for t in reversed(range(self.n_timesteps)):
             t_batch = torch.full((B,), t, device=device, dtype=torch.long)
             
-            # Get model predictions with conditioning
+            # Get model predictions with pre-encoded conditioning
             logits = model(
                 x, t_batch,
-                control_set=control_set,
+                control_set=None,  # Don't pass raw control_set
                 target_gene_idx=target_gene_idx,
-                batch_idx=batch_idx
+                batch_idx=batch_idx,
+                control_context=control_context  # Pass pre-encoded context
             )
             
             logits = logits / temperature
@@ -769,41 +852,60 @@ class PartialMaskingDiffusion:
         
         return x
 
+def create_muon_optimizer(model: nn.Module, config: ConditionalModelConfig):
+    """Create Muon optimizer with weight decay.
 
-def create_optimizer(model: nn.Module, config: ConditionalModelConfig):
-    """Create AdamW optimizer with weight decay."""
-    decay = set()
-    no_decay = set()
-    
-    for mn, m in model.named_modules():
-        for pn, p in m.named_parameters(recurse=False):
-            fpn = f"{mn}.{pn}" if mn else pn
-            
-            if pn.endswith('bias'):
-                no_decay.add(fpn)
-            elif pn.endswith('weight') and isinstance(m, (nn.LayerNorm, nn.Embedding)):
-                no_decay.add(fpn)
-            else:
-                decay.add(fpn)
-    
-    param_dict = {pn: p for pn, p in model.named_parameters()}
-    optim_groups = [
-        {"params": [param_dict[pn] for pn in sorted(decay)], "weight_decay": config.weight_decay},
-        {"params": [param_dict[pn] for pn in sorted(no_decay)], "weight_decay": 0.0},
+    Falls back to a non-distributed variant when ``torch.distributed`` is not
+    initialised (e.g. during local profiling).
+    """
+    # ---------------------------------------------------------
+    # Build parameter groups
+    # ---------------------------------------------------------
+    hidden_weights = [
+        p for n, p in model.named_parameters()
+        if p.ndim == 2 and
+        not any(x in n for x in ["token_emb", "id_emb", "batch_embed"])
     ]
-    
-    return torch.optim.AdamW(optim_groups, lr=config.learning_rate, betas=(0.9, 0.95))
 
+    hidden_gains_biases = [
+        p for n, p in model.named_parameters()
+        if (p.ndim == 1 or p.ndim == 0) and
+        not any(x in n for x in ["token_emb", "id_emb", "batch_embed"])
+    ]
 
-def cosine_lr_schedule(optimizer, step: int, total_steps: int, config: ConditionalModelConfig):
-    """Cosine learning rate schedule with warmup."""
-    if step < config.warmup_steps:
-        lr = config.learning_rate * step / config.warmup_steps
+    nonhidden_params = [
+        p for n, p in model.named_parameters()
+        if any(x in n for x in ["token_emb", "id_emb", "batch_embed", "ln", "norm"])
+    ]
+
+    param_groups = [
+        dict(params=hidden_weights, use_muon=True,
+             lr=config.muon_lr, weight_decay=0.01),
+        dict(params=hidden_gains_biases + nonhidden_params, use_muon=False,
+             lr=config.adam_lr, betas=(0.9, 0.95), weight_decay=0.01),
+    ]
+
+    # ---------------------------------------------------------
+    # Select the appropriate optimizer implementation
+    # ---------------------------------------------------------
+    import torch.distributed as dist
+    if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
+        OptimClass = MuonWithAuxAdam
     else:
-        progress = (step - config.warmup_steps) / (total_steps - config.warmup_steps)
-        lr = config.learning_rate * 0.5 * (1 + math.cos(math.pi * progress))
-        
-    for param_group in optimizer.param_groups:
-        param_group['lr'] = lr
-    return lr
+        OptimClass = SingleDeviceMuonWithAuxAdam
 
+    optimizer = OptimClass(param_groups)
+    return optimizer
+
+def get_lr(optimizer, it: int, cfg: ConditionalModelConfig):
+    assert it <= cfg.num_steps
+    # 1) linear warmup for warmup_iters steps
+    if it < cfg.warmup_steps:
+        return (it+1) / cfg.warmup_steps
+    # 2) constant lr for a while
+    elif it < cfg.num_steps - cfg.cooldown_steps:
+        return 1.0
+    # 3) linear cooldown
+    else:
+        decay_ratio = (cfg.num_steps - it) / cfg.cooldown_steps
+        return decay_ratio

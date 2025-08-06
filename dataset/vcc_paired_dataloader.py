@@ -12,7 +12,7 @@ import scanpy as sc
 from torch.utils.data import Dataset, DataLoader
 from typing import List, Tuple
 import warnings
-from dataset.vcc_collator import VCCCollator
+from dataset.collators import VCCCollator
 
 class VCCPairedDataset(Dataset):
     """
@@ -57,7 +57,7 @@ class VCCPairedDataset(Dataset):
         print(f"Loading VCC data from {adata_path}...")
         self.adata = sc.read_h5ad(adata_path)
 
-              # Apply normalization if requested
+        # Apply normalization if requested
         if self.normalize:
             print("Applying CP10K normalization + log1p transformation...")
             # Make a copy to avoid modifying the original data
@@ -67,7 +67,22 @@ class VCCPairedDataset(Dataset):
             # Log1p transformation
             sc.pp.log1p(self.adata)
             print(f"  Normalization complete. Expression values now in range [0, {self.adata.X.max():.2f}]")
-        
+        else:
+            # Sanity check for log1p normalization using the same approach as scrna_hvg_dataset.py
+            pass
+            '''
+            X = self.adata.X
+            
+            # Basic range check - should be non-negative with reasonable max
+            X_min, X_max = (X.min(), X.max()) if not hasattr(X, 'toarray') else (X.min(), X.max())
+            print(f"  Expression value range: [{X_min:.6f}, {X_max:.2f}]")
+            
+            # Print mean statistics across the cells
+            mean_values = self.adata.X.mean(axis=0)
+            print(f"Mean expression values across cells: {mean_values}")
+            print(f"Overall mean expression value: {mean_values.mean():.2f}")
+            '''
+
         # Create gene name <-> ID mappings
         self.gene_name_to_id = dict(zip(self.adata.var.index, self.adata.var['gene_id']))
         self.gene_id_to_name = dict(zip(self.adata.var['gene_id'], self.adata.var.index))
@@ -174,8 +189,9 @@ class VCCPairedDataset(Dataset):
                         continue
 
                 pert_cells = obs.index[ct_mask].values
-                if len(pert_cells) < self.set_size:
-                    skipped_entries.append((f"{gene}/{cell_type}", f"only {len(pert_cells)} perturbed cells"))
+                # If there are no perturbed cells for this gene / cell-type combo, skip it entirely
+                if len(pert_cells) == 0:
+                    skipped_entries.append((f"{gene}/{cell_type}", "no perturbed cells"))
                     continue
 
                 # batches where this gene was perturbed within this cell_type
@@ -188,13 +204,19 @@ class VCCPairedDataset(Dataset):
                     (obs['cell_type'] == cell_type)
                 )
                 ctrl_cells = obs.index[ctrl_mask].values
-                if len(ctrl_cells) < self.set_size:
-                    skipped_entries.append((f"{gene}/{cell_type}", f"only {len(ctrl_cells)} control cells"))
+                # If there are no control cells available, skip this entry
+                if len(ctrl_cells) == 0:
+                    skipped_entries.append((f"{gene}/{cell_type}", "no control cells"))
                     continue
 
                 for _ in range(self.n_samples_per_gene):
-                    pert_sample = rng.choice(pert_cells, self.set_size, replace=False)
-                    ctrl_sample = rng.choice(ctrl_cells, self.set_size, replace=False)
+                    # Dynamically allow sampling **with replacement** when the available cells are fewer than the
+                    # desired set size. This guarantees that we still create a set of exactly ``self.set_size``
+                    # cells while making use of every unique cell that exists.
+                    replace_pert = len(pert_cells) < self.set_size
+                    replace_ctrl = len(ctrl_cells) < self.set_size
+                    pert_sample = rng.choice(pert_cells, self.set_size, replace=replace_pert)
+                    ctrl_sample = rng.choice(ctrl_cells, self.set_size, replace=replace_ctrl)
                     self.samples.append({
                         'gene': gene,
                         'gene_idx': self.gene_to_hvg_idx[gene],
@@ -232,11 +254,6 @@ class VCCPairedDataset(Dataset):
         ctrl_gene_expr_log = ctrl_expr[:, gene_idx_in_adata].mean()
         log2fc = (pert_gene_expr_log - ctrl_gene_expr_log) / np.log(2)
 
-        # Exponentiate log1p values back to counts (range ~0–10k)
-        pert_expr = np.expm1(pert_expr)
-        ctrl_expr = np.expm1(ctrl_expr)
-
-        # Convert to torch tensors
         pert_expr = torch.from_numpy(pert_expr).float()
         ctrl_expr = torch.from_numpy(ctrl_expr).float()
 
@@ -256,7 +273,6 @@ def create_vcc_paired_dataloader(
     adata_path: str = "data/competition_support/competition_train.h5",
     hvg_gene_ids: List[str] = None,
     set_size: int = 16,
-    batch_size: int = 4,
     n_samples_per_gene: int = 10,
     train_split: float = 0.8,
     is_train: bool = True,
@@ -286,14 +302,14 @@ def create_vcc_paired_dataloader(
     collate_fn = VCCCollator(tokenizer, dataset.batch_to_idx, set_size) if tokenizer else None
 
     dataloader_kwargs = dict(
-        batch_size=batch_size,
+        batch_size=1,
         shuffle=shuffle and is_train,  # Only shuffle training data
         num_workers=num_workers,
         drop_last=True,
         pin_memory=pin_memory,
     )
-    if collate_fn is not None:
-        dataloader_kwargs['collate_fn'] = collate_fn
+    assert collate_fn is not None
+    dataloader_kwargs['collate_fn'] = collate_fn
     if num_workers > 0:
         dataloader_kwargs['prefetch_factor'] = prefetch_factor
 
@@ -302,12 +318,11 @@ def create_vcc_paired_dataloader(
     return dataset, dataloader
 
 
-def create_train_val_dataloaders(
+def create_vcc_train_val_dataloaders(
     *,
     adata_path: str = "data/competition_support/competition_train.h5",
     hvg_gene_ids: List[str] = None,
     set_size: int = 16,
-    batch_size: int = 4,
     n_samples_per_gene_train: int = 10,
     n_samples_per_gene_val: int = 1,
     train_split: float = 0.8,
@@ -325,7 +340,6 @@ def create_train_val_dataloaders(
         adata_path=adata_path,
         hvg_gene_ids=hvg_gene_ids,
         set_size=set_size,
-        batch_size=batch_size,
         n_samples_per_gene=n_samples_per_gene_train,
         train_split=train_split,
         is_train=True,
@@ -344,7 +358,6 @@ def create_train_val_dataloaders(
         adata_path=adata_path,
         hvg_gene_ids=hvg_gene_ids,
         set_size=set_size,
-        batch_size=batch_size,
         n_samples_per_gene=n_samples_per_gene_val,
         train_split=train_split,
         is_train=False,

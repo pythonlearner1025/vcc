@@ -34,6 +34,7 @@ class ScRNADatasetWithHVGs(Dataset):
         self.transform = transform
         self.use_cache = use_cache
         self.normalize = normalize
+        self.normalize_check = False
         
         # ------------------------------------------------------------------
         # Filter HVG list to genes that are actually present in the scRNA data
@@ -133,11 +134,33 @@ class ScRNADatasetWithHVGs(Dataset):
             # CP10K normalization: scale each cell to 10,000 total counts
             row_sums = X.sum(axis=1, keepdims=True)
             row_sums[row_sums == 0] = 1  # Avoid division by zero
-            X = (X / row_sums) * 10000
+            X = (X / row_sums) * 50000
             
             # Log1p transformation
             X = np.log1p(X)
-        
+        elif not self.normalize_check:
+            # Verify if data is log1p (CP10K-normalised) when `normalize=False`.
+            # After CP10K + log1p, each gene value should be ≤ log1p(10000) ≈ 9.2
+            # and row sums should be reasonable (much larger than 9.2)
+            max_possible_gene_value = np.log1p(50000)  # ≈ 9.2
+            X_max = X.max()
+            row_sums = X.sum(axis=1)
+            
+            # Check if individual gene values exceed theoretical maximum
+            if X_max > max_possible_gene_value + 0.1:  # Small tolerance for numerical precision
+                print(f"[ScRNADatasetWithHVGs] Detected NONE-log1p(CP10K-normalised) data. Max value {X_max:.2f} > {max_possible_gene_value:.2f}")
+                raise Exception
+            # Check if row sums are too small (indicating raw counts, not log1p)
+            elif row_sums.mean() < 50:  # log1p normalized data should have much higher row sums
+                print(f"[ScRNADatasetWithHVGs] Detected NONE-log1p(CP10K-normalised) data. Mean row sum {row_sums.mean():.1f} too small.")
+                raise Exception
+            else:
+                print(f"[ScRNADatasetWithHVGs] Verified log1p(CP10K) normalization:")
+                print(f"  Max gene value: {X_max:.2f} (≤ {max_possible_gene_value:.2f})")
+                print(f"  Mean row sum: {row_sums.mean():.1f}")
+
+            self.normalize_check = True
+
         # Extract HVG columns
         X_hvg = self._extract_hvg_columns(X)
         
