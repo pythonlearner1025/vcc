@@ -22,6 +22,16 @@ python -u train.py --config configs/example_scrna_vcc.yml
   - a `torch.Tensor` of shape `[B, N]` named tokens (pretrain style), or
   - a `dict` with keys `tokens` and optional `control`, `target_gene_idx`, `batch_idx`.
 
+#### Global technical batch indexing
+- The trainer discovers local batch names per phase from:
+  - `dataset.unique_batches` (if provided), or
+  - `dataset.adata.obs['batch']` (if present), or
+  - falls back to a single per-phase batch name.
+- It merges all names into a unique global mapping and:
+  - sets `model.config.n_technical_batches` accordingly (rounded up to multiple of 16 when FP8 is enabled),
+  - attaches `batch_to_idx` to datasets/collators when supported,
+  - wraps the collate function so each batch has a `batch_idx` tensor if missing.
+
 The trainer will adapt batches automatically and call a loss via one of:
 - `model.diffusion.compute_loss(model, tokens, control_set=..., target_gene_idx=..., batch_idx=..., step=...)`
 - `model.compute_loss(batch)`

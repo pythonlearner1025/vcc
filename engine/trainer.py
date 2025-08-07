@@ -73,9 +73,28 @@ class Trainer:
         self._maybe_set_seed(cfg.seed)
         self._build_dirs()
         self._init_wandb()
+        # Build all dataloaders first to compute global batch mapping
+        self._phases: List[Tuple[str, Any, DataLoader]] = []
+        for ds_spec in self.cfg.datasets:
+            dataset, dataloader = self._build_dataloader(ds_spec)
+            self._phases.append((ds_spec.name, dataset, dataloader))
+        # Compute global mapping and set n_technical_batches on model config if present
+        from engine.batches import build_global_batch_mapping, attach_global_batch_mapping, pad_batches_for_fp8
+        self.global_batch_mapping = build_global_batch_mapping(self._phases)
+        # Update model config arg if exists
+        if self.cfg.model.config_args is not None:
+            n_batches = len(self.global_batch_mapping)
+            # pad to 16 for FP8 safety; harmless otherwise
+            self.cfg.model.config_args["n_technical_batches"] = pad_batches_for_fp8(n_batches)
+        # Now build model/optim/loss
         self.model = self._build_model().to(self.device)
         self.optimizer, self.scheduler = self._build_optimizer()
         self.loss_adapter = self._build_loss_adapter()
+        # Attach mapping to all dataloaders
+        self._phases = [
+            (name, ds, attach_global_batch_mapping(name, ds, dl, self.global_batch_mapping))
+            for name, ds, dl in self._phases
+        ]
         self.global_step = 0
         self.global_epoch = 0
 
@@ -162,7 +181,8 @@ class Trainer:
         self.resume_if_needed()
         for ds_idx, ds_spec in enumerate(self.cfg.datasets):
             print(f"\n==> Phase {ds_idx+1}/{len(self.cfg.datasets)}: {ds_spec.name} ({ds_spec.epochs} epochs)")
-            dataset, dataloader = self._build_dataloader(ds_spec)
+            # Use prebuilt dataloader with attached mapping
+            _, dataloader = next((d for d in self._phases if d[0] == ds_spec.name), (None, None, None))[1:]
             self._train_phase(ds_spec, dataloader)
 
     def _build_dataloader(self, ds_spec: DatasetSpec) -> Tuple[Any, DataLoader]:
