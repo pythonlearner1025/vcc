@@ -65,6 +65,23 @@ class ScRNADatasetWithHVGs(Dataset):
         self.batch_files = sorted(self.data_dir.glob("batch_*.h5"))
         if not self.batch_files:
             raise ValueError(f"No batch files found in {data_dir}")
+
+        # Optional on-disk cache directory: <parent>/hvg_cache/<tag>/*.npy
+        self.cache_root = self.data_dir.parent / 'hvg_cache'
+        self.npy_cache: Optional[Path] = None
+        if self.cache_root.exists():
+            # pick the newest tag dir; more robust selection can be added later
+            subdirs = sorted([p for p in self.cache_root.iterdir() if p.is_dir()], key=lambda p: p.stat().st_mtime, reverse=True)
+            for cand in subdirs:
+                txt = cand / 'hvg_genes.txt'
+                if txt.exists():
+                    try:
+                        hvgs_disk = [line.strip() for line in txt.read_text().splitlines() if line.strip()]
+                        if hvgs_disk == self.hvg_genes:
+                            self.npy_cache = cand
+                            break
+                    except Exception:
+                        pass
         
         # Create mapping from *original* gene position → pruned HVG index
         self.scrna_to_hvg = {
@@ -116,58 +133,41 @@ class ScRNADatasetWithHVGs(Dataset):
         return X_hvg
     
     def _load_batch(self, batch_idx: int) -> np.ndarray:
-        """Load and extract HVG columns from a batch of data."""
-        # Check cache
+        """Load HVG-pruned batch, preferring on-disk X_hvg if available."""
+        # Check RAM cache first
         if self._cache is not None and batch_idx in self._cache:
             return self._cache[batch_idx]
-        
-        # Load batch
+
+        # Prefer external npy cache if present
+        if self.npy_cache is not None:
+            npy_path = self.npy_cache / (self.batch_files[batch_idx].stem + '.npy')
+            if npy_path.exists():
+                X_hvg = np.load(npy_path, mmap_mode='r')[:]
+                if self._cache is not None:
+                    self._cache[batch_idx] = X_hvg
+                return X_hvg
+
         batch_file = self.batch_files[batch_idx]
         with h5py.File(batch_file, 'r') as f:
-            X = f['X'][:]
-
-            # Apply normalization if requested
-        if self.normalize:
-            # Convert to float32 for normalization
-            X = X.astype(np.float32)
-            
-            # CP10K normalization: scale each cell to 10,000 total counts
-            row_sums = X.sum(axis=1, keepdims=True)
-            row_sums[row_sums == 0] = 1  # Avoid division by zero
-            X = (X / row_sums) * 50000
-            
-            # Log1p transformation
-            X = np.log1p(X)
-        elif not self.normalize_check:
-            # Verify if data is log1p (CP10K-normalised) when `normalize=False`.
-            # After CP10K + log1p, each gene value should be ≤ log1p(10000) ≈ 9.2
-            # and row sums should be reasonable (much larger than 9.2)
-            max_possible_gene_value = np.log1p(50000)  # ≈ 9.2
-            X_max = X.max()
-            row_sums = X.sum(axis=1)
-            
-            # Check if individual gene values exceed theoretical maximum
-            if X_max > max_possible_gene_value + 0.1:  # Small tolerance for numerical precision
-                print(f"[ScRNADatasetWithHVGs] Detected NONE-log1p(CP10K-normalised) data. Max value {X_max:.2f} > {max_possible_gene_value:.2f}")
-                raise Exception
-            # Check if row sums are too small (indicating raw counts, not log1p)
-            elif row_sums.mean() < 50:  # log1p normalized data should have much higher row sums
-                print(f"[ScRNADatasetWithHVGs] Detected NONE-log1p(CP10K-normalised) data. Mean row sum {row_sums.mean():.1f} too small.")
-                raise Exception
+            # Fast path: precomputed X_hvg with matching gene order
+            if 'X_hvg' in f and 'hvg_genes' in f:
+                file_hvgs = [g.decode('utf-8') if isinstance(g, (bytes, np.bytes_)) else str(g)
+                             for g in f['hvg_genes'][:]]
+                if len(file_hvgs) == self.n_hvgs and file_hvgs == self.hvg_genes:
+                    X_hvg = f['X_hvg'][:]
+                else:
+                    # Fallback to safe recompute if mismatch
+                    X = f['X'][:]
+                    X_hvg = self._extract_hvg_columns(X)
             else:
-                print(f"[ScRNADatasetWithHVGs] Verified log1p(CP10K) normalization:")
-                print(f"  Max gene value: {X_max:.2f} (≤ {max_possible_gene_value:.2f})")
-                print(f"  Mean row sum: {row_sums.mean():.1f}")
+                # Original path: compute in-memory
+                X = f['X'][:]
+                X_hvg = self._extract_hvg_columns(X)
 
-            self.normalize_check = True
-
-        # Extract HVG columns
-        X_hvg = self._extract_hvg_columns(X)
-        
         # Cache if enabled
         if self._cache is not None:
             self._cache[batch_idx] = X_hvg
-        
+
         return X_hvg
     
     def __len__(self):

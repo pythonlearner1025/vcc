@@ -34,7 +34,8 @@ class VCCPairedDataset(Dataset):
         normalize: bool = True,
         blacklist_path: str = None,
     ):
-  
+        # Save key construction arguments for downstream evaluation utilities
+        self.adata_path = adata_path
         self.set_size = set_size
         self.n_samples_per_gene = n_samples_per_gene
         self.random_seed = random_seed

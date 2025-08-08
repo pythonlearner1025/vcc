@@ -5,7 +5,7 @@ from typing import Any, Dict
 
 import yaml
 
-from engine.trainer import Trainer, ExperimentConfig, ModelSpec, OptimizerSpec, DatasetSpec
+from engine.trainer import Trainer, ExperimentConfig, ModelSpec, OptimizerSpec, DatasetSpec, LossSpec
 
 
 def _dict_to_obj(cls, d: Dict[str, Any]):
@@ -16,11 +16,14 @@ def _dict_to_obj(cls, d: Dict[str, Any]):
         return ModelSpec(**d)
     if cls is OptimizerSpec:
         return OptimizerSpec(**d)
+    if cls is LossSpec:
+        return LossSpec(**d)
     if cls is ExperimentConfig:
         # nested types
         d = dict(d)
         d["model"] = _dict_to_obj(ModelSpec, d["model"]) if isinstance(d.get("model"), dict) else d.get("model")
         d["optimizer"] = _dict_to_obj(OptimizerSpec, d["optimizer"]) if isinstance(d.get("optimizer"), dict) else d.get("optimizer")
+        d["loss"] = _dict_to_obj(LossSpec, d["loss"]) if isinstance(d.get("loss"), dict) else d.get("loss")
         if isinstance(d.get("datasets"), list):
             d["datasets"] = [
                 _dict_to_obj(DatasetSpec, x) if isinstance(x, dict) else x for x in d["datasets"]

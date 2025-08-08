@@ -24,6 +24,12 @@ class DatasetSpec:
     save_every_steps: int = 1000
     max_steps_per_epoch: Optional[int] = None
     lr: Optional[float] = None
+    # Optional: limit number of validation steps per eval
+    validation_steps: Optional[int] = None
+    # Optional: per-dataset learning rates and warmup
+    muon_lr: Optional[float] = None
+    adam_lr: Optional[float] = None
+    warmup_steps: Optional[int] = None
     hooks: Dict[str, Any] = field(default_factory=dict)
 
 
@@ -98,6 +104,26 @@ class Trainer:
         self.global_step = 0
         self.global_epoch = 0
 
+    def _reinit_token_and_head(self) -> None:
+        """Reinitialise token embedding and output head weights.
+
+        Used when switching from log-binned tokens (pretrain) to delta tokens (finetune)
+        so that token semantics do not leak across phases.
+        """
+        import torch.nn as nn
+        import torch.nn.init as init
+
+        tok = getattr(self.model, "token_emb", None)
+        head = getattr(self.model, "head", None)
+        if isinstance(tok, nn.Embedding):
+            init.normal_(tok.weight, mean=0.0, std=0.02)
+        if isinstance(head, nn.Linear):
+            init.normal_(head.weight, mean=0.0, std=0.02)
+            if head.bias is not None:
+                init.zeros_(head.bias)
+        print("[trainer] Reinitialised token embedding and output head weights")
+        self._log({"model/reinit_token_head": 1, "train/global_step": self.global_step})
+
     def _maybe_set_seed(self, seed: int) -> None:
         torch.manual_seed(seed)
         np.random.seed(seed)
@@ -129,13 +155,23 @@ class Trainer:
 
     def _build_optimizer(self) -> Tuple[torch.optim.Optimizer, Optional[Any]]:
         from engine.utils import import_from_string
-        OptimClass = import_from_string(self.cfg.optimizer.optimizer_class)
-        optimizer = OptimClass(self.model.parameters(), **self.cfg.optimizer.optimizer_args)
-        scheduler = None
-        if self.cfg.optimizer.scheduler_class:
-            SchedClass = import_from_string(self.cfg.optimizer.scheduler_class)
-            scheduler = SchedClass(optimizer, **self.cfg.optimizer.scheduler_args)
-        return optimizer, scheduler
+        OptimObj = import_from_string(self.cfg.optimizer.optimizer_class)
+        optimizer = None
+        # Case 1: standard torch optimizer class
+        if isinstance(OptimObj, type) and issubclass(OptimObj, torch.optim.Optimizer):
+            optimizer = OptimObj(self.model.parameters(), **self.cfg.optimizer.optimizer_args)
+        else:
+            # Case 2: factory function (e.g., models.diffusion:create_muon_optimizer)
+            if callable(OptimObj):
+                model_cfg = getattr(self.model, "config", None)
+                try:
+                    optimizer = OptimObj(self.model, model_cfg, **self.cfg.optimizer.optimizer_args)
+                except TypeError:
+                    optimizer = OptimObj(self.model, model_cfg)
+            else:
+                raise TypeError("optimizer_class must be a torch.optim.Optimizer subclass or a callable factory")
+        # Default: no scheduler here; we will apply per-dataset warmup manually.
+        return optimizer, None
 
     def _build_loss_adapter(self) -> Callable[[torch.nn.Module, Batch, int], torch.Tensor]:
         from engine.utils import import_from_string
@@ -184,6 +220,9 @@ class Trainer:
             # Use prebuilt dataloader with attached mapping
             _, dataloader = next((d for d in self._phases if d[0] == ds_spec.name), (None, None, None))[1:]
             self._train_phase(ds_spec, dataloader)
+            # After scrna_pretrain completes, reset token embedding/head for delta-token finetuning
+            if ds_spec.name.lower() == "scrna_pretrain":
+                self._reinit_token_and_head()
 
     def _build_dataloader(self, ds_spec: DatasetSpec) -> Tuple[Any, DataLoader]:
         from engine.utils import import_from_string
@@ -218,11 +257,133 @@ class Trainer:
         print(f"Saved checkpoint: {ckpt_path}")
 
     def _eval(self, ds_spec: DatasetSpec) -> None:
-        pass
+        # Only implement validation for VCC phases for now
+        phase_name = ds_spec.name.lower()
+        if "vcc" not in phase_name:
+            return
+
+        # Retrieve the train dataloader for this phase (it may carry val handles)
+        dataset, train_loader = next((d for d in self._phases if d[0] == ds_spec.name), (None, None, None))[1:]
+        val_loader = getattr(train_loader, "val_dataloader", None)
+        val_dataset = getattr(train_loader, "val_dataset", None)
+        if val_loader is None or val_dataset is None:
+            print("[eval] No validation dataloader available for phase", ds_spec.name)
+            return
+
+        # Ensure the same global batch mapping is applied to validation
+        from engine.batches import attach_global_batch_mapping
+        val_loader = attach_global_batch_mapping(ds_spec.name + "_val", val_dataset, val_loader, self.global_batch_mapping)
+
+        # Lazily construct diffusion object to compute loss directly
+        from engine.utils import get_autocast_ctx
+        autocast_dtype = torch.bfloat16 if self.cfg.amp_dtype.lower() == "bf16" else torch.float16
+
+        # Validation steps: default to one full pass over val loader, but allow override
+        validation_steps = getattr(ds_spec, "validation_steps", None)
+        steps_done = 0
+        val_losses: List[float] = []
+        self.model.eval()
+        with torch.no_grad():
+            for bidx, batch in enumerate(val_loader):
+                if validation_steps is not None and steps_done >= int(validation_steps):
+                    break
+                batch_std: Batch = adapt_batch(batch, self.device)
+                with get_autocast_ctx(self.model, autocast_dtype):
+                    loss = self.loss_adapter(self.model, batch_std, self.global_step)
+                val_losses.append(loss.item())
+                steps_done += 1
+
+        avg_val = float(np.mean(val_losses) if val_losses else 0.0)
+        print(f"[eval] {ds_spec.name}: val_loss={avg_val:.4f} over {steps_done} steps")
+        self._log({
+            "val/loss": avg_val,
+            "val/steps": steps_done,
+            "val/epoch": self.global_epoch,
+            "phase": ds_spec.name,
+        })
+
+        # Optional full evaluation using evaluate._run_validation_merged
+        # Triggered by model.config.full_eval if available
+        full_eval = bool(getattr(getattr(self.model, "config", object()), "full_eval", False))
+        if full_eval:
+            try:
+                from evaluate import _prepare_gene_mappings, _run_validation_merged
+                # Prepare gene mappings based on the dataset's AnnData
+                # Attempt to locate paths from model.config; fallback to dataset attributes
+                cfg_obj = getattr(self.model, "config", None)
+                # Prefer dataloader args for accuracy
+                finetune_path = (
+                    ds_spec.dataloader_args.get("adata_path")
+                    if isinstance(getattr(ds_spec, "dataloader_args", None), dict) else None
+                ) or getattr(cfg_obj, "finetune_data_path", None) or getattr(val_dataset, "adata_path", None)
+                hvg_path = (
+                    ds_spec.dataloader_args.get("hvg_info_path")
+                    if isinstance(getattr(ds_spec, "dataloader_args", None), dict) else None
+                ) or getattr(cfg_obj, "hvg_info_path", None)
+                if finetune_path is None or hvg_path is None:
+                    raise RuntimeError("full_eval requires config.finetune_data_path and config.hvg_info_path")
+                gene_names, hvg_to_full, hvg_gene_ids = _prepare_gene_mappings(finetune_path, hvg_path)
+
+                # Build simple args namespace for evaluate routine
+                class _Args:
+                    val_genes_number = 10
+                    val_set_size = getattr(cfg_obj, "vcc_set_size", getattr(cfg_obj, "pretrain_batch_size", 16))
+                    blacklist_path = getattr(cfg_obj, "blacklist_path", "assets/blacklist.txt")
+
+                # Create output dir inside run_dir
+                out_dir = self.run_dir / f"eval_ep{self.global_epoch}"
+                out_dir.mkdir(parents=True, exist_ok=True)
+
+                # Tokeniser/Detokeniser for delta tokens
+                from tokenizer import create_delta_tokenizer
+                tokenizer, detok = create_delta_tokenizer(getattr(cfg_obj, "vocab_size", 128), max_abs=getattr(cfg_obj, "token_max_value", 10.82), min_abs=1e-3)
+
+                # Ensure val_dataset has mapping
+                setattr(val_dataset, "batch_to_idx", self.global_batch_mapping)
+
+                # Ensure diffusion instance
+                diffusion_obj = getattr(self.model, "_generic_trainer_diffusion", None)
+                if diffusion_obj is None:
+                    try:
+                        from models.diffusion import PartialMaskingDiffusion as _PMD
+                        diffusion_obj = _PMD(cfg_obj)
+                    except Exception:
+                        diffusion_obj = None
+
+                _run_validation_merged(
+                    cfg_obj,
+                    self.model,
+                    diffusion_obj,
+                    tokenizer,
+                    detok,
+                    gene_names,
+                    hvg_to_full,
+                    hvg_gene_ids,
+                    _Args,
+                    self.device,
+                    out_dir,
+                    batch_to_idx=self.global_batch_mapping,
+                    val_ds=val_dataset,
+                    val_dl=val_loader,
+                    max_genes=getattr(cfg_obj, "max_eval_genes", 10),
+                )
+            except Exception as e:
+                print(f"[eval] full_eval failed: {e}")
 
     def _train_phase(self, ds_spec: DatasetSpec, dataloader: DataLoader) -> None:
         device = self.device
-        self._maybe_update_lr(ds_spec.lr)
+        # Apply per-dataset learning rates if provided
+        if ds_spec.muon_lr is not None or ds_spec.adam_lr is not None:
+            for param_group in self.optimizer.param_groups:
+                # param groups are tagged by custom keys from create_muon_optimizer
+                if param_group.get("use_muon", False):
+                    if ds_spec.muon_lr is not None:
+                        param_group["lr"] = ds_spec.muon_lr
+                else:
+                    if ds_spec.adam_lr is not None:
+                        param_group["lr"] = ds_spec.adam_lr
+        else:
+            self._maybe_update_lr(ds_spec.lr)
         total_steps_per_epoch = len(dataloader)
         max_steps = ds_spec.max_steps_per_epoch or total_steps_per_epoch
         autocast_dtype = torch.bfloat16 if self.cfg.amp_dtype.lower() == "bf16" else torch.float16
@@ -231,6 +392,7 @@ class Trainer:
             epoch_losses: List[float] = []
             self.model.train()
             start_t = time.time()
+            total_steps = len(dataloader)
             for step_idx, batch in enumerate(dataloader):
                 if step_idx >= max_steps:
                     break
@@ -240,18 +402,30 @@ class Trainer:
                 self.optimizer.zero_grad(set_to_none=True)
                 loss.backward()
                 self.optimizer.step()
-                if self.scheduler is not None:
-                    self.scheduler.step()
+                # Per-dataset warmup only: scale base LR multipliers during warmup
+                if ds_spec.warmup_steps is not None and ds_spec.warmup_steps > 0:
+                    # Compute scale in [0,1]
+                    scale = min(1.0, (self.global_step + 1) / float(ds_spec.warmup_steps))
+                    for pg in self.optimizer.param_groups:
+                        base_lr = pg.get("base_lr", pg["lr"]) if pg.get("_base_lr_cached", False) else pg["lr"]
+                        # cache original if not cached
+                        if not pg.get("_base_lr_cached", False):
+                            pg["base_lr"] = base_lr
+                            pg["_base_lr_cached"] = True
+                        desired = pg["base_lr"] * scale
+                        pg["lr"] = desired
                 self.global_step += 1
                 epoch_losses.append(loss.item())
                 if self.global_step % max(1, ds_spec.log_every_steps) == 0:
                     avg = float(np.mean(epoch_losses[-100:] if len(epoch_losses) > 100 else epoch_losses))
-                    self._log({
+                    stats = {
                         "train/loss": loss.item(),
                         "train/loss_avg": avg,
                         "train/epoch": self.global_epoch,
                         "train/global_step": self.global_step,
-                    })
+                    }
+                    print(f"[Epoch {local_epoch}][{self.global_step}/{total_steps}] | loss {stats['train/loss']:.3f} avg_loss {stats['train/loss_avg']:.3f}")
+                    self._log(stats)
                 if self.global_step % max(1, ds_spec.save_every_steps) == 0:
                     self._save(f"ep{self.global_epoch}_step{self.global_step}")
             self.global_epoch += 1

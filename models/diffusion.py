@@ -71,6 +71,7 @@ class ConditionalModelConfig:
     vocab_size: int = 64  # 64 expression bins
     token_max_value: float = 9.2
     n_genes: int = 2000  # Number of HVGs
+    n_latents: int = 256
 
     # Training target type
     target_is_delta: bool = True  # Predict Δ rather than raw counts during fine-tune
@@ -294,41 +295,6 @@ class GroupedQueryAttention(nn.Module):
         
         return out
 
-class LatentContextCompressor(nn.Module):
-    """Learn **K** latent tokens that attend over the full gene sequence and
-    return an orderless summary (B, K, D). Equivalent to one Perceiver-style
-    cross-attention block.
-    """
-    def __init__(self, dim: int, k: int, n_head: int, dropout: float = 0.0):
-        super().__init__()
-        self.k = k
-        self.latents = nn.Parameter(torch.randn(1, k, dim) * 0.02)
-
-        # Q comes from latents, K/V from gene tokens using grouped-query attention
-        self.cross_attn = GroupedQueryAttention(dim, n_head, n_group=2)
-        self.ln_q = LayerNorm(dim)
-        self.ln_kv = LayerNorm(dim)
-
-        self.mlp = nn.Sequential(
-            LayerNorm(dim),
-            Linear(dim, 4 * dim),
-            nn.GELU(),
-            Linear(4 * dim, dim),
-        )
-
-    def forward(self, gene_tokens: torch.Tensor) -> torch.Tensor:
-        """gene_tokens: (B, N, D) → (B, K, D)"""
-        B, _, _ = gene_tokens.shape
-        lat = self.latents.expand(B, -1, -1)  # (B, K, D)
-
-        lat2 = self.cross_attn(
-            self.ln_q(lat),
-            kv=self.ln_kv(gene_tokens),
-        )
-        lat = lat + lat2
-        lat = lat + self.mlp(lat)
-        return lat
-
 class TransformerBlock(nn.Module):
     """Transformer block with MQA and cross-attention support."""
     
@@ -516,8 +482,6 @@ class ConditionalDiffusionTransformer(nn.Module):
         self.gene_q_ln = LayerNorm(config.dim)
         self.lat_kv_ln = LayerNorm(config.dim)
 
-        # No context compressor or gene-space transformer blocks in this variant
-        self.context_compressor = None
         self.blocks = nn.ModuleList()
 
         self.ln_f = LayerNorm(config.dim)
@@ -795,11 +759,12 @@ class PartialMaskingDiffusion:
         x_noisy, mask = self.q_sample(x_start, t, mask_token, mask_ratio=mask_ratio, step=step)
         
         # Predict original tokens
+        control_ctx = control_set.detach() if isinstance(control_set, torch.Tensor) else None
         logits = model(
             x_noisy, t,
             target_gene_idx=target_gene_idx,
             batch_idx=batch_idx,
-            control_context=control_set.detach()
+            control_context=control_ctx
         )
         
         # Compute loss only on masked positions
@@ -832,7 +797,7 @@ class PartialMaskingDiffusion:
         x = torch.full((B, N), mask_token, device=device, dtype=torch.long)
         
         # Pre-encode control set once before denoising loop
-        control_context = control_set.detach()
+        control_context = control_set.detach() if isinstance(control_set, torch.Tensor) else None
         # Iterative denoising
         for t in reversed(range(self.n_timesteps)):
             t_batch = torch.full((B,), t, device=device, dtype=torch.long)
@@ -840,7 +805,6 @@ class PartialMaskingDiffusion:
             # Get model predictions with pre-encoded conditioning
             logits = model(
                 x, t_batch,
-                control_set=None,  # Don't pass raw control_set
                 target_gene_idx=target_gene_idx,
                 batch_idx=batch_idx,
                 control_context=control_context  # Pass pre-encoded context

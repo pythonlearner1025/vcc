@@ -233,29 +233,31 @@ def _run_validation_merged(
             break
         steps += 1
         delta_expr = sample["tokens"].squeeze(0)  # (S,N)
-        ctrl_expr = sample["control"].squeeze(0) # (S,S,N)
+        ctrl_expr = sample["control"].squeeze(0) # (S,N)
         pert_expr = ctrl_expr[0] + delta_expr
         gene_idxs_raw = sample["target_gene_idx"]
         gene_idxs = gene_idxs_raw.to(device, non_blocking=True)
         batches = sample["batch_idx"]
         S, N = pert_expr.shape
 
-        # Tokenise
-        tokens_ctrl = tokenizer(ctrl_expr).to(device, non_blocking=True).unsqueeze(0)
-        print(f"eval tokens_ctrl.shape: {tokens_ctrl.shape}")
+        # Tokenise control set for conditioning (shape must be (S, N))
+        tokens_ctrl = tokenizer(ctrl_expr).to(device, non_blocking=True)
+        #print(f"eval tokens_ctrl.shape: {tokens_ctrl.shape}")
 
         batch_to_idx = val_ds.batch_to_idx
         batch_idx = torch.tensor([batch_to_idx.get(b, 0) for b in batches], dtype=torch.long).to(device, non_blocking=True)
 
-        pred_tokens = diffusion.p_sample_loop(
-            model,
-            mask_token=mask_token,
-            shape=(S, cfg.n_genes),
-            control_set=tokens_ctrl,
-            target_gene_idx=gene_idxs,
-            batch_idx=batch_idx,
-            device=device,
-        )
+        # Use BF16 autocast to enable efficient attention kernels
+        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+            pred_tokens = diffusion.p_sample_loop(
+                model,
+                mask_token=mask_token,
+                shape=(S, cfg.n_genes),
+                control_set=tokens_ctrl,
+                target_gene_idx=gene_idxs,
+                batch_idx=batch_idx,
+                device=device,
+            )
 
         # Convert tokens → expression.  For Δ-training we need to add the predicted
         # change back to the control-cell baseline.
