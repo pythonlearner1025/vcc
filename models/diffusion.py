@@ -600,6 +600,9 @@ class PartialMaskingDiffusion:
         self.n_timesteps = config.n_timesteps
         self.vocab_size = config.vocab_size
         self.mask_ratio = config.mask_ratio
+        # Prefer explicit mask token id from config; fallback to last token id
+        self.mask_token_id: int = int(getattr(config, "mask_token_id", config.vocab_size - 1))
+        print(f'mask_token_id: {self.mask_token_id}')
         
         # Cosine schedule
         s = 0.008
@@ -683,7 +686,7 @@ class PartialMaskingDiffusion:
         self, 
         x_start: torch.LongTensor, 
         t: torch.LongTensor,
-        mask_token: int = 63,  # Last token is [MASK]
+        mask_token: Optional[int] = None,
         mask_ratio: Optional[float] = None,
         step: int = 0
     ) -> Tuple[torch.LongTensor, torch.BoolTensor]:
@@ -696,7 +699,10 @@ class PartialMaskingDiffusion:
         """
         B, N = x_start.shape
         device = x_start.device
-        
+        # Resolve mask token id
+        if mask_token is None:
+            mask_token = self.mask_token_id
+
         if mask_ratio is not None:
             # Use provided mask ratio
             mask_prob = torch.full((B,), mask_ratio, device=device)
@@ -739,7 +745,7 @@ class PartialMaskingDiffusion:
         control_set: Optional[torch.LongTensor] = None,
         target_gene_idx: Optional[torch.LongTensor] = None,
         batch_idx: Optional[torch.LongTensor] = None,
-        mask_token: int = 63,
+        mask_token: Optional[int] = None,
         step: int = 0,
     ) -> torch.Tensor:
         """
