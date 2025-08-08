@@ -25,8 +25,8 @@ model:
     use_batch_conditioning: true
     n_timesteps: 16
     schedule: cosine
-    pretrain_mask_ratio: 0.2
-    finetune_mask_ratio_start: 0.2
+    pretrain_mask_ratio: 0.5
+    finetune_mask_ratio_start: 0.6
     finetune_mask_ratio_end: 0.9
     finetune_mask_ratio_steps: 10000
     finetune_full_mask_prob: 0.05
@@ -62,6 +62,7 @@ datasets:
     muon_lr: 0.03
     adam_lr: 0.0003
     warmup_steps: 1000
+    token_weighting_annealing_steps: 30000
 
   - name: orion_finetune
     dataloader_factory: wrappers.factories:create_orion_finetune
@@ -80,6 +81,7 @@ datasets:
     muon_lr: 0.01
     adam_lr: 0.0001
     warmup_steps: 500
+    token_weighting_annealing_steps: 10000
 
   - name: vcc_finetune
     dataloader_factory: wrappers.factories:create_vcc_finetune
@@ -103,3 +105,4 @@ datasets:
     muon_lr: 0.01
     adam_lr: 0.0001
     warmup_steps: 1000
+    token_weighting_annealing_steps: 10000

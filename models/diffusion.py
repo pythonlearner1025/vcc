@@ -642,10 +642,10 @@ class PartialMaskingDiffusion:
         
         # Compute weights as inverse frequency with smoothing
         # Add smoothing to avoid division by zero and extreme weights
-        weights = 1.0 / (frequencies + smoothing / self.vocab_size)
+        weights = 1.0 / (frequencies + smoothing / self.vocab_size) ** (-0.5)
         
         # Normalize so average weight is 1.0 (preserves overall mask rate)
-        weights = weights / weights.mean()
+        weights = np.minimum(weights / weights.mean(), 3.0)
         
         return torch.tensor(weights, dtype=torch.float32)
     
@@ -660,24 +660,24 @@ class PartialMaskingDiffusion:
         Returns:
             Mask ratio to use
         """
+        def _jitter_around(base, amp=0.1):
+            # amp is absolute jitter; for base=0.6, amp=0.1 → uniform in [0.5, 0.7]
+            u = torch.rand(1).item()
+            lo = max(0.0, base - amp)
+            hi = min(1.0, base + amp)
+            return lo + (hi - lo) * u
+        
         if is_conditioned:
             # Fine-tuning: check for random 100% masking injection
             if torch.rand(1).item() < self.config.finetune_full_mask_prob:
                 return 1.0  # 100% masking
-            
             # Otherwise, use curriculum learning: ramp from start to end ratio
             progress = min(1.0, step / self.config.finetune_mask_ratio_steps)
             base_ratio = (self.config.finetune_mask_ratio_start + 
                          (self.config.finetune_mask_ratio_end - self.config.finetune_mask_ratio_start) * progress)
-            
-            # Sample from beta distribution for variance
-            # Beta(2, 5) gives a right-skewed distribution favoring lower values
-            u = torch.distributions.Beta(2, 5).sample().item()
-            return base_ratio * u
+            return _jitter_around(base_ratio)
         else:
-            # Pretraining: use fixed mask ratio with beta sampling for variance
-            u = torch.distributions.Beta(2, 5).sample().item()
-            return self.config.pretrain_mask_ratio * u
+            return _jitter_around(self.config.pretrain_mask_ratio)
     
     def q_sample(
         self, 
@@ -720,7 +720,7 @@ class PartialMaskingDiffusion:
             freq_weights = self.token_weights.to(device)[x_start]  # shape: [B, N]
             
             # Blend uniform weights (1.0) with frequency weights based on annealing
-            weights = (1.0 - annealing_factor) + annealing_factor * freq_weights
+            weights = (1.0 - annealing_factor) + annealing_factor * (freq_weights ** -0.5) # power law
             
             # Scale mask probability by token weight
             scaled_probs = weights * mask_prob.unsqueeze(1)

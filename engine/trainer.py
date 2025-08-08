@@ -30,6 +30,8 @@ class DatasetSpec:
     muon_lr: Optional[float] = None
     adam_lr: Optional[float] = None
     warmup_steps: Optional[int] = None
+    # Optional: per-dataset token weighting annealing steps
+    token_weighting_annealing_steps: Optional[int] = None
     hooks: Dict[str, Any] = field(default_factory=dict)
 
 
@@ -384,6 +386,14 @@ class Trainer:
                         param_group["lr"] = ds_spec.adam_lr
         else:
             self._maybe_update_lr(ds_spec.lr)
+
+        # If the diffusion object is cached on the model from prior phases, update its
+        # config for per-dataset token weighting annealing if requested.
+        if ds_spec.token_weighting_annealing_steps is not None and hasattr(self.model, "_generic_trainer_diffusion"):
+            try:
+                self.model._generic_trainer_diffusion.config.token_weighting_annealing_steps = ds_spec.token_weighting_annealing_steps
+            except Exception:
+                pass
         total_steps_per_epoch = len(dataloader)
         max_steps = ds_spec.max_steps_per_epoch or total_steps_per_epoch
         autocast_dtype = torch.bfloat16 if self.cfg.amp_dtype.lower() == "bf16" else torch.float16
