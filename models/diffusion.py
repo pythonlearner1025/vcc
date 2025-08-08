@@ -26,7 +26,7 @@ from torch.nn.attention import sdpa_kernel, SDPBackend
 # Try to import flash_attn for native MQA support
 try:
     from flash_attn import flash_attn_func, flash_attn_varlen_qkvpacked_func
-    HAS_FLASH_ATTN = False
+    HAS_FLASH_ATTN = True
     print("Using flash_attn for MQA support")
 except ImportError:
     HAS_FLASH_ATTN = False
@@ -643,9 +643,12 @@ class PartialMaskingDiffusion:
         # Set frequency for unseen tokens
         frequencies[~seen_mask] = median_freq
         
-        # Compute weights as inverse frequency with smoothing
-        # Add smoothing to avoid division by zero and extreme weights
-        weights = 1.0 / (frequencies + smoothing / self.vocab_size) ** (-0.5)
+        # Compute weights from frequencies with smoothing
+        # Higher weight for rarer tokens. Use a gentle power law to avoid extreme values.
+        # Example: weight ∝ (1 / (f + eps))^alpha with alpha in [0,1]
+        eps = smoothing / self.vocab_size
+        alpha = 0.5
+        weights = (1.0 / (frequencies + eps)) ** alpha
         
         # Normalize so average weight is 1.0 (preserves overall mask rate)
         weights = np.minimum(weights / weights.mean(), 3.0)
