@@ -1,0 +1,105 @@
+run_name: scrna_to_vcc_diffusion
+output_dir: checkpoints
+seed: 42
+device: cuda
+amp_dtype: bf16
+use_wandb: true
+wandb_project: vcc-st-diffusion
+
+model:
+  model_class: models.diffusion:ConditionalDiffusionTransformer
+  config_class: models.diffusion:ConditionalModelConfig
+  config_args:
+    dim: 768
+    n_head: 16
+    n_latents: 256
+    n_layer: 20
+    ffn_mult: 4
+    vocab_size: 128
+    token_max_value: 10.82
+    n_genes: 6288
+    n_total_genes: 6288
+    gene_embed_dim: 768
+    n_technical_batches: 48
+    batch_embed_dim: 40
+    use_batch_conditioning: true
+    n_timesteps: 16
+    schedule: cosine
+    pretrain_mask_ratio: 0.2
+    finetune_mask_ratio_start: 0.2
+    finetune_mask_ratio_end: 0.9
+    finetune_mask_ratio_steps: 10000
+    finetune_full_mask_prob: 0.05
+    use_fp8: false
+    full_eval: true
+
+optimizer:
+  optimizer_class: models.diffusion:create_muon_optimizer
+  optimizer_args: {}
+
+loss:
+  loss_class: engine.losses:DiffusionLoss
+  loss_args:
+    diffusion_class: models.diffusion:PartialMaskingDiffusion
+
+# Datasets stack with wrappers that compute HVGs/tokenizers internally
+# Provide simple arguments only.
+datasets:
+  - name: scrna_pretrain
+    dataloader_factory: wrappers.factories:create_scrna_pretrain
+    dataloader_args:
+      data_dir: scRNA_norm/processed
+      hvg_info_path: assets/hvg_seuratv3_6288.txt
+      batch_size: 128
+      vocab_size: 128
+      max_value: 10.82
+      num_workers: 4
+    epochs: 1
+    log_every_steps: 1
+    save_every_steps: 1500
+    eval_every_epochs: 1
+    max_steps_per_epoch: null
+    muon_lr: 0.03
+    adam_lr: 0.0003
+    warmup_steps: 1000
+
+  - name: orion_finetune
+    dataloader_factory: wrappers.factories:create_orion_finetune
+    dataloader_args:
+      data_dir: data/batched_5e4_norm
+      hvg_info_path: assets/hvg_seuratv3_6288.txt
+      set_size: 128
+      vocab_size: 128
+      max_value: 10.82
+      num_workers: 4
+    epochs: 1
+    log_every_steps: 1
+    save_every_steps: 1500
+    eval_every_epochs: 1
+    max_steps_per_epoch: null
+    muon_lr: 0.01
+    adam_lr: 0.0001
+    warmup_steps: 500
+
+  - name: vcc_finetune
+    dataloader_factory: wrappers.factories:create_vcc_finetune
+    dataloader_args:
+      adata_path: /competition_train.h5
+      hvg_info_path: assets/hvg_seuratv3_6288.txt
+      set_size: 128
+      vocab_size: 128
+      max_value: 10.82 
+      n_samples_per_gene_train: 10
+      n_samples_per_gene_val: 1
+      train_split: 0.8
+      num_workers: 4
+      random_seed: 42
+      blacklist_path: assets/blacklist.txt
+    epochs: 7
+    log_every_steps: 1
+    save_every_steps: 1500
+    eval_every_epochs: 1
+    max_steps_per_epoch: null
+    muon_lr: 0.01
+    adam_lr: 0.0001
+    warmup_steps: 1000
