@@ -356,10 +356,10 @@ class OrionPairedDataset(Dataset):  # noqa: E501
 # Helper for building DataLoader (shared by train/val)
 # -------------------------------------------------------------------------
 
-def _build_dataloader(dataset: Dataset, collate_fn=None, *, shuffle: bool, num_workers: int, prefetch_factor: int, pin_memory: bool):
+def _build_dataloader(dataset: Dataset, collate_fn=None, *, shuffle: bool, num_workers: int, prefetch_factor: int, pin_memory: bool, batch_size: int = 1):
     return DataLoader(
         dataset,
-        batch_size=1,  # one set per batch – collator flattens later
+        batch_size=batch_size,
         shuffle=shuffle,
         num_workers=num_workers,
         prefetch_factor=prefetch_factor if num_workers > 0 else None,
@@ -377,6 +377,7 @@ def create_orion_paired_dataloader(
     batches_dir: str | Path,
     set_size: int = 16,
     hvg_gene_ids: List[str] | None = None,
+    batch_size: int = 1,
     shuffle: bool = True,
     num_workers: int = 4,
     random_seed: int = 42,
@@ -386,7 +387,7 @@ def create_orion_paired_dataloader(
     control_label: str = "Non-Targeting",
 ):
     ds = OrionPairedDataset(batches_dir, set_size=set_size, hvg_gene_ids=hvg_gene_ids, control_label=control_label, seed=random_seed)
-    dl = _build_dataloader(ds, None, shuffle=shuffle, num_workers=num_workers, prefetch_factor=prefetch_factor, pin_memory=pin_memory)
+    dl = _build_dataloader(ds, None, shuffle=shuffle, num_workers=num_workers, prefetch_factor=prefetch_factor, pin_memory=pin_memory, batch_size=batch_size)
     return ds, dl
 
 
@@ -394,6 +395,7 @@ def create_orion_train_val_dataloaders(
     batches_dir: str | Path,
     set_size: int = 16,
     hvg_gene_ids: List[str] | None = None,
+    batch_size: int = 1,
     num_workers: int = 4,
     random_seed: int = 42,
     tokenizer=None,  # kept for signature parity
@@ -422,7 +424,8 @@ def create_orion_train_val_dataloaders(
         num_workers=num_workers,
         prefetch_factor=prefetch_factor,
         pin_memory=pin_memory,
-        collate_fn=collate_fn
+        collate_fn=collate_fn,
+        batch_size=batch_size,
     )
     val_dl = _build_dataloader(
         val_ds,
@@ -430,7 +433,8 @@ def create_orion_train_val_dataloaders(
         num_workers=0,
         prefetch_factor=prefetch_factor,
         pin_memory=pin_memory,
-        collate_fn=collate_fn
+        collate_fn=collate_fn,
+        batch_size=batch_size,
     )
 
     return (train_ds, train_dl), (val_ds, val_dl)

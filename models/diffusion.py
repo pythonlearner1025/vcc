@@ -32,32 +32,11 @@ except ImportError:
     HAS_FLASH_ATTN = False
     print("flash_attn not available, falling back to PyTorch SDPA")
 
-# ----------------------------------------------------------------------
-# Transformer-Engine (FP8) integration
-# ----------------------------------------------------------------------
 import os
-USE_TE = int(os.getenv("TE", 0))
-HAS_TE = False
-if USE_TE:
-    try:
-        import transformer_engine.pytorch as te
-        from transformer_engine.pytorch import fp8_autocast
-        print("USING TRANSFORMER ENGINE FP8")
-        HAS_TE = True
-    except ImportError:
-        from contextlib import nullcontext as _nullctx
-        def fp8_autocast(enabled=True, *args, **kwargs):
-            """Fallback to no-op context manager when TE is unavailable or disabled."""
-            return _nullctx()
-        HAS_TE = False
 
 # Drop-in replacements enabling FP8 kernels when TE is available
-if HAS_TE:
-    Linear = te.Linear
-    LayerNorm = te.LayerNorm
-else:
-    Linear = torch.nn.Linear
-    LayerNorm = torch.nn.LayerNorm
+Linear = torch.nn.Linear
+LayerNorm = torch.nn.LayerNorm
 
 @dataclass
 class ConditionalModelConfig:
@@ -68,7 +47,10 @@ class ConditionalModelConfig:
     n_head: int = 8
     n_layer: int = 8
     ffn_mult: int = 8
-    vocab_size: int = 64  # 64 expression bins
+    # Data vocabulary size (number of valid expression bins)
+    vocab_size: int = 128  # 64 expression bins (data tokens only; mask is separate)
+    # Optional explicit mask token id; if None it defaults to vocab_size (i.e., the first id after the data vocab)
+    mask_token_id: Optional[int] = None
     token_max_value: float = 9.2
     n_genes: int = 2000  # Number of HVGs
     n_latents: int = 256
@@ -106,7 +88,7 @@ class ConditionalModelConfig:
     # Masking parameters
     pretrain_mask_ratio: float = 0.20  # Fixed mask ratio for pretraining
     finetune_mask_ratio_start: float = 0.30  # Starting mask ratio for finetuning
-    finetune_mask_ratio_end: float = 0.90  # End mask ratio for finetuning (curriculum)
+    finetune_mask_ratio_end: float = 1.0  # End mask ratio for finetuning (curriculum)
     finetune_mask_ratio_steps: int = 100_000  # Steps to ramp from start to end
     finetune_full_mask_prob: float = 0.10  # Probability of 100% masking during finetune
     
@@ -122,6 +104,8 @@ class ConditionalModelConfig:
     finetune_adam_lr: float = 1e-4
     # Enable FP8 execution via Transformer-Engine (if available)
     use_fp8: bool = True  # Now working with custom-built wheel
+    # Enable auxiliary DE heads/returns
+    use_aux: bool = True
     
     # Gradient checkpointing - disable for large-batch FP8 runs to see true kernel speed
     grad_ckpt: bool = True  # Enable activation checkpointing (trades compute for memory)
@@ -151,14 +135,13 @@ class ConditionalModelConfig:
     @property
     def n_params(self) -> int:
         """Estimate parameter count."""
-        params = self.vocab_size * self.dim  # Token embedding
+        # Token embedding includes an extra row for the [MASK] token
+        params = (self.vocab_size + 1) * self.dim
         params += self.n_timesteps * self.dim  # Time embedding
         params += self.n_total_genes * self.gene_embed_dim  # Gene embeddings
         
         # Batch conditioning
-        if self.use_batch_conditioning:
-            params += self.n_batches * self.batch_embed_dim  # Batch embeddings
-        
+        params += (self.n_technical_batches if self.use_batch_conditioning else 0) * self.batch_embed_dim
         # Transformer layers
         per_layer = (
             4 * self.dim * self.dim +  # QKV + proj
@@ -166,7 +149,7 @@ class ConditionalModelConfig:
         )
         params += self.n_layer * per_layer
         
-        # Output head
+        # Output head predicts only data tokens (excludes [MASK])
         params += self.dim * self.vocab_size
         
         return params
@@ -226,14 +209,6 @@ class GroupedQueryAttention(nn.Module):
         # Use x for key/value if not provided
         if kv is None: 
             kv = x
-        #else: 1663ms fwd, 5675 back
-            #kv = kv[:,:684,:]
-        '''
-            6886->6886:2259ms fwd, 7788ms back
-            6886->684: 1663ms fwd, 5675ms back
-            # one epoch 38569 steps
-            # full 27hr diff in one epoch
-        '''
 
         M = kv.shape[1]  # kv sequence length (6288)
         
@@ -410,12 +385,13 @@ class ConditionalDiffusionTransformer(nn.Module):
         super().__init__()
         self.config = config
         # Enable FP8 execution if requested and Transformer-Engine is available
-        self.fp8_enabled = getattr(config, "use_fp8", False) and HAS_TE
+        self.fp8_enabled = getattr(config, "use_fp8", False) 
 
         # ------------------------------------------------------------------
         #  Embeddings
         # ------------------------------------------------------------------
-        self.token_emb = nn.Embedding(config.vocab_size, config.dim)
+        # Include one extra row for the dedicated [MASK] token at id == config.vocab_size
+        self.token_emb = nn.Embedding(config.vocab_size + 1, config.dim)
 
         # Gene‑level embeddings (trainable IDs + optional ESM2 vectors)
         self.gene_embed = AugmentedGeneEmbedding(
@@ -465,11 +441,15 @@ class ConditionalDiffusionTransformer(nn.Module):
         #  Latent transformer (Perceiver-style) replacing context compressor
         # ------------------------------------------------------------------
         self.n_latents = getattr(config, "n_latents", 512)
-        self.latents = nn.Parameter(torch.randn(1, self.n_latents, config.dim) * 0.02)
+        self.lat1 = nn.Parameter(torch.randn(1, self.n_latents, config.dim) * 0.02)
+        self.lat2 = nn.Parameter(torch.randn(1, self.n_latents, config.dim) * 0.02)
+
 
         gqa_groups = max(1, config.n_head // 2)  # Higher grouping for cross-attention
-        self.cross_attn_q_lat_kv_genes = GroupedQueryAttention(config.dim, config.n_head, n_group=gqa_groups)
+        self.cross_attn_q_lat1_kv_genes = GroupedQueryAttention(config.dim, config.n_head, n_group=gqa_groups)
         self.cross_attn_q_genes_kv_lat = GroupedQueryAttention(config.dim, config.n_head, n_group=gqa_groups)
+        self.cross_attn_q_lat2_kv_genes = GroupedQueryAttention(config.dim, config.n_head, n_group=gqa_groups)
+        #self.cross_attn_seq_context = GroupedQueryAttention(config.dim, config.n_head, n_group=gqa_groups)
 
         # Self-attention stack that processes only the latent tokens
         self.latent_blocks = nn.ModuleList(
@@ -485,7 +465,15 @@ class ConditionalDiffusionTransformer(nn.Module):
         self.blocks = nn.ModuleList()
 
         self.ln_f = LayerNorm(config.dim)
+        # Predict only data tokens, never the [MASK] class
         self.head = nn.Linear(config.dim, config.vocab_size)
+
+        # ---- DE-aware heads ----
+        self.de_sig_head = nn.Linear(config.dim, 1)   # BCEWithLogits on significance
+        self.de_dir_head = nn.Linear(config.dim, 2)   # CE on up/down
+        self.de_rank_head = nn.Linear(config.dim, 1)  # scalar score for RankNet/hinge
+        # Default controlled by config.use_aux
+        self.return_aux = bool(getattr(config, "use_aux", False))
 
         self.apply(self._init_weights)
 
@@ -501,6 +489,54 @@ class ConditionalDiffusionTransformer(nn.Module):
         elif isinstance(m, nn.Embedding):
             nn.init.normal_(m.weight, mean=0.0, std=0.02)
 
+    @staticmethod
+    def _normalize_to_BS(
+        idx: Optional[torch.Tensor],
+        B: int,
+        S: int,
+        name: str,
+        device: Optional[torch.device] = None,
+    ) -> Optional[torch.Tensor]:
+        """Normalize index-like inputs to shape (B, S).
+
+        Accepts scalars, 1-D, or 2-D tensors:
+        - 0-D: broadcast to (B,S)
+        - 1-D: if length==B → (B,S); if length==S → (B,S); if length==1 → (B,S); else error
+        - 2-D: allow (B,S), (B,1), (1,S), (1,1) with expansion; else error
+        Returns None if idx is None.
+        """
+        if idx is None:
+            return None
+        if not torch.is_tensor(idx):
+            idx = torch.as_tensor(idx, device=device)
+        if idx.ndim == 0:
+            idx = idx.view(1, 1).expand(B, S)
+        elif idx.ndim == 1:
+            length = idx.shape[0]
+            if length == B:
+                idx = idx.view(B, 1).expand(B, S)
+            elif length == S:
+                idx = idx.view(1, S).expand(B, S)
+            elif length == 1:
+                idx = idx.view(1, 1).expand(B, S)
+            else:
+                raise ValueError(f"{name} has shape ({length},), expected length equal to batch size {B} or set size {S}.")
+        elif idx.ndim == 2:
+            b, s = idx.shape
+            if (b, s) == (B, S):
+                pass
+            elif (b, s) == (B, 1):
+                idx = idx.expand(B, S)
+            elif (b, s) == (1, S):
+                idx = idx.expand(B, S)
+            elif (b, s) == (1, 1):
+                idx = idx.expand(B, S)
+            else:
+                raise ValueError(f"{name} has shape ({b},{s}), expected (B,S)=({B},{S}), (B,1), (1,S) or (1,1).")
+        else:
+            raise ValueError(f"{name} has {idx.ndim} dims; expected 0, 1 or 2.")
+        return idx.to(dtype=torch.long, device=device)
+
     # ----------------------------------------------------------------------
     #  Forward
     # ----------------------------------------------------------------------
@@ -510,14 +546,15 @@ class ConditionalDiffusionTransformer(nn.Module):
         timesteps: torch.LongTensor,  # (B,)
         target_gene_idx: Optional[torch.LongTensor] = None,  # (B,)
         batch_idx: Optional[torch.LongTensor] = None,  # (B,)
-        control_context: Optional[torch.Tensor] = None,  # (B, S, D) - pre-encoded control set
-    ) -> torch.Tensor:
-        B, N = tokens.shape
+        control_context: Optional[torch.Tensor] = None,  # (B, N) - pre-encoded control set
+        return_aux: bool = False,
+    ) -> torch.Tensor | Dict[str, torch.Tensor]:
+        B, S, N = tokens.shape
 
         # ------------------------------------------------------------------
         #  (1) Base token embeddings (and optional gene features)
         # ------------------------------------------------------------------
-        token_emb = self.token_emb(tokens)  # (B, N, D)
+        token_emb = self.token_emb(tokens)  # (B, S, N, D)
 
         # Encode control-set tokens (if provided)
         context_emb = None
@@ -528,8 +565,8 @@ class ConditionalDiffusionTransformer(nn.Module):
         if self.use_esm_in_sequence:
             # Use cached pre-projected gene features instead of recomputing
             gene_feat = self._cached_gene_features.to(tokens.device)  # (N, D)
-            # Expand across batch and fuse by addition to avoid extra matmul
-            gene_feat = gene_feat.unsqueeze(0).expand(token_emb.size(0), -1, -1)
+            # Expand across batch and set positions to avoid extra matmul
+            gene_feat = gene_feat.unsqueeze(0).unsqueeze(0).expand(B, S, -1, -1)  # (B, S, N, D)
             x = token_emb + gene_feat  # additive fusion (faster than concat+linear)
             if context_emb is not None:
                 context_emb = context_emb + gene_feat
@@ -540,56 +577,91 @@ class ConditionalDiffusionTransformer(nn.Module):
         #  (2) Global time embedding
         # ------------------------------------------------------------------
         t_emb = self.time_emb(timesteps.float())  # (B, D)
+        t_emb = t_emb.unsqueeze(1).unsqueeze(1)  # (B, 1, 1, D)
 
         # ------------------------------------------------------------------
         #  (4) Conditioning vector (target gene + batch) if provided
         # ------------------------------------------------------------------
         combined_emb = t_emb  # always include time
         if target_gene_idx is not None:
-            target_gene_idx = torch.clamp(target_gene_idx, 0, self.config.n_total_genes - 1)
-            gene_cond_emb = self.gene_embed(target_gene_idx)  # (B, gene_embed_dim)
-            cond_parts = [gene_cond_emb]
+            # Normalize target_gene_idx and batch_idx to (B,S)
+            tgt_idx = self._normalize_to_BS(target_gene_idx, B, S, "target_gene_idx", device=tokens.device)
+            bat_idx = None
             if self.config.use_batch_conditioning and batch_idx is not None:
-                batch_idx = torch.clamp(batch_idx, 0, self.config.n_technical_batches - 1)
-                cond_parts.append(self.batch_embed(batch_idx))
-            cond_vec = torch.cat(cond_parts, dim=-1)
-            cond_vec = self.cond_proj(cond_vec)
+                bat_idx = self._normalize_to_BS(batch_idx, B, S, "batch_idx", device=tokens.device)
+
+            # Clamp to valid ranges
+            tgt_idx = torch.clamp(tgt_idx, 0, self.config.n_total_genes - 1)
+            if bat_idx is not None:
+                bat_idx = torch.clamp(bat_idx, 0, self.config.n_technical_batches - 1)
+
+            gene_cond_emb = self.gene_embed(tgt_idx)  # (B, S, gene_embed_dim)
+            cond_parts = [gene_cond_emb]
+            if bat_idx is not None:
+                cond_parts.append(self.batch_embed(bat_idx))   # (B, S, batch_embed_dim)
+            cond_vec = torch.cat(cond_parts, dim=-1)          # (B, S, gene_embed_dim+batch_dim)
+            cond_vec = self.cond_proj(cond_vec)               # (B, S, D)
+            cond_vec = cond_vec.unsqueeze(2)                  # (B, S, 1, D)
             combined_emb = combined_emb + cond_vec
 
         # Inject combined (time + conditioning) into every token position
-        x = x + combined_emb.unsqueeze(1)  # (B, 1, D)
+        x = x + combined_emb  # (B, S, N, D)
 
         # ------------------------------------------------------------------
         #  (5) Latent transformer
         # ------------------------------------------------------------------
         B = x.shape[0]
-        lat = self.latents.expand(B, -1, -1)  # (B, K, D)
+        lat1 = self.lat1.expand(B, -1, -1)  # (B, K, D)
+        lat2 = self.lat2.expand(B, -1, -1)  # (B, K, D)
 
-        # Combine gene and control tokens for encoder cross-attention
+        # Flatten (B, S, N, D) -> (B, S*N, D) for attention
+        x_seq = x.view(B, S * N, -1)
         if context_emb is not None:
-            kv_all = torch.cat([x, context_emb], dim=1)
+            context_seq = context_emb.view(B, S * N, -1)
+            #x_seq = self.cross_attn_seq_context(x_seq, kv=self.kv_ln(context_seq))
+            #kv_all = torch.cat([x_seq, context_seq], dim=1)
+            kv_x = x_seq
+            kv_c = context_seq
         else:
-            kv_all = x
-
+            kv_all = x_seq
+        
         # Encode streams into latents
-        lat = lat + self.cross_attn_q_lat_kv_genes(self.lat_q_ln(lat), kv=self.kv_ln(kv_all))
+        lat1 = lat1 + self.cross_attn_q_lat1_kv_genes(self.lat_q_ln(lat1), kv=self.kv_ln(kv_x))
+        lat2 = lat2 + self.cross_attn_q_lat2_kv_genes(self.lat_q_ln(lat2), kv=self.kv_ln(kv_c))
 
         # Latent self-attention stack
         use_ckpt = self.config.grad_ckpt and self.training and torch.is_grad_enabled()
         for blk in self.latent_blocks:
             if use_ckpt:
-                lat = torch.utils.checkpoint.checkpoint(lambda _lat: blk(_lat, context=None), lat, use_reentrant=False)
+                lat1 = torch.utils.checkpoint.checkpoint(lambda _lat, _ctx: blk(_lat, context=_ctx), lat1, lat2, use_reentrant=True)
             else:
-                lat = blk(lat, context=None)
+                lat1 = blk(lat1, context=self.lat_kv_ln(lat2))
 
         # Decode back to gene tokens
-        x = x + self.cross_attn_q_genes_kv_lat(self.gene_q_ln(x), kv=self.lat_kv_ln(lat))
+        x_seq = x_seq + self.cross_attn_q_genes_kv_lat(self.gene_q_ln(x_seq), kv=self.lat_kv_ln(lat1))
+        x = x_seq.view(B, S, N, -1)
 
         # ------------------------------------------------------------------
         #  (6) Output head
         # ------------------------------------------------------------------
-        x = self.ln_f(x)
-        return self.head(x)
+        h = self.ln_f(x)          # per-gene hidden states (B, S, N, D)
+        vocab_logits = self.head(h)  # (B, S, N, V)
+
+        if not return_aux:
+            return vocab_logits
+
+        # Aux heads
+        de_sig_logit = self.de_sig_head(h).squeeze(-1)   # (B, S, N)
+        de_dir_logits = self.de_dir_head(h)              # (B, S, N, 2)
+        de_rank_score = self.de_rank_head(h).squeeze(-1) # (B, S, N)
+
+        return {
+            "logits": vocab_logits,
+            "hidden": h,
+            "de_sig_logit": de_sig_logit,
+            "de_dir_logits": de_dir_logits,
+            "de_rank_score": de_rank_score,
+        }
 
 
 class PartialMaskingDiffusion:
@@ -598,19 +670,24 @@ class PartialMaskingDiffusion:
     def __init__(self, config: ConditionalModelConfig):
         self.config = config
         self.n_timesteps = config.n_timesteps
-        self.vocab_size = config.vocab_size
-        self.mask_ratio = config.mask_ratio
-        # Prefer explicit mask token id from config; fallback to last token id
-        self.mask_token_id: int = int(getattr(config, "mask_token_id", config.vocab_size - 1))
-        print(f'mask_token_id: {self.mask_token_id}')
+        # Data vocabulary size (excludes [MASK])
+        self.data_vocab_size = config.vocab_size
+        self.mask_ratio = config.mask_ratio # TODO change this? 
+        # Dedicated [MASK] token id placed right after data vocab by default
+        self.mask_token_id: int = int(config.mask_token_id if config.mask_token_id is not None else self.data_vocab_size)
+        print(f'mask_token_id: {self.mask_token_id} (data_vocab_size={self.data_vocab_size})')
         
         # Cosine schedule
         s = 0.008
         steps = torch.arange(self.n_timesteps + 1, dtype=torch.float32)
         alphas = torch.cos((steps / self.n_timesteps + s) / (1 + s) * math.pi * 0.5) ** 2
         alphas = alphas / alphas[0]
-        self.mask_probs = 1 - alphas[:-1]
-        self.mask_probs = self.mask_probs * self.mask_ratio / self.mask_probs[-1]
+        base_probs = 1 - alphas[:-1]
+        # Finetune-time target: end at finetune_mask_ratio_end
+        eps = 1e-8
+        self.p_mask_probs = base_probs * (self.config.finetune_mask_ratio_end / (base_probs[-1] + eps))
+        # Pretrain-time target: end at pretrain_mask_ratio
+        self.p_mask_probs_pretrain = base_probs * (self.config.pretrain_mask_ratio / (base_probs[-1] + eps))
         
         # Load token weights for frequency-aware masking
         self.token_weights = None
@@ -622,11 +699,11 @@ class PartialMaskingDiffusion:
         with open(token_distribution_json, 'r') as f:
             token_counts = json.load(f)
         
-        counts = np.zeros(self.vocab_size)
+        counts = np.zeros(self.data_vocab_size)
         total_count = 0
         for k, v in token_counts.items():
             k = int(k)
-            if k < self.vocab_size:
+            if k < self.data_vocab_size:
                 counts[k] = v
                 total_count += v
         
@@ -638,7 +715,7 @@ class PartialMaskingDiffusion:
         if seen_mask.any():
             median_freq = np.median(frequencies[seen_mask])
         else:
-            median_freq = 1.0 / self.vocab_size
+            median_freq = 1.0 / self.data_vocab_size
         
         # Set frequency for unseen tokens
         frequencies[~seen_mask] = median_freq
@@ -646,52 +723,22 @@ class PartialMaskingDiffusion:
         # Compute weights from frequencies with smoothing
         # Higher weight for rarer tokens. Use a gentle power law to avoid extreme values.
         # Example: weight ∝ (1 / (f + eps))^alpha with alpha in [0,1]
-        eps = smoothing / self.vocab_size
+        eps = smoothing / self.data_vocab_size
         alpha = 0.5
         weights = (1.0 / (frequencies + eps)) ** alpha
         
         # Normalize so average weight is 1.0 (preserves overall mask rate)
-        weights = np.minimum(weights / weights.mean(), 3.0)
+        weights = np.minimum(weights / weights.mean(), 4.0)
         
         return torch.tensor(weights, dtype=torch.float32)
     
-    def sample_mask_ratio(self, is_conditioned: bool, step: int) -> float:
-        """
-        Sample masking ratio based on conditioning and training step.
-        
-        Args:
-            is_conditioned: Whether this batch has conditioning
-            step: Current training step
-            
-        Returns:
-            Mask ratio to use
-        """
-        def _jitter_around(base, amp=0.1):
-            # amp is absolute jitter; for base=0.6, amp=0.1 → uniform in [0.5, 0.7]
-            u = torch.rand(1).item()
-            lo = max(0.0, base - amp)
-            hi = min(1.0, base + amp)
-            return lo + (hi - lo) * u
-        
-        if is_conditioned:
-            # Fine-tuning: check for random 100% masking injection
-            if torch.rand(1).item() < self.config.finetune_full_mask_prob:
-                return 1.0  # 100% masking
-            # Otherwise, use curriculum learning: ramp from start to end ratio
-            progress = min(1.0, step / self.config.finetune_mask_ratio_steps)
-            base_ratio = (self.config.finetune_mask_ratio_start + 
-                         (self.config.finetune_mask_ratio_end - self.config.finetune_mask_ratio_start) * progress)
-            return _jitter_around(base_ratio)
-        else:
-            return _jitter_around(self.config.pretrain_mask_ratio)
     
     def q_sample(
         self, 
         x_start: torch.LongTensor, 
         t: torch.LongTensor,
-        mask_token: Optional[int] = None,
-        mask_ratio: Optional[float] = None,
-        step: int = 0
+        mask_ratio: float | torch.Tensor,
+        step: int = 0,
     ) -> Tuple[torch.LongTensor, torch.BoolTensor]:
         """
         Forward diffusion: partially mask tokens based on timestep.
@@ -700,23 +747,21 @@ class PartialMaskingDiffusion:
             x_noisy: Partially masked tokens
             mask: Boolean mask indicating which positions were masked
         """
-        B, N = x_start.shape
+        B, S, N = x_start.shape
         device = x_start.device
         # Resolve mask token id
-        if mask_token is None:
-            mask_token = self.mask_token_id
+        mask_token = self.mask_token_id
 
-        if mask_ratio is not None:
-            # Use provided mask ratio
-            mask_prob = torch.full((B,), mask_ratio, device=device)
+        # Use provided mask ratio; support per-sample tensors and floats
+        if torch.is_tensor(mask_ratio):
+            mask_prob = mask_ratio.to(device).view(B)
         else:
-            # Get mask probability for each timestep
-            mask_prob = self.mask_probs[t].to(device)  # (B,)
+            mask_prob = torch.full((B,), float(mask_ratio), device=device)
         
         if self.token_weights is None:
-            # Uniform masking
-            rand = torch.rand(B, N, device=device)
-            mask = rand < mask_prob.unsqueeze(1)
+            # Uniform masking per-position
+            rand = torch.rand(B, S, N, device=device)
+            mask = rand < mask_prob.view(B, 1, 1)
         else:
             # Token-aware masking with annealing
             if self.config.token_weighting_annealing_steps is None or self.config.token_weighting_annealing_steps == 0:
@@ -726,21 +771,90 @@ class PartialMaskingDiffusion:
                 annealing_factor = min(1.0, step / self.config.token_weighting_annealing_steps)
             
             # Get frequency-based weights for tokens
-            freq_weights = self.token_weights.to(device)[x_start]  # shape: [B, N]
+            freq_weights = self.token_weights.to(device)[x_start]  # shape: [B, S, N]
             
             # Blend uniform weights (1.0) with frequency weights based on annealing
-            weights = (1.0 - annealing_factor) + annealing_factor * (freq_weights ** -0.5) # power law
+            weights = (1.0 - annealing_factor) + annealing_factor * freq_weights # power law
             
             # Scale mask probability by token weight
-            scaled_probs = weights * mask_prob.unsqueeze(1)
-            rand = torch.rand(B, N, device=device)
+            scaled_probs = weights * mask_prob.view(B, 1, 1)
+            rand = torch.rand(B, S, N, device=device)
             mask = rand < scaled_probs.clamp(0, 1)
         
         # Apply mask
         x_noisy = torch.where(mask, mask_token, x_start)
-        
         return x_noisy, mask
-    
+
+    @staticmethod
+    @torch.no_grad()
+    def build_de_targets(delta, signif_mode="percentile", signif_arg=0.10, mlm_mask=None):
+        B, N = delta.shape
+        abs_delta = delta.abs()
+        if mlm_mask is None:
+            valid_mask = torch.isfinite(delta)
+        else:
+            valid_mask = torch.isfinite(delta) & mlm_mask
+        de_sig = torch.zeros_like(abs_delta, dtype=torch.bool)
+        if signif_mode == "percentile":
+            for b in range(B):
+                vb = valid_mask[b]
+                if vb.sum() == 0: continue
+                k = max(1, int(vb.sum().item() * signif_arg))
+                vals = abs_delta[b][vb]
+                thr = vals.topk(k).values[-1]
+                de_sig[b] = (abs_delta[b] >= thr) & vb
+        else:
+            de_sig = (abs_delta >= signif_arg) & valid_mask
+        de_dir     = (delta > 0).long()
+        rank_score = abs_delta
+        return de_sig, de_dir, rank_score, valid_mask
+
+    def _bce_with_logits_masked(self, logits: torch.Tensor, target: torch.Tensor, mask: torch.Tensor, pos_weight: Optional[float] = None):
+        # logits/target/mask: (B, N)
+        if pos_weight is not None:
+            pw = torch.tensor(pos_weight, device=logits.device, dtype=logits.dtype)
+            loss_fn = nn.BCEWithLogitsLoss(reduction="none", pos_weight=pw)
+        else:
+            loss_fn = nn.BCEWithLogitsLoss(reduction="none")
+        loss = loss_fn(logits, target.float())
+        denom = mask.float().sum().clamp_min(1.0)
+        loss = (loss * mask.float()).sum() / denom
+        return loss
+
+    def _ce_masked(self, logits: torch.Tensor, target: torch.Tensor, mask: torch.Tensor):
+        # logits: (B,N,2) | target: (B,N) | mask: (B,N)
+        loss = F.cross_entropy(logits.view(-1, 2), target.contiguous().view(-1), reduction="none")
+        loss = loss.view_as(mask)
+        denom = mask.float().sum().clamp_min(1.0)
+        loss = (loss * mask.float()).sum() / denom
+        return loss
+
+    def _ranknet_loss(self, scores, targets, mask, num_pairs=1024, margin=0.0, top_percent=0.1):
+        # scores/targets/mask: (B,S,N)
+        s = scores.mean(dim=1)   # (B,N)
+        t = targets.mean(dim=1)  # (B,N)
+        m = mask.any(dim=1)      # (B,N)
+        B, N = s.shape
+        eps = 0.05 * self.config.token_max_value
+        total = 0.0; denom = 0
+        for b in range(B):
+            valid = m[b]
+            tb, sb = t[b], s[b]
+            top_mask = valid & (tb >= eps)
+            bot_mask = valid & (tb <  eps)
+            if top_mask.sum()==0 or bot_mask.sum()==0: continue
+            k_top = max(1, int(top_mask.sum().item()*top_percent))
+            k_bot = max(1, int(bot_mask.sum().item()*top_percent))
+            top_idx = torch.where(top_mask)[0][ tb[top_mask].topk(k_top).indices ]
+            bot_idx = torch.where(bot_mask)[0][ (-tb[bot_mask]).topk(k_bot).indices ]
+            n = min(num_pairs, top_idx.numel(), bot_idx.numel())
+            if n == 0: continue
+            ti = top_idx[torch.randint(0, top_idx.numel(), (n,), device=sb.device)]
+            tj = bot_idx[torch.randint(0, bot_idx.numel(), (n,), device=sb.device)]
+            total += (-F.logsigmoid(sb[ti] - sb[tj] - margin)).mean()
+            denom += 1
+        return (total/denom) if denom>0 else s.new_zeros(())
+
     def compute_loss(
         self,
         model: nn.Module,
@@ -748,42 +862,132 @@ class PartialMaskingDiffusion:
         control_set: Optional[torch.LongTensor] = None,
         target_gene_idx: Optional[torch.LongTensor] = None,
         batch_idx: Optional[torch.LongTensor] = None,
-        mask_token: Optional[int] = None,
         step: int = 0,
+        max_steps: int = 1000,
+        # ---- new knobs ----
+        lambda_de: float = 0.5,
+        lambda_dir: float = 0.2,
+        lambda_rank: float = 0.2,
+        de_pos_weight: Optional[float] = 2.0,
+        signif_mode: str = "percentile",
+        signif_arg: float = 0.1,
+        # ---- optional direct DE inputs ----
+        delta_means: Optional[torch.FloatTensor] = None,
     ) -> torch.Tensor:
         """
         Compute training loss with partial masking and cross-attention conditioning.
         """
-        B, N = x_start.shape
+        
+        B, S, N = x_start.shape
         device = x_start.device
         
-        # Sample random timesteps
-        t = torch.randint(0, self.n_timesteps, (B,), device=device)
+        # Sample random timesteps from [1, T-1] to avoid zero-mask edge case at t=0
+        # (t=0 yields mask ratio ~0 which can create empty masks and NaNs)
+        t = torch.randint(1, self.n_timesteps, (B,), device=device)
         
-        # Determine mask ratio based on conditioning
+        # Determine mask ratio from timestep schedule (t-dependent training)
         is_conditioned = control_set is not None
-        mask_ratio = self.sample_mask_ratio(is_conditioned, step)
+        if is_conditioned:
+            mask_ratio_vec = self.p_mask_probs.to(device)[t]
+        else:
+            mask_ratio_vec = self.p_mask_probs_pretrain.to(device)[t]
+
+        # Optionally inject some fully masked samples during finetuning to match sampling-time start
+        if is_conditioned and getattr(self.config, "finetune_full_mask_prob", 0.0) > 0.0:
+            full_mask_mask = (torch.rand(B, device=device) < float(self.config.finetune_full_mask_prob))
+            mask_ratio_vec = torch.where(full_mask_mask, torch.ones_like(mask_ratio_vec), mask_ratio_vec)
         
-        # Partial masking
-        x_noisy, mask = self.q_sample(x_start, t, mask_token, mask_ratio=mask_ratio, step=step)
+        # Partial masking using per-sample ratios
+        x_noisy, mlm_mask = self.q_sample(x_start, t, mask_ratio_vec, step=step)
         
         # Predict original tokens
-        control_ctx = control_set.detach() if isinstance(control_set, torch.Tensor) else None
-        logits = model(
+        control_ctx = control_set if isinstance(control_set, torch.Tensor) else None
+        out = model(
             x_noisy, t,
             target_gene_idx=target_gene_idx,
             batch_idx=batch_idx,
-            control_context=control_ctx
+            control_context=control_ctx,
+            return_aux=True,
         )
+        logits = out["logits"] if isinstance(out, dict) else out
         
-        # Compute loss only on masked positions
-        loss = F.cross_entropy(
-            logits[mask].view(-1, self.vocab_size),
-            x_start[mask].view(-1),
-            reduction='mean'
-        )
-        
-        return loss
+        # Compute loss only on masked positions; guard against rare empty-mask batches
+        if mlm_mask.any():
+            main_loss = F.cross_entropy(
+                logits[mlm_mask].view(-1, self.data_vocab_size),
+                x_start[mlm_mask].view(-1),
+                reduction='mean'
+            )
+        else:
+            main_loss = logits.new_zeros(())
+
+        # (4) aux DE losses (only if we have controls)
+        aux_loss = logits.new_zeros(())
+        aux_sig = logits.new_zeros(())
+        aux_dir = logits.new_zeros(())
+        aux_rank = logits.new_zeros(())
+
+        # TODO try with no ramp. No change in MLM loss with and without ramp
+        # makes me think it doesn't actually hurt
+        def ramp(step, frac=0.2):
+            return min(1.0, step / max(1, int(max_steps*frac)))
+        scale = ramp(step)
+        if control_set is not None and isinstance(out, dict) and (delta_means is not None):
+            # Reduce MLM mask over set dimension to per-gene mask for DE target building
+            mlm_mask_gene = mlm_mask.any(dim=1)  # (B, N)
+            de_sig, de_dir, rank_score, valid = self.build_de_targets(
+                delta_means,
+                signif_mode=signif_mode,
+                signif_arg=signif_arg,
+                mlm_mask=mlm_mask_gene,
+            )
+
+            B2, S2, N2, _ = logits.shape
+            # Expand per-gene targets across set dimension
+            de_sig      = de_sig.unsqueeze(1).expand(-1, S2, -1)       # (B, S, N)
+            de_dir_mask = de_sig                                      # (B, S, N)
+            de_dir      = de_dir.unsqueeze(1).expand(-1, S2, -1)       # (B, S, N)
+            rank_score  = rank_score.unsqueeze(1).expand(-1, S2, -1)   # (B, S, N)
+            valid       = valid.unsqueeze(1).expand(-1, S2, -1)        # (B, S, N)
+
+            # Restrict aux to masked genes at each set position
+            valid = valid & mlm_mask
+            de_dir_mask  = valid & de_dir_mask
+
+            # (4a) significance BCE (all valid positions)
+            aux_sig = self._bce_with_logits_masked(
+                out["de_sig_logit"], de_sig, valid, pos_weight=de_pos_weight
+            ) * lambda_de * scale
+            aux_loss = aux_loss + aux_sig
+
+            # (4b) direction CE (only where significant)
+            if de_dir_mask.any():
+                aux_dir = self._ce_masked(
+                    out["de_dir_logits"], de_dir, de_dir_mask
+                ) * lambda_dir * scale
+                aux_loss = aux_loss + aux_dir
+
+            # (4c) ranking on |Δ| using scalar score head
+            aux_rank = self._ranknet_loss(
+                out["de_rank_score"], rank_score, valid, num_pairs=512
+            ) * lambda_rank * scale
+            aux_loss = aux_loss + aux_rank
+        total_loss = main_loss + aux_loss
+
+        # Stash detailed loss breakdown for logging
+        try:
+            self._last_loss_stats = {
+                "loss_main": float(main_loss.detach().item()),
+                "loss_aux": float(aux_loss.detach().item()),
+                "loss_aux_de": float(aux_sig.detach().item()),
+                "loss_aux_dir": float(aux_dir.detach().item()),
+                "loss_aux_rank": float(aux_rank.detach().item()),
+                "loss_total": float(total_loss.detach().item()),
+            }
+        except Exception:
+            pass
+
+        return total_loss
     
     @torch.no_grad()
     def p_sample_loop(
@@ -793,20 +997,38 @@ class PartialMaskingDiffusion:
         control_set: Optional[torch.LongTensor] = None,
         target_gene_idx: Optional[torch.LongTensor] = None,
         batch_idx: Optional[torch.LongTensor] = None,
-        mask_token: int = 63,
         temperature: float = 1.0,
         device: str = 'cuda',
+        return_aux: bool = False
     ) -> torch.LongTensor:
         """
         Generate samples with cross-attention conditioning and optional partial context.
         """
         B, N = shape
         
-        # Start with all masks
-        x = torch.full((B, N), mask_token, device=device, dtype=torch.long)
+        # Resolve mask token and start with all masks, single-set dimension (S=1)
+        mask_token = self.mask_token_id
+        x = torch.full((B, 1, N), int(mask_token), device=device, dtype=torch.long)
         
-        # Pre-encode control set once before denoising loop
-        control_context = control_set.detach() if isinstance(control_set, torch.Tensor) else None
+        # Prepare conditioning with S=1 shapes
+        control_context = None
+        if isinstance(control_set, torch.Tensor):
+            # Accept (B,N) or (N,) for B=1
+            if control_set.ndim == 1:
+                # Disambiguate: if B==1 and length==N, treat as (N,) -> (1,N)
+                control_set = control_set.view(1, -1)
+            control_context = control_set.unsqueeze(1)  # (B,1,N)
+        # Normalize 1-D indices to (B,1) or (1,1) depending on B
+        if isinstance(target_gene_idx, torch.Tensor) and target_gene_idx.ndim == 1:
+            if target_gene_idx.shape[0] == B:
+                target_gene_idx = target_gene_idx.view(B, 1)
+            else:
+                target_gene_idx = target_gene_idx.view(1, 1).expand(B, 1)
+        if isinstance(batch_idx, torch.Tensor) and batch_idx.ndim == 1:
+            if batch_idx.shape[0] == B:
+                batch_idx = batch_idx.view(B, 1)
+            else:
+                batch_idx = batch_idx.view(1, 1).expand(B, 1)
         # Iterative denoising
         for t in reversed(range(self.n_timesteps)):
             t_batch = torch.full((B,), t, device=device, dtype=torch.long)
@@ -816,15 +1038,16 @@ class PartialMaskingDiffusion:
                 x, t_batch,
                 target_gene_idx=target_gene_idx,
                 batch_idx=batch_idx,
-                control_context=control_context  # Pass pre-encoded context
-            )
+                control_context=control_context,
+                return_aux=False
+            )  # (B,1,N,V_data)
             
             logits = logits / temperature
-            
+
             # Determine which positions to unmask at this step
-            current_mask_prob = self.mask_probs[t]
+            current_mask_prob = self.p_mask_probs[t]
             if t > 0:
-                next_mask_prob = self.mask_probs[t-1]
+                next_mask_prob = self.p_mask_probs[t-1]
             else:
                 next_mask_prob = 0.0
             
@@ -839,13 +1062,13 @@ class PartialMaskingDiffusion:
             unmask = torch.rand_like(is_masked.float()) < unmask_prob
             unmask = unmask & is_masked
             
-            # Sample new tokens for positions to unmask
+            # Sample new tokens for positions to unmask (data tokens only)
             if unmask.any():
-                probs = F.softmax(logits, dim=-1)
-                new_tokens = torch.multinomial(probs.view(-1, self.vocab_size), 1).view(x.shape)
+                probs = F.softmax(logits, dim=-1)  # (B,1,N,V_data)
+                new_tokens = torch.multinomial(probs.view(-1, self.data_vocab_size), 1).view(B, 1, N)
                 x[unmask] = new_tokens[unmask]
         
-        return x
+        return x.squeeze(1)
 
 def create_muon_optimizer(model: nn.Module, config: ConditionalModelConfig):
     """Create Muon optimizer with weight decay.

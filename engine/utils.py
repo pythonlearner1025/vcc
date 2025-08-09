@@ -6,22 +6,6 @@ from typing import Any, Callable, Dict, Optional, Tuple
 
 import torch
 
-# Optional Transformer Engine (FP8)
-USE_TE = int(os.getenv("TE", 0))
-HAS_TE = False
-try:
-    if USE_TE:
-        import transformer_engine.pytorch as te  # type: ignore
-        from transformer_engine.pytorch import fp8_autocast  # type: ignore
-        HAS_TE = True
-    else:
-        raise ImportError
-except Exception:
-    def fp8_autocast(enabled: bool = True):  # type: ignore
-        return nullcontext()
-    HAS_TE = False
-
-
 def import_from_string(path: str) -> Any:
     """Import an object from a dotted path string.
 
@@ -43,8 +27,6 @@ def get_autocast_ctx(model: torch.nn.Module, dtype: torch.dtype = torch.bfloat16
     - Otherwise use PyTorch AMP with the requested dtype (default BF16).
     """
     use_fp8 = getattr(getattr(model, "config", object()), "use_fp8", False)
-    if HAS_TE and use_fp8:
-        return fp8_autocast(enabled=True)
     return torch.amp.autocast("cuda", dtype=dtype)
 
 
@@ -54,6 +36,8 @@ class Batch:
     control: Optional[torch.Tensor] = None
     target_gene_idx: Optional[torch.Tensor] = None
     batch_idx: Optional[torch.Tensor] = None
+    delta_means: Optional[torch.Tensor] = None
+    tokenizer: Optional[Any] = None
 
 
 def adapt_batch(batch: Any, device: torch.device) -> Batch:
@@ -78,7 +62,11 @@ def adapt_batch(batch: Any, device: torch.device) -> Batch:
         batch_idx = batch.get("batch_idx")
         if batch_idx is not None:
             batch_idx = batch_idx.to(device, non_blocking=True)
-        return Batch(tokens=tokens, control=control, target_gene_idx=target_gene_idx, batch_idx=batch_idx)
+        if "delta_means" in batch and batch["delta_means"] is not None:
+            dm = batch["delta_means"]
+            delta_means = dm.to(device, non_blocking=True)
+        tokenizer = batch.get("tokenizer")
+        return Batch(tokens=tokens, control=control, target_gene_idx=target_gene_idx, batch_idx=batch_idx, delta_means=delta_means, tokenizer=tokenizer)
     if isinstance(batch, (tuple, list)) and len(batch) > 0 and isinstance(batch[0], torch.Tensor):
         tokens = batch[0].to(device, non_blocking=True)
         return Batch(tokens=tokens)

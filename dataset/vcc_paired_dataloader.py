@@ -277,6 +277,7 @@ def create_vcc_paired_dataloader(
     n_samples_per_gene: int = 10,
     train_split: float = 0.8,
     is_train: bool = True,
+    batch_size: int = 1,
     num_workers: int = 4,
     shuffle: bool = True,
     random_seed: int = 42,
@@ -303,7 +304,7 @@ def create_vcc_paired_dataloader(
     collate_fn = VCCCollator(tokenizer, dataset.batch_to_idx, set_size) if tokenizer else None
 
     dataloader_kwargs = dict(
-        batch_size=1,
+        batch_size=batch_size,
         shuffle=shuffle and is_train,  # Only shuffle training data
         num_workers=num_workers,
         drop_last=True,
@@ -327,6 +328,7 @@ def create_vcc_train_val_dataloaders(
     n_samples_per_gene_train: int = 10,
     n_samples_per_gene_val: int = 1,
     train_split: float = 0.8,
+    batch_size: int = 1,
     num_workers: int = 4,
     tokenizer=None,
     prefetch_factor: int = 2,
@@ -344,6 +346,7 @@ def create_vcc_train_val_dataloaders(
         n_samples_per_gene=n_samples_per_gene_train,
         train_split=train_split,
         is_train=True,
+        batch_size=batch_size,
         num_workers=num_workers,
         shuffle=True,
         random_seed=random_seed,
@@ -362,6 +365,7 @@ def create_vcc_train_val_dataloaders(
         n_samples_per_gene=n_samples_per_gene_val,
         train_split=train_split,
         is_train=False,
+        batch_size=batch_size,
         num_workers=0,  # Disable multiprocessing for validation
         shuffle=False,
         random_seed=random_seed,

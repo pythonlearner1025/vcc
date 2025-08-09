@@ -229,34 +229,33 @@ def _run_validation_merged(
 
     steps = 0
     for sample in val_dl:
-        if steps >= max_genes:
-            break
+        #if steps >= max_genes:
+        #    break
         steps += 1
+        print(f"num genes: {steps}")
         delta_expr = sample["tokens"].squeeze(0)  # (S,N)
-        ctrl_expr = sample["control"].squeeze(0) # (S,N)
+        ctrl_expr = sample["control"].squeeze(0) # (S,S,N)
         pert_expr = ctrl_expr[0] + delta_expr
         gene_idxs_raw = sample["target_gene_idx"]
         gene_idxs = gene_idxs_raw.to(device, non_blocking=True)
         batches = sample["batch_idx"]
         S, N = pert_expr.shape
 
-        # Tokenise control set for conditioning (shape must be (S, N))
+        # Tokenise
         tokens_ctrl = tokenizer(ctrl_expr).to(device, non_blocking=True)
         #print(f"eval tokens_ctrl.shape: {tokens_ctrl.shape}")
 
         batch_to_idx = val_ds.batch_to_idx
         batch_idx = torch.tensor([batch_to_idx.get(b, 0) for b in batches], dtype=torch.long).to(device, non_blocking=True)
-
-        # Use BF16 autocast to enable efficient attention kernels
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
             pred_tokens = diffusion.p_sample_loop(
                 model,
-                mask_token=mask_token,
                 shape=(S, cfg.n_genes),
                 control_set=tokens_ctrl,
                 target_gene_idx=gene_idxs,
                 batch_idx=batch_idx,
                 device=device,
+                return_aux=False
             )
 
         # Convert tokens → expression.  For Δ-training we need to add the predicted
@@ -275,12 +274,9 @@ def _run_validation_merged(
 
         X_true_parts.extend([ctrl_full, true_full])
         X_pred_parts.extend([ctrl_full, pred_full])
-        print(gene_idxs_raw)
         # Append labels for control and perturbed cells (S each)
         obs_labels.extend(["non-targeting"] * S + [gene_names[i] for i in gene_idxs_raw])
 
-        if len(X_true_parts) // 2 >= args.val_genes_number:
-            break
 
     X_true = np.concatenate(X_true_parts, axis=0)
     X_pred = np.concatenate(X_pred_parts, axis=0)
@@ -431,7 +427,6 @@ def _run_test_generation(
                 # ------------------ forward diffusion sampling ------------------
                 pred_tokens = diffusion.p_sample_loop(
                     model,
-                    mask_token     = mask_token,
                     shape          = (S, cfg.n_genes),
                     control_set    = tokens_ctrl_t,
                     target_gene_idx= tgt_idx_t,

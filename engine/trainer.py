@@ -22,7 +22,7 @@ class DatasetSpec:
     log_every_steps: int = 100
     eval_every_epochs: int = 1
     save_every_steps: int = 1000
-    max_steps_per_epoch: Optional[int] = None
+    max_steps: Optional[int] = None
     lr: Optional[float] = None
     # Optional: limit number of validation steps per eval
     validation_steps: Optional[int] = None
@@ -61,6 +61,7 @@ class LossSpec:
 @dataclass
 class ExperimentConfig:
     run_name: str
+    eval_mode: bool = False
     output_dir: str = "checkpoints"
     seed: int = 42
     device: str = "cuda"
@@ -94,8 +95,10 @@ class Trainer:
             n_batches = len(self.global_batch_mapping)
             # pad to 16 for FP8 safety; harmless otherwise
             self.cfg.model.config_args["n_technical_batches"] = pad_batches_for_fp8(n_batches)
+        print("n_technical_batches: ", self.cfg.model.config_args["n_technical_batches"])
         # Now build model/optim/loss
         self.model = self._build_model().to(self.device)
+        print(f"\nModel parameters: {sum(p.numel() for p in self.model.parameters()):,}\n")
         self.optimizer, self.scheduler = self._build_optimizer()
         self.loss_adapter = self._build_loss_adapter()
         # Attach mapping to all dataloaders
@@ -179,8 +182,8 @@ class Trainer:
         from engine.utils import import_from_string
         LossClass = import_from_string(self.cfg.loss.loss_class)
         loss_obj = LossClass(**self.cfg.loss.loss_args)
-        def _adapter(model: torch.nn.Module, batch: Batch, step: int) -> torch.Tensor:
-            return loss_obj.compute_loss(model, batch, step)
+        def _adapter(model: torch.nn.Module, batch: Batch, phase_step: int, total_phase_steps) -> torch.Tensor:
+            return loss_obj.compute_loss(model, batch, phase_step, total_phase_steps)
         return _adapter
 
     def _export_config(self) -> Dict[str, Any]:
@@ -199,7 +202,8 @@ class Trainer:
         if not self.cfg.resume_from:
             return
         ckpt = torch.load(self.cfg.resume_from, map_location="cpu", weights_only=False)
-        self.model.load_state_dict(ckpt["model_state_dict"])  # type: ignore
+        # Tolerant load: use matching tensors from checkpoint; zero-init missing; keep current for mismatched shapes
+        self._safe_load_model_state(ckpt.get("model_state_dict", {}))
         if "optimizer_state_dict" in ckpt and self.optimizer is not None:
             try:
                 self.optimizer.load_state_dict(ckpt["optimizer_state_dict"])  # type: ignore
@@ -215,6 +219,43 @@ class Trainer:
         self.global_epoch = int(state.get("global_epoch", 0))
         print(f"Resumed from {self.cfg.resume_from}: step={self.global_step}, epoch={self.global_epoch}")
 
+    def _safe_load_model_state(self, src_state: Dict[str, torch.Tensor]) -> None:
+        """Load model state dict tolerantly.
+
+        - If a parameter exists in the checkpoint with the same shape, load it.
+        - If missing in the checkpoint, zero-initialize the model parameter.
+        - If present but with mismatched shape, keep the current model parameter.
+        """
+        if not isinstance(src_state, dict) or len(src_state) == 0:
+            print("[warn] checkpoint has no model_state_dict; skipping model restore")
+            return
+
+        dst_state = self.model.state_dict()
+        new_state: Dict[str, torch.Tensor] = {}
+        missing_keys: List[str] = []
+        mismatched_keys: List[str] = []
+
+        for key, dst_tensor in dst_state.items():
+            if key in src_state:
+                src_tensor = src_state[key]
+                if tuple(src_tensor.shape) == tuple(dst_tensor.shape):
+                    # Move to same device/dtype as destination tensor
+                    new_state[key] = src_tensor.to(device=dst_tensor.device, dtype=dst_tensor.dtype)
+                else:
+                    mismatched_keys.append(key)
+                    new_state[key] = dst_tensor
+            else:
+                missing_keys.append(key)
+                new_state[key] = torch.zeros_like(dst_tensor)
+
+        # Load strictly since we've filled all required keys
+        self.model.load_state_dict(new_state, strict=True)
+
+        if missing_keys:
+            print(f"[resume] zero-initialized {len(missing_keys)} missing params (e.g., {missing_keys[:6]})")
+        if mismatched_keys:
+            print(f"[resume] kept current params for {len(mismatched_keys)} shape-mismatched keys (e.g., {mismatched_keys[:6]})")
+
     def train(self) -> None:
         self.resume_if_needed()
         for ds_idx, ds_spec in enumerate(self.cfg.datasets):
@@ -223,7 +264,7 @@ class Trainer:
             _, dataloader = next((d for d in self._phases if d[0] == ds_spec.name), (None, None, None))[1:]
             self._train_phase(ds_spec, dataloader)
             # After scrna_pretrain completes, reset token embedding/head for delta-token finetuning
-            if ds_spec.name.lower() == "scrna_pretrain":
+            if ds_spec.name.lower() == "scrna_pretrain" and ds_spec.epochs > 0:
                 self._reinit_token_and_head()
 
     def _build_dataloader(self, ds_spec: DatasetSpec) -> Tuple[Any, DataLoader]:
@@ -280,6 +321,9 @@ class Trainer:
         from engine.utils import get_autocast_ctx
         autocast_dtype = torch.bfloat16 if self.cfg.amp_dtype.lower() == "bf16" else torch.float16
 
+        print(f"len val_dataset:{len(val_dataset)}, val_dataloader: {len(val_loader)}")
+        total_val_steps = len(val_loader)
+
         # Validation steps: default to one full pass over val loader, but allow override
         validation_steps = getattr(ds_spec, "validation_steps", None)
         steps_done = 0
@@ -291,9 +335,10 @@ class Trainer:
                     break
                 batch_std: Batch = adapt_batch(batch, self.device)
                 with get_autocast_ctx(self.model, autocast_dtype):
-                    loss = self.loss_adapter(self.model, batch_std, self.global_step)
+                    loss = self.loss_adapter(self.model, batch_std, steps_done, total_val_steps)
                 val_losses.append(loss.item())
                 steps_done += 1
+                print(f"steps_done: {steps_done}")
 
         avg_val = float(np.mean(val_losses) if val_losses else 0.0)
         print(f"[eval] {ds_spec.name}: val_loss={avg_val:.4f} over {steps_done} steps")
@@ -304,6 +349,7 @@ class Trainer:
             "phase": ds_spec.name,
         })
 
+        print(f"len val_dataset:{len(val_dataset)}, val_dataloader: {len(val_loader)}")
         # Optional full evaluation using evaluate._run_validation_merged
         # Triggered by model.config.full_eval if available
         full_eval = bool(getattr(getattr(self.model, "config", object()), "full_eval", False))
@@ -387,6 +433,13 @@ class Trainer:
         else:
             self._maybe_update_lr(ds_spec.lr)
 
+        # Reset per-phase base learning rate anchors for warmup scaling so they do not
+        # leak across phases. We always capture the base from the LR just applied above.
+        if ds_spec.warmup_steps is not None and ds_spec.warmup_steps > 0:
+            for pg in self.optimizer.param_groups:
+                pg["base_lr"] = pg["lr"]
+                pg.pop("_base_lr_cached", None)  # clear any previous phase cache flag
+
         # If the diffusion object is cached on the model from prior phases, update its
         # config for per-dataset token weighting annealing if requested.
         if ds_spec.token_weighting_annealing_steps is not None and hasattr(self.model, "_generic_trainer_diffusion"):
@@ -395,46 +448,84 @@ class Trainer:
             except Exception:
                 pass
         total_steps_per_epoch = len(dataloader)
-        max_steps = ds_spec.max_steps_per_epoch or total_steps_per_epoch
+        total_steps_per_phase = total_steps_per_epoch*ds_spec.epochs
+        max_steps = ds_spec.max_steps or total_steps_per_phase
         autocast_dtype = torch.bfloat16 if self.cfg.amp_dtype.lower() == "bf16" else torch.float16
 
+        # Maintain a local per-phase step counter to drive per-dataset warmup
+        phase_step = 0
+
         for local_epoch in range(ds_spec.epochs):
+            if self.cfg.eval_mode: 
+                self._eval(ds_spec)
+                break
             epoch_losses: List[float] = []
             self.model.train()
             start_t = time.time()
-            total_steps = len(dataloader)
             for step_idx, batch in enumerate(dataloader):
-                if step_idx >= max_steps:
+                if phase_step >= max_steps:
                     break
                 batch_std: Batch = adapt_batch(batch, device)
                 with get_autocast_ctx(self.model, autocast_dtype):
-                    loss = self.loss_adapter(self.model, batch_std, self.global_step)
+                    # Pass phase-local step and total phase steps to the loss
+                    loss = self.loss_adapter(self.model, batch_std, phase_step, total_steps_per_phase)
                 self.optimizer.zero_grad(set_to_none=True)
                 loss.backward()
                 self.optimizer.step()
-                # Per-dataset warmup only: scale base LR multipliers during warmup
-                if ds_spec.warmup_steps is not None and ds_spec.warmup_steps > 0:
-                    # Compute scale in [0,1]
-                    scale = min(1.0, (self.global_step + 1) / float(ds_spec.warmup_steps))
-                    for pg in self.optimizer.param_groups:
-                        base_lr = pg.get("base_lr", pg["lr"]) if pg.get("_base_lr_cached", False) else pg["lr"]
-                        # cache original if not cached
-                        if not pg.get("_base_lr_cached", False):
-                            pg["base_lr"] = base_lr
-                            pg["_base_lr_cached"] = True
-                        desired = pg["base_lr"] * scale
-                        pg["lr"] = desired
+                # Per-dataset schedule: linear warmup then immediate linear cooldown (no flat section),
+                # using phase-local steps and total phase steps.
+                warmup_steps = int(ds_spec.warmup_steps or 0)
+                cooldown_steps = max(1, total_steps_per_phase - max(0, warmup_steps))
+                if warmup_steps > 0 and (phase_step + 1) <= warmup_steps:
+                    scale = (phase_step + 1) / float(warmup_steps)
+                else:
+                    steps_into_cooldown = max(0, (phase_step + 1) - max(0, warmup_steps))
+                    decay_ratio = max(0.0, (cooldown_steps - steps_into_cooldown) / float(cooldown_steps))
+                    scale = decay_ratio
+                for pg in self.optimizer.param_groups:
+                    base_lr = pg.get("base_lr", pg["lr"])  # base captured at phase start
+                    pg["lr"] = base_lr * scale
+                phase_step += 1
                 self.global_step += 1
                 epoch_losses.append(loss.item())
-                if self.global_step % max(1, ds_spec.log_every_steps) == 0:
+                if phase_step % max(1, ds_spec.log_every_steps) == 0:
                     avg = float(np.mean(epoch_losses[-100:] if len(epoch_losses) > 100 else epoch_losses))
+                    # Gather learning rates (support muon+adam split or generic optimizer)
+                    muon_lrs = [pg.get("lr", 0.0) for pg in self.optimizer.param_groups if pg.get("use_muon", False)]
+                    adam_lrs = [pg.get("lr", 0.0) for pg in self.optimizer.param_groups if not pg.get("use_muon", False)]
+                    has_split = any(pg.get("use_muon", False) for pg in self.optimizer.param_groups)
+                    lr_muon = float(np.mean(muon_lrs)) if muon_lrs else None
+                    lr_adam = float(np.mean(adam_lrs)) if adam_lrs else None
+                    lr_overall = float(np.mean([pg.get("lr", 0.0) for pg in self.optimizer.param_groups]))
                     stats = {
                         "train/loss": loss.item(),
                         "train/loss_avg": avg,
                         "train/epoch": self.global_epoch,
                         "train/global_step": self.global_step,
+                        "train/lr": lr_overall,
                     }
-                    print(f"[Epoch {local_epoch}][{self.global_step}/{total_steps}] | loss {stats['train/loss']:.3f} avg_loss {stats['train/loss_avg']:.3f}")
+                    if has_split:
+                        if lr_muon is not None:
+                            stats["train/lr_muon"] = lr_muon
+                        if lr_adam is not None:
+                            stats["train/lr_adam"] = lr_adam
+                    # Merge auxiliary loss breakdown if available
+                    extra = getattr(self.model, "_last_loss_stats", None)
+                    if isinstance(extra, dict):
+                        stats.update({
+                            "train/loss_main": extra.get("loss_main", None),
+                            "train/loss_aux": extra.get("loss_aux", None),
+                            "train/loss_aux_de": extra.get("loss_aux_de", None),
+                            "train/loss_aux_dir": extra.get("loss_aux_dir", None),
+                            "train/loss_aux_rank": extra.get("loss_aux_rank", None),
+                            "train/loss_total": extra.get("loss_total", None),
+                        })
+                    # Build LR string for console
+                    if has_split:
+                        lr_str = f"lr_muon {lr_muon:.3e} lr_adam {lr_adam:.3e}"
+                    else:
+                        lr_str = f"lr {lr_overall:.3e}"
+                    print(f"[Epoch {local_epoch}][{phase_step}/{total_steps_per_phase}] | loss {stats['train/loss']:.3f} avg_loss {stats['train/loss_avg']:.3f} | {lr_str} | lr_overall {lr_overall:.3e}")
                     self._log(stats)
                 if self.global_step % max(1, ds_spec.save_every_steps) == 0:
                     self._save(f"ep{self.global_epoch}_step{self.global_step}")

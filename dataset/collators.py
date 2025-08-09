@@ -8,16 +8,16 @@ from typing import List, Dict
 import torch
 
 class OrionCollator:
-    """Collate function for Orion datasets (batch_size is always 1).
+    """Collate for Orion datasets, supports batch_size >= 1.
 
-    Each element in *batch_list* is a dict with keys:
-        - 'perturbed_expr': FloatTensor (S, N)
-        - 'control_expr':   FloatTensor (S, N)
-        - 'target_gene_idx': int
-        - 'pert_batches':   List[str] length S
+    Input per item:
+      - perturbed_expr: (S, N)
+      - control_expr:   (S, N)
+      - target_gene_idx: int
+      - pert_batches:   List[str] length S
 
-    We convert expression matrices to tokens, build a (1, S, N) control tensor
-    and map batch names to integer indices on-the-fly.
+    Output tensors are flattened to shape (B*S, N) for compatibility with the
+    current training/loss stack. delta_mean is returned only for B==1.
     """
 
     def __init__(self, tokenizer, set_size: int, batch_to_idx: Dict[str, int] | None = None):
@@ -31,6 +31,16 @@ class OrionCollator:
             self._batch_to_idx = batch_to_idx
             self._use_external_mapping = True
 
+    # Allow runtime injection of global mapping via attribute set
+    @property
+    def batch_to_idx(self) -> Dict[str, int]:
+        return self._batch_to_idx
+
+    @batch_to_idx.setter
+    def batch_to_idx(self, mapping: Dict[str, int]) -> None:
+        self._batch_to_idx = mapping
+        self._use_external_mapping = True
+
     def _map_batch(self, name: str) -> int:
         # use external global (+vcc) batch_to_idx map
         if self._use_external_mapping:
@@ -41,40 +51,43 @@ class OrionCollator:
             return self._batch_to_idx[name]
 
     def __call__(self, batch_list: List[Dict]):
-        # batch_size is guaranteed to be 1
-        sample = batch_list[0]
-        pert = sample["perturbed_expr"]  # (S,N)
-        ctrl = sample["control_expr"]    # (S,N)
-        S, N = pert.shape
-
-        # Tokenise (vectorised over set)
-        delta_tok = self.tokenizer((pert - ctrl).unsqueeze(0)).squeeze(0)  # (S,N)
-        ctrl_tok = self.tokenizer(ctrl)            # (S,N)
-        # Expand control set so each perturbed cell gets full control matrix
-
-        # Batch indices
-        batch_idx = torch.tensor([self._map_batch(b) for b in sample["pert_batches"]], dtype=torch.long)
-
-        return {
-            "tokens": delta_tok.long(),              # (S,N)
-            "control": ctrl_tok.long(),     # (1,S,N)
-            "batch_idx": batch_idx,                  # (S,)
-            "target_gene_idx": torch.tensor(sample["target_gene_idx"], dtype=torch.long).repeat(S),
+        B = len(batch_list)
+        perts, ctrls, batch_ids, tgt_ids = [], [], [], []
+        delta_means = []
+        for sample in batch_list:
+            pert = sample["perturbed_expr"]  # (S,N)
+            ctrl = sample["control_expr"]    # (S,N)
+            S, N = pert.shape
+            # Tokenise
+            delta_tok = self.tokenizer((pert - ctrl).unsqueeze(0)).squeeze(0)  # (S,N)
+            ctrl_tok = self.tokenizer(ctrl)  # (S,N)
+            perts.append(delta_tok.long())
+            ctrls.append(ctrl_tok.long())
+            batch_ids.append(torch.tensor([self._map_batch(b) for b in sample["pert_batches"]], dtype=torch.long))
+            tgt_ids.append(torch.tensor(sample["target_gene_idx"], dtype=torch.long).repeat(S))
+            # delta_mean only when unbatched to keep semantics (N,)
+            p_mean = pert.mean(0)
+            c_mean = ctrl.mean(0)
+            delta_means.append(p_mean - c_mean)
+        tokens = torch.stack(perts, dim=0)   # (B,S,N)
+        control = torch.stack(ctrls, dim=0)  # (B,S,N)
+        batch_idx = torch.stack(batch_ids, dim=0)  # (B,S,)
+        target_gene_idx = torch.stack(tgt_ids, dim=0)  # (B,S,)
+        delta_means = torch.stack(delta_means, dim=0)  # (B,S,)
+        out = {
+            "tokens": tokens,
+            "control": control,
+            "batch_idx": batch_idx,
+            "target_gene_idx": target_gene_idx,
+            "tokenizer": self.tokenizer,
+            "delta_means": delta_means
         }
+        return out
 
 class VCCCollator:
-    """Callable collate_fn for torch DataLoader.
+    """Collate for VCC dataset, supports batch_size >= 1 and flattens to (B*S, N).
 
-    It expects that each element in *batch_list* is a dictionary produced by
-    ``VCCPairedDataset.__getitem__`` with keys:
-        - 'perturbed_expr': FloatTensor (S, N)
-        - 'control_expr':   FloatTensor (S, N)
-        - 'target_gene_idx': int
-        - 'pert_batches':   List[str] of length S  (batch name for each perturbed cell)
-
-    The collator stacks the sets, tokenises everything in a vectorised fashion,
-    expands the control sets to shape (1, S, N), and maps the batch names to
-    integer indices used by the model.
+    delta_mean is included only when B==1 (shape (N,)).
     """
 
     def __init__(self, tokenizer, batch_to_idx: Dict[str, int], set_size: int):
@@ -83,22 +96,36 @@ class VCCCollator:
         self.set_size = set_size
 
     def __call__(self, batch_list: List[Dict]):
-        # batch_size == 1 in this training setup
-        sample = batch_list[0]
-        pert = sample["perturbed_expr"].squeeze()  # (S,N)
-        ctrl = sample["control_expr"].squeeze()    # (S,N)
-        S, N = pert.shape
-
-        delta_expr = pert - ctrl  # (S,N)
-        delta_tok = self.tokenizer(delta_expr.unsqueeze(0)).squeeze(0)  # (S,N)
-        ctrl_tok = self.tokenizer(ctrl)         # (S,N)
-
-        # Map batch names to integer indices
-        batch_idx = torch.tensor([self.batch_to_idx.get(b, 0) for b in sample["pert_batches"]], dtype=torch.long)
-
-        return {
-            "tokens": delta_tok.long(), #(S, N)
-            "control": ctrl_tok.long(), #(1, S, N)
-            "batch_idx": batch_idx,  # (S,)
-            "target_gene_idx": torch.tensor(sample["target_gene_idx"], dtype=torch.long).repeat(S), # (S,)
+        B = len(batch_list)
+        perts, ctrls, batch_ids, tgt_ids = [], [], [], []
+        delta_means = []
+        for sample in batch_list:
+            pert = sample["perturbed_expr"].squeeze()  # (S,N)
+            ctrl = sample["control_expr"].squeeze()    # (S,N)
+            S, N = pert.shape
+            delta_expr = pert - ctrl
+            delta_tok = self.tokenizer(delta_expr.unsqueeze(0)).squeeze(0)  # (S,N)
+            ctrl_tok = self.tokenizer(ctrl)  # (S,N)
+            perts.append(delta_tok.long())
+            ctrls.append(ctrl_tok.long())
+            batch_ids.append(torch.tensor([self.batch_to_idx.get(b, 0) for b in sample["pert_batches"]], dtype=torch.long))
+            tgt_ids.append(torch.tensor(sample["target_gene_idx"], dtype=torch.long).repeat(S))
+            p_mean = pert.mean(0)
+            c_mean = ctrl.mean(0)
+            delta_means.append(p_mean - c_mean)
+        tokens = torch.stack(perts, dim=0)   # (B,S,N)
+        control = torch.stack(ctrls, dim=0)  # (B,S,N)
+        # TODO remove dropout control to see if it changes
+        control_zeros = torch.zeros_like(control)  # (B,S,N)
+        batch_idx = torch.stack(batch_ids, dim=0)  # (B,S,)
+        target_gene_idx = torch.stack(tgt_ids, dim=0)  # (B,S,)
+        delta_means = torch.stack(delta_means, dim=0)  # (B,S,)
+        out = {
+            "tokens": tokens,
+            "control": control,
+            "batch_idx": batch_idx,
+            "target_gene_idx": target_gene_idx,
+            "tokenizer": self.tokenizer,
+            "delta_means": delta_means
         }
+        return out
