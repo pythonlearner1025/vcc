@@ -59,9 +59,9 @@ class OrionCollator:
             ctrl = sample["control_expr"]    # (S,N)
             S, N = pert.shape
             # Tokenise
-            delta_tok = self.tokenizer((pert - ctrl).unsqueeze(0)).squeeze(0)  # (S,N)
+            pert_tok = self.tokenizer((per).unsqueeze(0)).squeeze(0)  # (S,N)
             ctrl_tok = self.tokenizer(ctrl)  # (S,N)
-            perts.append(delta_tok.long())
+            perts.append(pert_tok.long())
             ctrls.append(ctrl_tok.long())
             batch_ids.append(torch.tensor([self._map_batch(b) for b in sample["pert_batches"]], dtype=torch.long))
             tgt_ids.append(torch.tensor(sample["target_gene_idx"], dtype=torch.long).repeat(S))
@@ -103,10 +103,9 @@ class VCCCollator:
             pert = sample["perturbed_expr"].squeeze()  # (S,N)
             ctrl = sample["control_expr"].squeeze()    # (S,N)
             S, N = pert.shape
-            delta_expr = pert - ctrl
-            delta_tok = self.tokenizer(delta_expr.unsqueeze(0)).squeeze(0)  # (S,N)
+            pert_tok = self.tokenizer(pert.unsqueeze(0)).squeeze(0)  # (S,N)
             ctrl_tok = self.tokenizer(ctrl)  # (S,N)
-            perts.append(delta_tok.long())
+            perts.append(pert_tok.long())
             ctrls.append(ctrl_tok.long())
             batch_ids.append(torch.tensor([self.batch_to_idx.get(b, 0) for b in sample["pert_batches"]], dtype=torch.long))
             tgt_ids.append(torch.tensor(sample["target_gene_idx"], dtype=torch.long).repeat(S))
@@ -115,10 +114,14 @@ class VCCCollator:
             delta_means.append(p_mean - c_mean)
         tokens = torch.stack(perts, dim=0)   # (B,S,N)
         control = torch.stack(ctrls, dim=0)  # (B,S,N)
-        # TODO remove dropout control to see if it changes
-        control_zeros = torch.zeros_like(control)  # (B,S,N)
         batch_idx = torch.stack(batch_ids, dim=0)  # (B,S,)
         target_gene_idx = torch.stack(tgt_ids, dim=0)  # (B,S,)
+        
+        # TODO remove
+        #control_zeros = torch.zeros_like(control)  # (B,S,N)
+        #target_gene_idx = torch.zeros_like(target_gene_idx)  # (B,S,N)
+        #batch_idx = torch.zeros_like(batch_idx)  # (B,S,)
+
         delta_means = torch.stack(delta_means, dim=0)  # (B,S,)
         out = {
             "tokens": tokens,

@@ -20,72 +20,72 @@ class TokenizedScRNADataset(Dataset):
         tokens = self.tokenizer(x)
         return tokens
 
-def create_logbin_tokenizer(vocab_size: int = 64, max_value: float = 9.2):
-    class SimpleTokenizer:
-        def __init__(self, vocab_size, max_value):
-            self.vocab_size = vocab_size - 1  # Reserve last token for [MASK]
-            self.max_value = max_value
-            self.mask_token = vocab_size - 1
-            
-            # Define bins for expression values - use log-scale for better distribution
-            # Bin 0: exactly 0 (very common in scRNA-seq)
-            # Bins 1-(vocab_size-2): log-scale from 0.1 to max_value
-            self.bins = torch.zeros(self.vocab_size)
-            self.bins[1:] = torch.logspace(
-                np.log10(0.1), 
-                np.log10(max_value), 
-                self.vocab_size - 1 # -2 because its inclusive
-            )
-
-            self.normalize_checked = False 
-            
-        def __call__(self, x):
-            """Tokenize expression values into discrete bins."""
-            if isinstance(x, np.ndarray):
-                x = torch.from_numpy(x)
-            
-            # Efficient tensor-aware validation
-            if not self.normalize_checked: 
-                if not torch.all((x >= 0) & (x < self.max_value)):
-                    invalid_mask = (x < 0) | (x >= self.max_value)
-                    invalid_values = x[invalid_mask]
-                    raise ValueError(f"Input values {invalid_values[:5].tolist()}... are out of the expected range [0, {self.max_value}). "
-                                f"Found {invalid_mask.sum().item()} invalid values out of {x.numel()} total.")
-                else: self.normalize_checked = True
-            
-            # Ensure bins are on the same device as input
-            if x.device != self.bins.device:
-                self.bins = self.bins.to(x.device)
-            
-            # Handle zero values explicitly
-            zero_mask = (x == 0)
-            
-            # Clip values to max range
-            x_clipped = torch.clamp(x, 0, self.max_value)
-            
-            # Bucketize into bins
-            tokens = torch.bucketize(x_clipped, self.bins)
-            
-            # Ensure zero values map to token 0
-            tokens[zero_mask] = 0
-            
-            return tokens.clamp(0, self.vocab_size - 1)
+class SimpleTokenizer:
+    def __init__(self, vocab_size, max_value):
+        self.vocab_size = vocab_size - 1  # Reserve last token for [MASK]
+        self.max_value = max_value
+        self.mask_token = vocab_size - 1
         
-        def detokenize(self, tokens):
-            """Convert tokens back to approximate expression values."""
-            # Use bin centers for reconstruction
-            bin_centers = torch.zeros(self.vocab_size)
-            bin_centers[0] = 0.0  # Zero bin
-            
-            for i in range(1, self.vocab_size - 1):
-                bin_centers[i] = (self.bins[i] + self.bins[i+1]) / 2
-            bin_centers[-1] = self.bins[-1]  # Last bin uses upper bound
-            
-            return bin_centers[tokens]
+        # Define bins for expression values - use log-scale for better distribution
+        # Bin 0: exactly 0 (very common in scRNA-seq)
+        # Bins 1-(vocab_size-2): log-scale from 0.1 to max_value
+        self.bins = torch.zeros(self.vocab_size)
+        self.bins[1:] = torch.logspace(
+            np.log10(0.1), 
+            np.log10(max_value), 
+            self.vocab_size - 1 # -2 because its inclusive
+        )
+
+        self.normalize_checked = False 
+        
+    def __call__(self, x):
+        """Tokenize expression values into discrete bins."""
+        if isinstance(x, np.ndarray):
+            x = torch.from_numpy(x)
+        
+        # Efficient tensor-aware validation
+        if not self.normalize_checked: 
+            if not torch.all((x >= 0) & (x < self.max_value)):
+                invalid_mask = (x < 0) | (x >= self.max_value)
+                invalid_values = x[invalid_mask]
+                raise ValueError(f"Input values {invalid_values[:5].tolist()}... are out of the expected range [0, {self.max_value}). "
+                            f"Found {invalid_mask.sum().item()} invalid values out of {x.numel()} total.")
+            else: self.normalize_checked = True
+        
+        # Ensure bins are on the same device as input
+        if x.device != self.bins.device:
+            self.bins = self.bins.to(x.device)
+        
+        # Handle zero values explicitly
+        zero_mask = (x == 0)
+        
+        # Clip values to max range
+        x_clipped = torch.clamp(x, 0, self.max_value)
+        
+        # Bucketize into bins
+        tokens = torch.bucketize(x_clipped, self.bins)
+        
+        # Ensure zero values map to token 0
+        tokens[zero_mask] = 0
+        
+        return tokens.clamp(0, self.vocab_size - 1)
     
+    def detokenize(self, tokens):
+        """Convert tokens back to approximate expression values."""
+        # Use bin centers for reconstruction
+        bin_centers = torch.zeros(self.vocab_size)
+        bin_centers[0] = 0.0  # Zero bin
+        
+        for i in range(1, self.vocab_size - 1):
+            bin_centers[i] = (self.bins[i] + self.bins[i+1]) / 2
+        bin_centers[-1] = self.bins[-1]  # Last bin uses upper bound
+        
+        return bin_centers[tokens]
+
+def create_logbin_tokenizer(vocab_size: int = 64, max_value: float = 9.2):
     tokenizer = SimpleTokenizer(vocab_size, max_value)
     return tokenizer, tokenizer.detokenize
-
+'''
 class DeltaTokenizer:
     """Symmetric tokenizer for perturbation Δ values.
 
@@ -176,3 +176,4 @@ def create_delta_tokenizer(vocab_size: int = 256, max_abs: float = 9.2, min_abs:
     """Factory matching the signature of ``create_logbin_tokenizer`` used elsewhere."""
     tok = DeltaTokenizer(vocab_size=vocab_size, max_abs=max_abs, min_abs=min_abs)
     return tok, tok.detokenize
+'''

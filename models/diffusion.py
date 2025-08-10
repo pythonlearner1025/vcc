@@ -63,7 +63,7 @@ class ConditionalModelConfig:
     gene_embed_dim: int = 128
     
     # ESM2 embeddings
-    esm_matrix_path: Optional[str] = "/esm_all.pt"  # Path to precomputed ESM2 embeddings (None to skip)
+    esm_matrix_path: Optional[str] = None # Path to precomputed ESM2 embeddings (None to skip)
     esm_proj_dim: int = 256  # Projection dimension for ESM2 embeddings
     
     # Batch conditioning
@@ -119,6 +119,7 @@ class ConditionalModelConfig:
     pretrain_data_dir: str = "data/scRNA"
     finetune_data_path: str = "data/vcc_data/"
     hvg_info_path: str = ".txt"
+    n_xattn_loops: int = 6
     
     # Logging
     log_every: int = 100
@@ -153,7 +154,6 @@ class ConditionalModelConfig:
         params += self.dim * self.vocab_size
         
         return params
-
 
 class SinusoidalPosEmb(nn.Module):
     """Sinusoidal positional embeddings for time steps."""
@@ -330,6 +330,7 @@ class AugmentedGeneEmbedding(nn.Module):
         # If no ESM table is given we just fall back to the ID embedding.
         if esm_matrix_path is None:
             self.has_esm = False
+            print("NO ESM")
             return
         try:
 
@@ -387,9 +388,6 @@ class ConditionalDiffusionTransformer(nn.Module):
         # Enable FP8 execution if requested and Transformer-Engine is available
         self.fp8_enabled = getattr(config, "use_fp8", False) 
 
-        # ------------------------------------------------------------------
-        #  Embeddings
-        # ------------------------------------------------------------------
         # Include one extra row for the dedicated [MASK] token at id == config.vocab_size
         self.token_emb = nn.Embedding(config.vocab_size + 1, config.dim)
 
@@ -401,23 +399,18 @@ class ConditionalDiffusionTransformer(nn.Module):
             proj_dim=config.esm_proj_dim,
         )
 
+        self.gene_proj = Linear(config.gene_embed_dim, config.dim, bias=False)
+        self.fuse_proj = Linear(config.dim * 2, config.dim)
+
         # If ESM2 is present we project it to `dim` and cache HVG indices.
         self.use_esm_in_sequence = getattr(self.gene_embed, "has_esm", False)
-        if self.use_esm_in_sequence:
-            print("self.use_esm_in_sequence = True")
-            self.register_buffer(
-                "_hvg_idx", torch.arange(config.n_genes, dtype=torch.long), persistent=False
-            )
-            self.gene_proj = Linear(config.gene_embed_dim, config.dim, bias=False)
-            # Fusion layer to combine token and per-gene features (token_emb || gene_feat)
-            self.fuse_proj = Linear(config.dim * 2, config.dim)
-            
-            # Pre-compute and cache the projected HVG features to avoid recomputation
-            with torch.no_grad():
-                gene_ids = torch.arange(config.n_genes, dtype=torch.long)
-                gene_feat = self.gene_embed(gene_ids)  # (N, gene_embed_dim)
-                gene_feat_proj = self.gene_proj(gene_feat)  # (N, D)
-            self.register_buffer("_cached_gene_features", gene_feat_proj, persistent=False)
+        # Pre-compute and cache the projected HVG features to avoid recomputation
+        with torch.no_grad():
+            gene_ids = torch.arange(config.n_genes, dtype=torch.long)
+            gene_feat = self.gene_embed(gene_ids)  # (N, gene_embed_dim)
+            gene_feat_proj = self.gene_proj(gene_feat)  # (N, D)
+
+        self.register_buffer("_cached_gene_features", gene_feat_proj, persistent=False)
 
         # Time embedding
         self.time_emb = nn.Sequential(
@@ -436,25 +429,28 @@ class ConditionalDiffusionTransformer(nn.Module):
             Linear(config.dim, config.dim),
         )
 
-                # Optional latent context compressor
+        self.control_id_emb = nn.Embedding(1, config.dim)
         # ------------------------------------------------------------------
-        #  Latent transformer (Perceiver-style) replacing context compressor
+        #  Latent transformer (Perceiver-style) 
         # ------------------------------------------------------------------
         self.n_latents = getattr(config, "n_latents", 512)
-        self.lat1 = nn.Parameter(torch.randn(1, self.n_latents, config.dim) * 0.02)
-        self.lat2 = nn.Parameter(torch.randn(1, self.n_latents, config.dim) * 0.02)
-
+        self.lat = nn.Parameter(torch.randn(1, self.n_latents, config.dim) * 0.02)
 
         gqa_groups = max(1, config.n_head // 2)  # Higher grouping for cross-attention
-        self.cross_attn_q_lat1_kv_genes = GroupedQueryAttention(config.dim, config.n_head, n_group=gqa_groups)
-        self.cross_attn_q_genes_kv_lat = GroupedQueryAttention(config.dim, config.n_head, n_group=gqa_groups)
-        self.cross_attn_q_lat2_kv_genes = GroupedQueryAttention(config.dim, config.n_head, n_group=gqa_groups)
-        #self.cross_attn_seq_context = GroupedQueryAttention(config.dim, config.n_head, n_group=gqa_groups)
 
-        # Self-attention stack that processes only the latent tokens
-        self.latent_blocks = nn.ModuleList(
-            [TransformerBlock(config.dim, config.n_head, config.ffn_mult) for _ in range(config.n_layer)]
-        )
+                # First cross-attention (unique weights)
+        self.cross_attn_first = GroupedQueryAttention(config.dim, config.n_head, n_group=gqa_groups)
+
+        # Shared cross-attention for all subsequent iterations
+        self.cross_attn_shared = GroupedQueryAttention(config.dim, config.n_head, n_group=gqa_groups)
+
+        # Shared latent Transformer block
+        self.latent_block_shared = TransformerBlock(config.dim, config.n_head, config.ffn_mult)
+
+        # Final decode cross-attention (latents → gene tokens)
+        self.cross_attn_decode = GroupedQueryAttention(config.dim, config.n_head, n_group=gqa_groups)
+
+        self.target_flag = nn.Embedding(2, config.dim)
 
         # LayerNorms for clean pre/post-attention
         self.lat_q_ln = LayerNorm(config.dim)
@@ -465,8 +461,8 @@ class ConditionalDiffusionTransformer(nn.Module):
         self.blocks = nn.ModuleList()
 
         self.ln_f = LayerNorm(config.dim)
-        # Predict only data tokens, never the [MASK] class
-        self.head = nn.Linear(config.dim, config.vocab_size)
+        # Predict data tokens plus the [MASK] class (K + 1)
+        self.head = nn.Linear(config.dim, config.vocab_size + 1)
 
         # ---- DE-aware heads ----
         self.de_sig_head = nn.Linear(config.dim, 1)   # BCEWithLogits on significance
@@ -480,13 +476,18 @@ class ConditionalDiffusionTransformer(nn.Module):
     # ----------------------------------------------------------------------
     #  Helpers
     # ----------------------------------------------------------------------
-    @staticmethod
-    def _init_weights(m):
+    def _init_weights(self, m):
         if isinstance(m, (nn.Linear, Linear)):
             nn.init.normal_(m.weight, mean=0.0, std=0.02)
             if m.bias is not None:
                 nn.init.zeros_(m.bias)
         elif isinstance(m, nn.Embedding):
+            # Skip pretrained/frozen ESM table and any frozen embeddings
+            if hasattr(self, "gene_embed") and getattr(self.gene_embed, "has_esm", False):
+                if m is getattr(self.gene_embed, "esm_emb", None):
+                    return
+            if getattr(m, "weight", None) is not None and (m.weight.requires_grad is False):
+                return
             nn.init.normal_(m.weight, mean=0.0, std=0.02)
 
     @staticmethod
@@ -542,125 +543,112 @@ class ConditionalDiffusionTransformer(nn.Module):
     # ----------------------------------------------------------------------
     def forward(
         self,
-        tokens: torch.LongTensor,  # (B, N)
+        tokens: torch.LongTensor,  # (B, S, N)
         timesteps: torch.LongTensor,  # (B,)
-        target_gene_idx: Optional[torch.LongTensor] = None,  # (B,)
-        batch_idx: Optional[torch.LongTensor] = None,  # (B,)
-        control_context: Optional[torch.Tensor] = None,  # (B, N) - pre-encoded control set
+        ### Conditioning ###
+        target_gene_idx: Optional[torch.LongTensor] = None,
+        batch_idx: Optional[torch.LongTensor] = None,
+        control_context: Optional[torch.Tensor] = None,
+        #------------------#
         return_aux: bool = False,
-    ) -> torch.Tensor | Dict[str, torch.Tensor]:
+    ):
         B, S, N = tokens.shape
 
-        # ------------------------------------------------------------------
-        #  (1) Base token embeddings (and optional gene features)
-        # ------------------------------------------------------------------
-        token_emb = self.token_emb(tokens)  # (B, S, N, D)
+        # --- Token + optional ESM2 features ---
+        token_emb = self.token_emb(tokens) # tokens will be 64 above
+        context_emb = self.token_emb(control_context) if control_context is not None else None # tokens full 0-128 
 
-        # Encode control-set tokens (if provided)
-        context_emb = None
-        if control_context is not None:
-            context_emb = self.token_emb(control_context)
-
-        # Optionally add per‑gene ESM2/ID embeddings projected to model dim.
-        if self.use_esm_in_sequence:
-            # Use cached pre-projected gene features instead of recomputing
-            gene_feat = self._cached_gene_features.to(tokens.device)  # (N, D)
-            # Expand across batch and set positions to avoid extra matmul
-            gene_feat = gene_feat.unsqueeze(0).unsqueeze(0).expand(B, S, -1, -1)  # (B, S, N, D)
-            x = token_emb + gene_feat  # additive fusion (faster than concat+linear)
-            if context_emb is not None:
-                context_emb = context_emb + gene_feat
-        else:
-            x = token_emb
-
-        # ------------------------------------------------------------------
-        #  (2) Global time embedding
-        # ------------------------------------------------------------------
-        t_emb = self.time_emb(timesteps.float())  # (B, D)
-        t_emb = t_emb.unsqueeze(1).unsqueeze(1)  # (B, 1, 1, D)
-
-        # ------------------------------------------------------------------
-        #  (4) Conditioning vector (target gene + batch) if provided
-        # ------------------------------------------------------------------
-        combined_emb = t_emb  # always include time
-        if target_gene_idx is not None:
-            # Normalize target_gene_idx and batch_idx to (B,S)
-            tgt_idx = self._normalize_to_BS(target_gene_idx, B, S, "target_gene_idx", device=tokens.device)
-            bat_idx = None
-            if self.config.use_batch_conditioning and batch_idx is not None:
-                bat_idx = self._normalize_to_BS(batch_idx, B, S, "batch_idx", device=tokens.device)
-
-            # Clamp to valid ranges
-            tgt_idx = torch.clamp(tgt_idx, 0, self.config.n_total_genes - 1)
-            if bat_idx is not None:
-                bat_idx = torch.clamp(bat_idx, 0, self.config.n_technical_batches - 1)
-
-            gene_cond_emb = self.gene_embed(tgt_idx)  # (B, S, gene_embed_dim)
-            cond_parts = [gene_cond_emb]
-            if bat_idx is not None:
-                cond_parts.append(self.batch_embed(bat_idx))   # (B, S, batch_embed_dim)
-            cond_vec = torch.cat(cond_parts, dim=-1)          # (B, S, gene_embed_dim+batch_dim)
-            cond_vec = self.cond_proj(cond_vec)               # (B, S, D)
-            cond_vec = cond_vec.unsqueeze(2)                  # (B, S, 1, D)
-            combined_emb = combined_emb + cond_vec
-
-        # Inject combined (time + conditioning) into every token position
-        x = x + combined_emb  # (B, S, N, D)
-
-        # ------------------------------------------------------------------
-        #  (5) Latent transformer
-        # ------------------------------------------------------------------
-        B = x.shape[0]
-        lat1 = self.lat1.expand(B, -1, -1)  # (B, K, D)
-        lat2 = self.lat2.expand(B, -1, -1)  # (B, K, D)
-
-        # Flatten (B, S, N, D) -> (B, S*N, D) for attention
-        x_seq = x.view(B, S * N, -1)
+        gene_feat = self._cached_gene_features.to(tokens.device).unsqueeze(0).unsqueeze(0).expand(B, S, -1, -1)
+        token_emb = self.fuse_proj(torch.cat([token_emb, gene_feat], dim=-1))
         if context_emb is not None:
-            context_seq = context_emb.view(B, S * N, -1)
-            #x_seq = self.cross_attn_seq_context(x_seq, kv=self.kv_ln(context_seq))
-            #kv_all = torch.cat([x_seq, context_seq], dim=1)
-            kv_x = x_seq
-            kv_c = context_seq
+            context_emb = self.fuse_proj(torch.cat([context_emb, gene_feat], dim=-1))
+
+        x = token_emb
+
+        # --- Time + conditioning embeddings ---
+        t_emb = self.time_emb(timesteps.float())[:, None, None, :]
+
+        # Normalize target gene indices and build conditioning input [gene_embed, batch_embed]
+        tgt = self._normalize_to_BS(target_gene_idx, B, S, "target_gene_idx", tokens.device)
+
+        # Batch conditioning vector (broadcasted across N)
+        if self.config.use_batch_conditioning and batch_idx is not None:
+            bat_idx = self._normalize_to_BS(batch_idx, B, S, "batch_idx", tokens.device)
+            bat_idx = torch.clamp(bat_idx, 0, self.config.n_technical_batches - 1)
+            batch_cond = self.batch_embed(bat_idx)  # (B, S, batch_embed_dim)
         else:
-            kv_all = x_seq
-        
-        # Encode streams into latents
-        lat1 = lat1 + self.cross_attn_q_lat1_kv_genes(self.lat_q_ln(lat1), kv=self.kv_ln(kv_x))
-        lat2 = lat2 + self.cross_attn_q_lat2_kv_genes(self.lat_q_ln(lat2), kv=self.kv_ln(kv_c))
+            batch_cond = torch.zeros(B, S, getattr(self.config, "batch_embed_dim", 0), device=tokens.device, dtype=x.dtype)
 
-        # Latent self-attention stack
+        # Gene conditioning
+        if tgt is not None:
+            gene_cond = self.gene_embed(tgt)  # (B, S, gene_embed_dim)
+        else:
+            gene_cond = torch.zeros(B, S, self.config.gene_embed_dim, device=tokens.device, dtype=x.dtype)
+
+        # Project conditioning if batch conditioning is enabled in config
+        if getattr(self.config, "use_batch_conditioning", False):
+            cond_input = torch.cat([gene_cond, batch_cond], dim=-1)  # (B, S, gene_embed_dim + batch_embed_dim)
+            cond_vec = self.cond_proj(cond_input)[:, :, None, :]  # (B, S, 1, D)
+            x = x + cond_vec + t_emb
+        else:
+            x = x + t_emb
+
+        # target flag always applied
+        idx = torch.arange(N, device=tokens.device)[None, None, :]  # (1, 1, N)
+        if tgt is not None:
+            flag = (idx == tgt[:, :, None]).long()  # (B, S, N)
+        else:
+            flag = torch.zeros(B, S, N, dtype=torch.long, device=tokens.device)
+        x = x + self.target_flag(flag)
+
+        # --- Flatten for attention ---
+        x_seq = x.view(B, S * N, -1)  # [B, S*N, D]
+        if context_emb is not None:
+            #print(f'context_emb.shape: {context_emb.shape}')
+            context_emb = context_emb + self.control_id_emb.weight + t_emb  # (B, S, N, D)
+            context_seq = context_emb.view(B, S * N, -1)  # [B, S*N, D]
+            kv_x = torch.cat([x_seq, context_seq], dim=1)
+        else:
+            kv_x = x_seq
+
+        # --- Initialize latents ---
+        lat = self.lat.expand(B, -1, -1)  # (B, K, D)
+
+        # --- Iterative cross-attn + latent self-attn ---
         use_ckpt = self.config.grad_ckpt and self.training and torch.is_grad_enabled()
-        for blk in self.latent_blocks:
-            if use_ckpt:
-                lat1 = torch.utils.checkpoint.checkpoint(lambda _lat, _ctx: blk(_lat, context=_ctx), lat1, lat2, use_reentrant=True)
+        kv = self.kv_ln(kv_x)
+        for i in range(self.config.n_xattn_loops):  # e.g., 8
+            if i == 0:
+                lat = lat + self.cross_attn_first(self.lat_q_ln(lat), kv=kv)
             else:
-                lat1 = blk(lat1, context=self.lat_kv_ln(lat2))
+                lat = lat + self.cross_attn_shared(self.lat_q_ln(lat), kv=kv)
 
-        # Decode back to gene tokens
-        x_seq = x_seq + self.cross_attn_q_genes_kv_lat(self.gene_q_ln(x_seq), kv=self.lat_kv_ln(lat1))
+            if use_ckpt:
+                lat = torch.utils.checkpoint.checkpoint(
+                    lambda _lat: self.latent_block_shared(_lat),
+                    lat,
+                    use_reentrant=True
+                )
+            else:
+                lat = self.latent_block_shared(lat)
+
+        # --- Final decode cross-attn ---
+        x_seq = x_seq + self.cross_attn_decode(self.gene_q_ln(x_seq), kv=self.lat_kv_ln(lat))
         x = x_seq.view(B, S, N, -1)
 
-        # ------------------------------------------------------------------
-        #  (6) Output head
-        # ------------------------------------------------------------------
-        h = self.ln_f(x)          # per-gene hidden states (B, S, N, D)
-        vocab_logits = self.head(h)  # (B, S, N, V)
+        # --- Output ---
+        h = self.ln_f(x)
+        vocab_logits = self.head(h)
 
-        if not return_aux:
+        if not (return_aux or self.return_aux):
             return vocab_logits
-
-        # Aux heads
-        de_sig_logit = self.de_sig_head(h).squeeze(-1)   # (B, S, N)
-        de_dir_logits = self.de_dir_head(h)              # (B, S, N, 2)
-        de_rank_score = self.de_rank_head(h).squeeze(-1) # (B, S, N)
 
         return {
             "logits": vocab_logits,
             "hidden": h,
-            "de_sig_logit": de_sig_logit,
-            "de_dir_logits": de_dir_logits,
-            "de_rank_score": de_rank_score,
+            "de_sig_logit": self.de_sig_head(h).squeeze(-1),
+            "de_dir_logits": self.de_dir_head(h),
+            "de_rank_score": self.de_rank_head(h).squeeze(-1),
         }
 
 
@@ -774,7 +762,7 @@ class PartialMaskingDiffusion:
             freq_weights = self.token_weights.to(device)[x_start]  # shape: [B, S, N]
             
             # Blend uniform weights (1.0) with frequency weights based on annealing
-            weights = (1.0 - annealing_factor) + annealing_factor * freq_weights # power law
+            weights = (1.0 - annealing_factor) + annealing_factor * freq_weights 
             
             # Scale mask probability by token weight
             scaled_probs = weights * mask_prob.view(B, 1, 1)
@@ -899,6 +887,26 @@ class PartialMaskingDiffusion:
         
         # Partial masking using per-sample ratios
         x_noisy, mlm_mask = self.q_sample(x_start, t, mask_ratio_vec, step=step)
+        '''
+        | Timestep | p\_mask\_probs | masked_tokens (total 6288)  |
+        | -------- | -------------- | - |
+        | 0        | 0.000000       | 0 |
+        | 1        | 0.011981       | 75 |
+        | 2        | 0.042598       | 268 |
+        | 3        | 0.090694       | 570 |
+        | 4        | 0.154449       | 971 |
+        | 5        | 0.231451       | 1455 |
+        | 6        | 0.318788       | 2004 |
+        | 7        | 0.413158       | 2598 |
+        | 8        | 0.510989       | 3213 |
+        | 9        | 0.608582       | 3826 |
+        | 10       | 0.702247       | 4415 |
+        | 11       | 0.788438       | 4957 |
+        | 12       | 0.863898       | 5432 |
+        | 13       | 0.925771       | 5821 |
+        | 14       | 0.971718       | 6110 |
+        | 15       | 1.000000       | 6288 |
+        '''
         
         # Predict original tokens
         control_ctx = control_set if isinstance(control_set, torch.Tensor) else None
@@ -910,11 +918,13 @@ class PartialMaskingDiffusion:
             return_aux=True,
         )
         logits = out["logits"] if isinstance(out, dict) else out
+        # Restrict to data vocabulary during training loss
+        logits_data = logits[..., :self.data_vocab_size]
         
         # Compute loss only on masked positions; guard against rare empty-mask batches
         if mlm_mask.any():
             main_loss = F.cross_entropy(
-                logits[mlm_mask].view(-1, self.data_vocab_size),
+                logits_data[mlm_mask].view(-1, self.data_vocab_size),
                 x_start[mlm_mask].view(-1),
                 reduction='mean'
             )
@@ -1040,9 +1050,11 @@ class PartialMaskingDiffusion:
                 batch_idx=batch_idx,
                 control_context=control_context,
                 return_aux=False
-            )  # (B,1,N,V_data)
+            )  # (B,1,N,V)
             
             logits = logits / temperature
+            # Restrict to data vocabulary for ancestral sampling
+            logits = logits[..., :self.data_vocab_size]
 
             # Determine which positions to unmask at this step
             current_mask_prob = self.p_mask_probs[t]
@@ -1069,6 +1081,165 @@ class PartialMaskingDiffusion:
                 x[unmask] = new_tokens[unmask]
         
         return x.squeeze(1)
+
+class AbsorbingMaskMD4Continuous(nn.Module):
+    """
+    Continuous-time per-token absorbing-mask diffusion (MD4-style)
+    (Without per-token weighting, which requires REINFORCE)
+    """
+
+    def __init__(self, config: ConditionalModelConfig):
+        super().__init__()
+        self.config = config
+        self.K = int(config.vocab_size)
+        self.mask_token_id = int(config.mask_token_id if config.mask_token_id is not None else self.K)
+        self.eps = 1e-4
+        self.t1 = float(getattr(config, "t1", 1e-3))
+        self.antithetic = bool(getattr(config, "antithetic_time_sampling", True))
+
+        # Per-token polynomial exponent w_v (fixed schedule by default; non-trainable)
+        power_init = torch.ones(self.K) * float(getattr(config, "power_init", 1.0))
+        self.register_buffer("power_const", power_init)
+
+    # ---- Schedule and derivatives ----
+    def alpha(self, t: torch.Tensor) -> torch.Tensor:
+        """α(t)[v] for continuous t ∈ [t1, 1.0]."""
+        t_exp = t.unsqueeze(-1)              # [B,1]
+        w = F.softplus(self.power_const).to(t.device)           # [K]
+        return 1.0 - (1.0 - self.eps) * t_exp**w
+
+    def dgamma_times_alpha(self, t: torch.Tensor) -> torch.Tensor:
+        """|dγ(t) × α(t)| magnitude for polynomial schedule = w_v / t (positive)."""
+        t_exp = t.unsqueeze(-1)
+        w = F.softplus(self.power_const).to(t.device)
+        return w / t_exp
+
+    # ---- Forward process ----
+    def q_sample(self, x0: torch.LongTensor, t: torch.Tensor) -> torch.LongTensor:
+        """Mask each token with probability 1 - α_t[v]. Supports arbitrary data shapes (B, ...)."""
+        B = x0.shape[0]
+        alpha_t = self.alpha(t)  # [B,K]
+        flat_x0 = x0.view(B, -1).clamp_max(self.K - 1)
+        keep_prob = alpha_t.gather(1, flat_x0)
+        keep_prob = keep_prob.view_as(x0)
+        survive = torch.rand_like(keep_prob, dtype=keep_prob.dtype) < keep_prob
+        return torch.where(survive, x0, torch.full_like(x0, self.mask_token_id))
+    # ---- Training loss ----
+    def compute_loss(
+        self,
+        model: nn.Module,
+        x0: torch.LongTensor,
+        control_set: Optional[torch.LongTensor] = None,
+        target_gene_idx: Optional[torch.LongTensor] = None,
+        batch_idx: Optional[torch.LongTensor] = None,
+        **_: dict,
+    ) -> torch.Tensor:
+        """
+        Continuous-time MD4 objective with REINFORCE variance reduction.
+        """
+        B = x0.shape[0]
+        device = x0.device
+
+        # Antithetic t sampling
+        if self.antithetic:
+            t0 = torch.rand((), device=device)
+            t = (t0 + torch.arange(0.0, 1.0, step=1.0 / max(1, B), device=device)) % 1.0
+        else:
+            t = torch.rand(B, device=device)
+        # Scale to [t1, 1.0]
+        t = (1 - self.t1) * t + self.t1
+
+        # Single z_t sample (no REINFORCE)
+        zt = self.q_sample(x0, t)
+        out = model(
+            zt,
+            t,
+            target_gene_idx=target_gene_idx,
+            batch_idx=batch_idx,
+            control_context=control_set,
+            return_aux=False,
+        )
+        logits = out["logits"]
+        loss, raw_loss = self._masked_ce_loss(zt, x0, logits, t)
+        return loss, raw_loss
+
+    def _masked_ce_loss(self, x_t, x0, logits, t):
+        """
+        Masked cross-entropy weighted by dgamma_times_alpha(t),
+        as in MD4's continuous-time ELBO integrand.
+        """
+        # Ensure we have logits over data + mask classes
+        log_probs = F.log_softmax(logits[..., : self.K], dim=-1)
+        one_hot_x0 = F.one_hot(x0.clamp_max(self.K-1), num_classes=self.K).float()
+        neg_ce = -(one_hot_x0 * log_probs).sum(dim=-1)  # [B,S,N]
+        mask = (x_t == self.mask_token_id).float()
+        weight = self.dgamma_times_alpha(t).mean(dim=-1).view(x_t.shape[0], 1, 1)
+        loss = (mask * neg_ce * weight).sum(dim=(1, 2)) / mask.sum(dim=(1, 2)).clamp_min(1.0).mean()
+        unweighted_loss = (mask * neg_ce).sum(dim=(1, 2)) / mask.sum(dim=(1, 2)).mean()
+        return loss, unweighted_loss
+
+    # ---- Inference ----
+    @torch.no_grad()
+    def p_sample_loop(
+        self,
+        model: nn.Module,
+        shape: Tuple[int, ...],
+        control_set: Optional[torch.LongTensor] = None,
+        target_gene_idx: Optional[torch.LongTensor] = None,
+        batch_idx: Optional[torch.LongTensor] = None,
+    ):
+        """
+        Continuous-time ancestral sampler from t=1.0 to t1 using MD4's update rule.
+        shape: (B, *data_shape) — must match model output's spatial shape.
+        """
+        B = shape[0]
+        device = next(model.parameters()).device
+        x_t = torch.full(shape, self.mask_token_id, device=device, dtype=torch.long)
+
+        # Define discrete step grid from 1.0 down to t1
+        times = torch.linspace(1.0, self.t1, self.config.n_timesteps, device=device)
+
+        for i in range(len(times) - 1):
+            t_val = times[i]
+            s_val = times[i + 1]
+
+            t_batch = torch.full((B,), t_val, device=device)
+            s_batch = torch.full((B,), s_val, device=device)
+
+            alpha_t = self.alpha(t_batch)  # [B,K]
+            alpha_s = self.alpha(s_batch)  # [B,K]
+
+            logits = model(
+                x_t,
+                t_batch,
+                target_gene_idx=target_gene_idx,
+                batch_idx=batch_idx,
+                control_context=control_set,
+                return_aux=False,
+            )
+            mean_preds = F.softmax(logits[..., :self.K], dim=-1)  # [B,...,K+1]
+
+            # Compute unmask probability for each vocab entry: (α_s - α_t) / (1 - α_t)
+            # For fixed schedule, α is same for all v in 0..K-1
+            unmask_prob = (alpha_s[:, 0] - alpha_t[:, 0]) / (1.0 - alpha_t[:, 0]).clamp_min(1e-8)
+            # Broadcast to data shape
+            unmask_prob = unmask_prob.view(B, *([1] * (x_t.ndim - 1)))
+
+            # Probabilities for vocab tokens (exclude mask logit)
+            probs_vocab = unmask_prob.unsqueeze(-1) * mean_preds[..., :self.K]
+            # Probability for staying masked
+            probs_mask = (1.0 - unmask_prob).unsqueeze(-1).expand_as(mean_preds[..., :1])
+            # Concatenate vocab and mask probabilities
+            probs = torch.cat([probs_vocab, probs_mask], dim=-1)
+
+            # Sample from categorical
+            x_new = torch.multinomial(probs.view(-1, self.K + 1), 1).view_as(x_t)
+
+            # Only replace masked positions
+            is_mask = x_t == self.mask_token_id
+            x_t = torch.where(is_mask, x_new, x_t)
+
+        return x_t
 
 def create_muon_optimizer(model: nn.Module, config: ConditionalModelConfig):
     """Create Muon optimizer with weight decay.

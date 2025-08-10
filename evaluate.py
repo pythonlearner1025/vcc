@@ -57,8 +57,7 @@ import torch
 # -----------------------------------------------------------------------------
 
 from tokenizer import (
-    create_logbin_tokenizer,
-    create_delta_tokenizer
+    create_logbin_tokenizer
 )
       # noqa: E402  – defined at top-level
 from models.diffusion import (
@@ -233,17 +232,19 @@ def _run_validation_merged(
         #    break
         steps += 1
         print(f"num genes: {steps}")
-        delta_expr = sample["tokens"].squeeze(0)  # (S,N)
-        ctrl_expr = sample["control"].squeeze(0) # (S,S,N)
-        pert_expr = ctrl_expr[0] + delta_expr
+        # Tokens from collator (already tokenised)
+        pert_tok = sample["tokens"].squeeze(0)   # (S,N) – perturbed tokens
+        ctrl_tok  = sample["control"].squeeze(0)  # (S,N) – control tokens
         gene_idxs_raw = sample["target_gene_idx"]
         gene_idxs = gene_idxs_raw.to(device, non_blocking=True)
         batches = sample["batch_idx"]
-        S, N = pert_expr.shape
+        S, N = pert_tok.shape
 
-        # Tokenise
-        tokens_ctrl = tokenizer(ctrl_expr).to(device, non_blocking=True)
-        #print(f"eval tokens_ctrl.shape: {tokens_ctrl.shape}")
+        # Control set tokens are already provided by the collator
+        tokens_ctrl = ctrl_tok.to(device, non_blocking=True)
+        # Also build float control baseline via detokeniser for metrics
+        #ctrl_expr = _tokens_to_expression(ctrl_tok, detokenizer)  # (S,N) float32
+        #ctrl_expr = detokenizer(ctrl_tok).to(device, non_blocking=True)
 
         batch_to_idx = val_ds.batch_to_idx
         batch_idx = torch.tensor([batch_to_idx.get(b, 0) for b in batches], dtype=torch.long).to(device, non_blocking=True)
@@ -258,19 +259,16 @@ def _run_validation_merged(
                 return_aux=False
             )
 
-        # Convert tokens → expression.  For Δ-training we need to add the predicted
-        # change back to the control-cell baseline.
-        if cfg.target_is_delta:
-            pred_delta_2k = _tokens_to_expression(pred_tokens, detokenizer)
-            pred_expr_2k = np.clip(ctrl_expr.numpy() + pred_delta_2k, 0, None)
-        else:
-            pred_expr_2k = _tokens_to_expression(pred_tokens, detokenizer)
-        true_expr_2k = pert_expr.numpy()
+        # Convert tokens → expression.
+        # If Δ-training, add predicted Δ back to control baseline; otherwise treat as absolute.
+        pred_expr_2k = _tokens_to_expression(pred_tokens, detokenizer)
+        # Ground-truth perturbed expression from provided perturbed tokens
+        true_expr_2k = _tokens_to_expression(pert_tok, detokenizer)
 
         # Map to 18 k space
         pred_full = _build_18k_matrix(pred_expr_2k, hvg_to_full, len(gene_names))
         true_full = _build_18k_matrix(true_expr_2k, hvg_to_full, len(gene_names))
-        ctrl_full = _build_18k_matrix(ctrl_expr.numpy(), hvg_to_full, len(gene_names))
+        ctrl_full = _build_18k_matrix(ctrl_expr, hvg_to_full, len(gene_names))
 
         X_true_parts.extend([ctrl_full, true_full])
         X_pred_parts.extend([ctrl_full, pred_full])
@@ -353,7 +351,7 @@ def _run_test_generation(
         return full
 
     # Use Dleta tokenizer
-    tokenizer, _ = create_delta_tokenizer(cfg.vocab_size)
+    tokenizer, _ = create_logbin_tokenizer(cfg.vocab_size)
 
     # ------------------------------------------------------------------
     # Load control cells once, keep in backed mode
@@ -533,10 +531,6 @@ def main():
     # 2. Tokeniser / detokeniser
     # ---------------------------------------------------------------------
     tokenizer, detokenizer = create_logbin_tokenizer(cfg.vocab_size)
-
-    _, delta_detokenizer = create_delta_tokenizer(
-            cfg.vocab_size, max_abs=cfg.token_max_value, min_abs=1e-3)
-    # ---------------------------------------------------------------------
     # 3. Gene mappings (18k list + HVG idx mapping)
     # ---------------------------------------------------------------------
     gene_names, hvg_to_full, hvg_gene_ids = _prepare_gene_mappings(cfg.finetune_data_path, args.hvg_ids_path)
@@ -566,7 +560,7 @@ def main():
         cfg,
         model,
         diffusion,
-        delta_detokenizer,
+        detokenizer,
         gene_names,
         hvg_to_full,
         hvg_gene_ids,

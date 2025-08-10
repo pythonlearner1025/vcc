@@ -335,7 +335,8 @@ class Trainer:
                     break
                 batch_std: Batch = adapt_batch(batch, self.device)
                 with get_autocast_ctx(self.model, autocast_dtype):
-                    loss = self.loss_adapter(self.model, batch_std, steps_done, total_val_steps)
+                    losses = self.loss_adapter(self.model, batch_std, steps_done, total_val_steps)
+                loss, raw_loss = losses
                 val_losses.append(loss.item())
                 steps_done += 1
                 print(f"steps_done: {steps_done}")
@@ -383,8 +384,8 @@ class Trainer:
                 out_dir.mkdir(parents=True, exist_ok=True)
 
                 # Tokeniser/Detokeniser for delta tokens
-                from tokenizer import create_delta_tokenizer
-                tokenizer, detok = create_delta_tokenizer(getattr(cfg_obj, "vocab_size", 128), max_abs=getattr(cfg_obj, "token_max_value", 10.82), min_abs=1e-3)
+                from tokenizer import create_logbin_tokenizer
+                tokenizer, detok = create_logbin_tokenizer(getattr(cfg_obj, "vocab_size", 128), max_value=getattr(cfg_obj, "token_max_value", 10.82))
 
                 # Ensure val_dataset has mapping
                 setattr(val_dataset, "batch_to_idx", self.global_batch_mapping)
@@ -468,8 +469,9 @@ class Trainer:
                 batch_std: Batch = adapt_batch(batch, device)
                 with get_autocast_ctx(self.model, autocast_dtype):
                     # Pass phase-local step and total phase steps to the loss
-                    loss = self.loss_adapter(self.model, batch_std, phase_step, total_steps_per_phase)
+                    losses = self.loss_adapter(self.model, batch_std, phase_step, total_steps_per_phase)
                 self.optimizer.zero_grad(set_to_none=True)
+                loss, raw_loss = losses
                 loss.backward()
                 self.optimizer.step()
                 # Per-dataset schedule: linear warmup then immediate linear cooldown (no flat section),
@@ -487,7 +489,7 @@ class Trainer:
                     pg["lr"] = base_lr * scale
                 phase_step += 1
                 self.global_step += 1
-                epoch_losses.append(loss.item())
+                epoch_losses.append(raw_loss.item())
                 if phase_step % max(1, ds_spec.log_every_steps) == 0:
                     avg = float(np.mean(epoch_losses[-100:] if len(epoch_losses) > 100 else epoch_losses))
                     # Gather learning rates (support muon+adam split or generic optimizer)
@@ -498,7 +500,7 @@ class Trainer:
                     lr_adam = float(np.mean(adam_lrs)) if adam_lrs else None
                     lr_overall = float(np.mean([pg.get("lr", 0.0) for pg in self.optimizer.param_groups]))
                     stats = {
-                        "train/loss": loss.item(),
+                        "train/loss": raw_loss.item(),
                         "train/loss_avg": avg,
                         "train/epoch": self.global_epoch,
                         "train/global_step": self.global_step,

@@ -8,8 +8,8 @@ from engine.utils import Batch
 
 @dataclass
 class DiffusionLoss:
-    # Dotted path to diffusion class; defaults to models.diffusion:PartialMaskingDiffusion
-    diffusion_class: str = "models.diffusion:PartialMaskingDiffusion"
+    # Dotted path to diffusion class; defaults to continuous-time MD4 diffusion
+    diffusion_class: str = "models.diffusion:AbsorbingMaskMD4Continuous"
     diffusion_args: Dict[str, Any] = field(default_factory=dict)
     # Aux loss knobs (can be overridden via YAML loss.loss_args)
     lambda_de: float = 0.5
@@ -31,7 +31,7 @@ class DiffusionLoss:
             diffusion = self._create(getattr(model, "config", None), **self.diffusion_args)
             setattr(model, "_generic_trainer_diffusion", diffusion)
         diffusion = getattr(model, "_generic_trainer_diffusion")
-        loss = diffusion.compute_loss(
+        losses = diffusion.compute_loss(
             model,
             batch.tokens,
             control_set=batch.control,
@@ -54,4 +54,4 @@ class DiffusionLoss:
                 setattr(model, "_last_loss_stats", stats)
         except Exception:
             pass
-        return loss
+        return losses
