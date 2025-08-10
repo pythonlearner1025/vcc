@@ -1,16 +1,16 @@
 """
-Modular Data Processor
+Modular Data Processor with Chunked Storage
 
-A standalone, configurable data processing module that handles all preprocessing
-steps before model training. Designed to be reproducible and configurable via JSON.
+A standalone, configurable data processing module that processes data into 
+optimized chunks for efficient training. Inspired by dataset/download.py chunking strategy.
 
 Key Features:
-- JSON-configurable preprocessing pipeline
+- Pre-chunked storage for efficient training data loading
+- JSON-configurable preprocessing pipeline  
 - Quality control filtering (genes, cells)
-- Dataset inclusion/exclusion
-- Gene filtering and ordering
-- Comprehensive logging and validation
-- Reproducible outputs
+- Efficient indexing by SRX accession and batch
+- Memory-optimized processing with HDF5 storage
+- Reproducible outputs with comprehensive metadata
 
 Usage:
     uv run src/data_processor.py --config config/data_config.json
@@ -20,21 +20,109 @@ Usage:
     processor = DataProcessor.from_config('config/data_config.json')
     processor.process()
 
-Extra:
-    https://sib-swiss.github.io/single-cell-python-training/ipynb/day1-3_normalization_scaling.html
+Output Format:
+- chunk_*.h5: Pre-processed data chunks for fast loading
+- chunk_index.json: Index mapping cells to chunks and metadata
+- processing_config.json: Complete processing configuration
+- gene_list.json: Consistent gene ordering across chunks
 """
 
 import json
 import logging
 import argparse
+import h5py
 import numpy as np
 import pandas as pd
 import scanpy as sc
 import anndata as ad
 from pathlib import Path
-from typing import Dict, List, Optional, Union, Any
+from typing import Dict, List, Optional, Union, Any, Tuple
 from datetime import datetime
+from dataclasses import dataclass, asdict
 import warnings
+from tqdm import tqdm
+import gc
+
+warnings.filterwarnings('ignore')
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class ChunkMetadata:
+    """Metadata for a single chunk."""
+    chunk_id: int
+    chunk_path: str
+    n_cells: int
+    n_genes: int
+    srx_accessions: List[str]
+    datasets: List[str]
+    file_size_mb: float
+    cell_start_idx: int  # Global index where this chunk starts
+    cell_end_idx: int    # Global index where this chunk ends
+
+
+@dataclass
+class ProcessingIndex:
+    """Complete index for efficient data retrieval."""
+    chunks: List[ChunkMetadata]
+    gene_list: List[str]
+    total_cells: int
+    total_chunks: int
+    processing_config: Dict[str, Any]
+    processing_timestamp: str
+    
+    def save(self, path: Path):
+        """Save index to JSON."""
+        # Convert to serializable format
+        chunks_dict = [asdict(chunk) for chunk in self.chunks]
+        index_dict = {
+            'chunks': chunks_dict,
+            'gene_list': self.gene_list,
+            'total_cells': self.total_cells,
+            'total_chunks': self.total_chunks,
+            'processing_config': self.processing_config,
+            'processing_timestamp': self.processing_timestamp
+        }
+        
+        with open(path, 'w') as f:
+            json.dump(index_dict, f, indent=2)
+        
+        logger.info(f"Saved processing index: {path}")
+    
+    @classmethod
+    def load(cls, path: Path) -> 'ProcessingIndex':
+        """Load index from JSON."""
+        with open(path, 'r') as f:
+            index_dict = json.load(f)
+        
+        # Convert chunks back to dataclass
+        chunks = [ChunkMetadata(**chunk_dict) for chunk_dict in index_dict['chunks']]
+        
+        return cls(
+            chunks=chunks,
+            gene_list=index_dict['gene_list'],
+            total_cells=index_dict['total_cells'],
+            total_chunks=index_dict['total_chunks'],
+            processing_config=index_dict['processing_config'],
+            processing_timestamp=index_dict['processing_timestamp']
+        )
+    
+    def get_chunk_for_cell(self, cell_idx: int) -> Optional[ChunkMetadata]:
+        """Get chunk metadata for a specific cell index."""
+        for chunk in self.chunks:
+            if chunk.cell_start_idx <= cell_idx < chunk.cell_end_idx:
+                return chunk
+        return None
+    
+    def get_chunks_for_srx(self, srx_accession: str) -> List[ChunkMetadata]:
+        """Get all chunks containing cells from a specific SRX accession."""
+        return [chunk for chunk in self.chunks if srx_accession in chunk.srx_accessions]
 
 warnings.filterwarnings('ignore')
 
@@ -69,15 +157,34 @@ class DataProcessingConfig:
     
     def _validate_config(self):
         """Validate configuration parameters."""
-        required_keys = ['input_paths', 'output_path', 'processing_steps']
+        # Handle both new comprehensive config and legacy config formats
+        if 'paths' in self.config:
+            # New comprehensive config format
+            required_keys = ['paths']
+            input_paths = self.config.get('paths', {}).get('input', {}).get('datasets', {})
+            output_path = self.config.get('paths', {}).get('output', {}).get('chunks_dir')
+        else:
+            # Legacy config format
+            required_keys = ['input_paths', 'output_path']
+            input_paths = self.config.get('input_paths', {})
+            output_path = self.config.get('output_path')
+        
         for key in required_keys:
             if key not in self.config:
                 raise ValueError(f"Required configuration key missing: {key}")
         
-        # Validate paths
-        for path_key, path_value in self.config['input_paths'].items():
-            if not Path(path_value).exists():
-                logger.warning(f"Input path does not exist: {path_key} = {path_value}")
+        # Validate input paths
+        if input_paths:
+            for path_key, path_value in input_paths.items():
+                if path_key != 'vcc_data_path' and not Path(path_value).exists():
+                    logger.warning(f"Input path does not exist: {path_key} = {path_value}")
+        
+        # Validate output path parent directory
+        if output_path:
+            output_parent = Path(output_path).parent
+            if not output_parent.exists():
+                logger.info(f"Creating output directory: {output_parent}")
+                output_parent.mkdir(parents=True, exist_ok=True)
     
     def get(self, key: str, default=None):
         """Get configuration value."""
@@ -86,25 +193,41 @@ class DataProcessingConfig:
 
 class DataProcessor:
     """
-    Modular data processor for Virtual Cell Challenge preprocessing.
+    Modular data processor with chunked storage for efficient ML training.
     
-    Handles all data preprocessing steps in a configurable, reproducible manner.
+    Processes data into optimized chunks for fast loading during training,
+    with comprehensive indexing for efficient retrieval.
     """
     
     def __init__(self, config: DataProcessingConfig):
         """Initialize processor with configuration."""
         self.config = config
-        self.output_path = Path(config.get('output_path', 'outputs/processed_data'))
+        
+        # Handle both new comprehensive config and legacy config formats
+        if 'paths' in config.config:
+            # New comprehensive config format
+            self.output_path = Path(config.config['paths']['output']['chunks_dir'])
+            chunk_config = config.config.get('processing', {}).get('chunking', {})
+            self.chunk_size = chunk_config.get('chunk_size', 25000)
+            self.compression_level = chunk_config.get('compression_level', 4)
+        else:
+            # Legacy config format
+            self.output_path = Path(config.get('output_path', '/workspace/vcc/data/processed/chunked'))
+            self.chunk_size = config.get('chunk_size', 25000)
+            self.compression_level = config.get('compression_level', 4)
+        
         self.output_path.mkdir(parents=True, exist_ok=True)
         
         # Initialize processing state
         self.datasets = {}
         self.combined_data = None
-        self.processed_data = None
         self.processing_log = []
+        self.chunks_metadata = []
         
-        logger.info(f"DataProcessor initialized")
+        logger.info(f"DataProcessor initialized with chunked storage")
         logger.info(f"Output path: {self.output_path}")
+        logger.info(f"Chunk size: {self.chunk_size:,} cells per chunk")
+        logger.info(f"Compression level: {self.compression_level}")
     
     @classmethod
     def from_config(cls, config_path: Union[str, Path]) -> 'DataProcessor':
@@ -112,10 +235,10 @@ class DataProcessor:
         config = DataProcessingConfig.from_file(config_path)
         return cls(config)
     
-    def process(self) -> ad.AnnData:
+    def process(self) -> ProcessingIndex:
         """Run the complete data processing pipeline."""
         logger.info("=" * 60)
-        logger.info("STARTING DATA PROCESSING PIPELINE")
+        logger.info("STARTING CHUNKED DATA PROCESSING PIPELINE")
         logger.info("=" * 60)
         
         try:
@@ -127,31 +250,34 @@ class DataProcessor:
             
             # Step 3: Quality control
             self._quality_control()
-
-            # .. Subset to control cells if specified
+            
+            # Step 4: Subset to control cells if requested
             self._subset_to_control_cells()
             
-            # Step 4: Combine datasets
+            # Step 5: Combine datasets
             self._combine_datasets()
             
-            # Step 5: Gene filtering and ordering
+            # Step 6: Process genes
             self._process_genes()
             
-            # Step 6: Cell filtering
+            # Step 7: Process cells
             self._process_cells()
             
-            # X Step 7:
-
-            # Step 8: Final validation and save
-            self._finalize_and_save()
+            # Step 8: Create chunks and save
+            processing_index = self._create_chunks_and_save()
+            
+            # Step 9: Save index and metadata
+            self._save_processing_index(processing_index)
             
             logger.info("=" * 60)
-            logger.info("DATA PROCESSING COMPLETED SUCCESSFULLY")
-            logger.info(f"Final dataset: {self.processed_data.shape}")
-            logger.info(f"Output saved to: {self.output_path}")
+            logger.info("CHUNKED DATA PROCESSING COMPLETE")
+            logger.info(f"Total chunks: {len(self.chunks_metadata)}")
+            logger.info(f"Total cells: {self.combined_data.n_obs:,}")
+            logger.info(f"Total genes: {self.combined_data.n_vars:,}")
+            logger.info(f"Output directory: {self.output_path}")
             logger.info("=" * 60)
             
-            return self.processed_data
+            return processing_index
             
         except Exception as e:
             logger.error(f"Data processing failed: {e}")
@@ -162,8 +288,15 @@ class DataProcessor:
         """Load specified datasets."""
         logger.info("Step 1: Loading datasets...")
         
-        input_paths = self.config.get('input_paths', {})
-        dataset_config = self.config.get('datasets', {})
+        # Handle both config formats
+        if 'paths' in self.config.config:
+            # New comprehensive config format
+            input_paths = self.config.config['paths']['input']['datasets']
+            dataset_config = self.config.config.get('processing', {}).get('datasets', {})
+        else:
+            # Legacy config format
+            input_paths = self.config.get('input_paths', {})
+            dataset_config = self.config.get('datasets', {})
         
         for dataset_name, dataset_path in input_paths.items():
             if dataset_name == 'vcc_data_path':
@@ -171,7 +304,8 @@ class DataProcessor:
             
             # Check if this dataset should be included
             if dataset_name in dataset_config:
-                if not dataset_config[dataset_name].get('include', True):
+                dataset_settings = dataset_config[dataset_name]
+                if not dataset_settings.get('include', True):
                     logger.info(f"Skipping {dataset_name} (excluded in config)")
                     continue
             
@@ -206,7 +340,10 @@ class DataProcessor:
                 # Add cell type to metadata (if not already present)
                 if 'cell_type' not in adata.obs.columns:
                     try: 
-                        adata.obs['cell_type'] = dataset_config[dataset_name].get('cell_type', dataset_name)
+                        if dataset_name in dataset_config:
+                            adata.obs['cell_type'] = dataset_config[dataset_name].get('cell_type', dataset_name)
+                        else:
+                            adata.obs['cell_type'] = dataset_name
                     except KeyError:
                         logger.warning(f"Cell type not found for {dataset_name}, using dataset name")
                         adata.obs['cell_type'] = dataset_name
@@ -220,7 +357,12 @@ class DataProcessor:
                 
             except Exception as e:
                 logger.error(f"Failed to load {dataset_name}: {e}")
-                if dataset_config.get(dataset_name, {}).get('required', False):
+                # Check if dataset is required
+                is_required = False
+                if dataset_name in dataset_config:
+                    is_required = dataset_config[dataset_name].get('required', False)
+                
+                if is_required:
                     raise
         
         logger.info(f"Loaded {len(self.datasets)} datasets")
@@ -804,6 +946,214 @@ class DataProcessor:
         
         return nan_count == 0 and negative_count == 0
 
+    def _create_chunks_and_save(self) -> ProcessingIndex:
+        """Create optimized chunks for efficient training data loading."""
+        logger.info("Step 7: Creating optimized chunks...")
+        
+        if self.combined_data is None:
+            raise ValueError("No combined data available for chunking")
+        
+        total_cells = self.combined_data.n_obs
+        n_chunks = (total_cells + self.chunk_size - 1) // self.chunk_size
+        
+        logger.info(f"Creating {n_chunks} chunks from {total_cells:,} cells")
+        logger.info(f"Chunk size: {self.chunk_size:,} cells per chunk")
+        
+        # Get gene list for consistent ordering
+        gene_list = self.combined_data.var_names.tolist()
+        
+        # Create chunks
+        chunks_metadata = []
+        cell_start_idx = 0
+        
+        for chunk_idx in tqdm(range(n_chunks), desc="Creating chunks"):
+            cell_end_idx = min(cell_start_idx + self.chunk_size, total_cells)
+            
+            # Extract chunk data
+            chunk_data = self.combined_data[cell_start_idx:cell_end_idx].copy()
+            
+            # Create chunk file
+            chunk_filename = f"chunk_{chunk_idx:04d}.h5"
+            chunk_path = self.output_path / chunk_filename
+            
+            # Save chunk with optimized HDF5 format
+            self._save_chunk_hdf5(chunk_data, chunk_path, chunk_idx)
+            
+            # Get chunk metadata
+            chunk_metadata = self._get_chunk_metadata(
+                chunk_data, chunk_idx, chunk_filename, cell_start_idx, cell_end_idx
+            )
+            chunks_metadata.append(chunk_metadata)
+            
+            # Log progress
+            if chunk_idx % 10 == 0 or chunk_idx == n_chunks - 1:
+                logger.info(f"  Created chunk {chunk_idx + 1}/{n_chunks}")
+            
+            cell_start_idx = cell_end_idx
+            
+            # Memory cleanup
+            del chunk_data
+            gc.collect()
+        
+        # Create processing index
+        processing_index = ProcessingIndex(
+            chunks=chunks_metadata,
+            gene_list=gene_list,
+            total_cells=total_cells,
+            total_chunks=n_chunks,
+            processing_config=self.config.config,
+            processing_timestamp=datetime.now().isoformat()
+        )
+        
+        logger.info(f"Successfully created {len(chunks_metadata)} chunks")
+        self._log_step("chunk_creation", {
+            "total_chunks": len(chunks_metadata),
+            "total_cells": total_cells,
+            "chunk_size": self.chunk_size
+        })
+        
+        return processing_index
+    
+    def _save_chunk_hdf5(self, chunk_data: ad.AnnData, chunk_path: Path, chunk_idx: int):
+        """Save chunk data in optimized HDF5 format."""
+        with h5py.File(chunk_path, 'w') as f:
+            # Save expression matrix (sparse format)
+            if hasattr(chunk_data.X, 'toarray'):
+                # Convert sparse to dense for HDF5 storage with compression
+                X_dense = chunk_data.X.toarray().astype(np.float32)
+            else:
+                X_dense = chunk_data.X.astype(np.float32)
+            
+            # Store with compression
+            f.create_dataset(
+                'X', 
+                data=X_dense, 
+                compression='gzip', 
+                compression_opts=self.compression_level,
+                shuffle=True
+            )
+            
+            # Save gene names
+            gene_names_encoded = [name.encode('utf-8') for name in chunk_data.var_names]
+            f.create_dataset('genes', data=gene_names_encoded)
+            
+            # Save cell names
+            cell_names_encoded = [name.encode('utf-8') for name in chunk_data.obs_names]
+            f.create_dataset('cells', data=cell_names_encoded)
+            
+            # Save metadata (obs)
+            obs_group = f.create_group('obs')
+            for col_name, col_data in chunk_data.obs.items():
+                if col_data.dtype == 'object':
+                    # String data
+                    encoded_data = [str(val).encode('utf-8') for val in col_data]
+                    obs_group.create_dataset(col_name, data=encoded_data)
+                else:
+                    # Numeric data
+                    obs_group.create_dataset(col_name, data=col_data.values)
+            
+            # Save chunk metadata
+            f.attrs['chunk_id'] = chunk_idx
+            f.attrs['n_cells'] = chunk_data.n_obs
+            f.attrs['n_genes'] = chunk_data.n_vars
+            f.attrs['creation_time'] = datetime.now().isoformat()
+    
+    def _get_chunk_metadata(self, chunk_data: ad.AnnData, chunk_idx: int, 
+                           chunk_filename: str, cell_start_idx: int, cell_end_idx: int) -> ChunkMetadata:
+        """Extract metadata from a chunk."""
+        chunk_path = self.output_path / chunk_filename
+        file_size_mb = chunk_path.stat().st_size / (1024 * 1024)
+        
+        # Get unique SRX accessions in this chunk
+        srx_accessions = []
+        if 'SRX_accession' in chunk_data.obs.columns:
+            srx_accessions = chunk_data.obs['SRX_accession'].unique().tolist()
+        
+        # Get unique datasets in this chunk
+        datasets = []
+        if 'dataset' in chunk_data.obs.columns:
+            datasets = chunk_data.obs['dataset'].unique().tolist()
+        
+        return ChunkMetadata(
+            chunk_id=chunk_idx,
+            chunk_path=chunk_filename,
+            n_cells=chunk_data.n_obs,
+            n_genes=chunk_data.n_vars,
+            srx_accessions=srx_accessions,
+            datasets=datasets,
+            file_size_mb=file_size_mb,
+            cell_start_idx=cell_start_idx,
+            cell_end_idx=cell_end_idx
+        )
+    
+    def _save_processing_index(self, processing_index: ProcessingIndex):
+        """Save the processing index and related files."""
+        logger.info("Step 8: Saving processing index and metadata...")
+        
+        # Save main index
+        index_path = self.output_path / "chunk_index.json"
+        processing_index.save(index_path)
+        
+        # Save gene list separately for easy access
+        gene_list_path = self.output_path / "gene_list.json"
+        with open(gene_list_path, 'w') as f:
+            json.dump(processing_index.gene_list, f, indent=2)
+        
+        # Save processing configuration
+        config_path = self.output_path / "processing_config.json"
+        with open(config_path, 'w') as f:
+            json.dump(processing_index.processing_config, f, indent=2, default=str)
+        
+        # Save processing log
+        self._save_processing_log()
+        
+        # Save summary statistics
+        self._save_chunk_summary(processing_index)
+        
+        logger.info(f"Processing index and metadata saved to: {self.output_path}")
+    
+    def _save_chunk_summary(self, processing_index: ProcessingIndex):
+        """Save summary statistics about the chunks."""
+        summary = {
+            'overview': {
+                'total_chunks': processing_index.total_chunks,
+                'total_cells': processing_index.total_cells,
+                'total_genes': len(processing_index.gene_list),
+                'chunk_size': self.chunk_size,
+                'processing_timestamp': processing_index.processing_timestamp
+            },
+            'chunks': []
+        }
+        
+        # Add chunk details
+        for chunk in processing_index.chunks:
+            chunk_summary = {
+                'chunk_id': chunk.chunk_id,
+                'file': chunk.chunk_path,
+                'cells': chunk.n_cells,
+                'size_mb': round(chunk.file_size_mb, 2),
+                'srx_count': len(chunk.srx_accessions),
+                'dataset_count': len(chunk.datasets)
+            }
+            summary['chunks'].append(chunk_summary)
+        
+        # Add storage statistics
+        total_size_mb = sum(chunk.file_size_mb for chunk in processing_index.chunks)
+        avg_chunk_size_mb = total_size_mb / len(processing_index.chunks)
+        
+        summary['storage'] = {
+            'total_size_mb': round(total_size_mb, 2),
+            'avg_chunk_size_mb': round(avg_chunk_size_mb, 2),
+            'compression_level': self.compression_level
+        }
+        
+        # Save summary
+        summary_path = self.output_path / "chunk_summary.json"
+        with open(summary_path, 'w') as f:
+            json.dump(summary, f, indent=2)
+        
+        logger.info(f"Chunk summary saved: {summary_path}")
+        logger.info(f"Total storage: {total_size_mb:.1f} MB across {len(processing_index.chunks)} chunks")
 
 def main():
     """Command-line interface for data processing."""

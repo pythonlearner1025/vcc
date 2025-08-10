@@ -1,0 +1,75 @@
+{
+  "input_paths": {
+    "vcc_data_path": "/workspace/vcc/data/raw/competition_support_set",
+    "k562_small": "/workspace/vcc/data/raw/competition_support_set/k562.h5"
+  },
+  "output_path": "/workspace/vcc/data/processed/chunked_test",
+  "chunk_size": 15000,
+  "compression_level": 4,
+  
+  "datasets": {
+    "k562_small": {
+      "include": true,
+      "cell_type": "K562",
+      "max_cells": 30000,
+      "required": true,
+      "description": "Quick test dataset using K562 cells"
+    }
+  },
+  
+  "filtering": {
+    "min_cells_per_dataset": 500,
+    "min_genes_per_dataset": 1000,
+    "max_cells_per_dataset": 50000
+  },
+  
+  "quality_control": {
+    "filter_cells": true,
+    "max_mitochondrial_percent": 25,
+    "min_umi_count": 200,
+    "max_umi_count": 100000,
+    "min_gene_count": 100,
+    "max_gene_count": 10000
+  },
+  
+  "gene_processing": {
+    "use_vcc_genes": true,
+    "order_by_vcc": true,
+    "strict_vcc_compliance": false,
+    "filter_by_variance": false
+  },
+  
+  "cell_processing": {
+    "filter_by_gene_count": true,
+    "min_genes_per_cell": 100,
+    "normalize_counts": true,
+    "log_transform": true,
+    "scale_features": false
+  },
+  
+  "subset_to_control_cells": false,
+  
+  "control_indicators": {
+    "target_gene": ["non-targeting", "control", "ctrl", "negative", "scramble"],
+    "perturbation_type": ["control", "ctrl", "none", "negative"],
+    "condition": ["control", "ctrl", "dmso", "vehicle", "untreated"]
+  },
+  
+  "output_settings": {
+    "save_raw_counts": true,
+    "save_normalized_counts": true,
+    "save_metadata": true,
+    "compression_algorithm": "gzip",
+    "create_backup": false
+  },
+  
+  "processing_steps": [
+    "load_datasets",
+    "filter_datasets", 
+    "quality_control",
+    "combine_datasets",
+    "process_genes",
+    "process_cells",
+    "create_chunks"
+  ]
+}

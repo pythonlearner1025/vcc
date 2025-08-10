@@ -1,0 +1,25 @@
+[
+  {
+    "step": "dataset_loading",
+    "timestamp": "2025-08-03T20:16:49.796638",
+    "details": {
+      "loaded_datasets": []
+    }
+  },
+  {
+    "step": "dataset_filtering",
+    "timestamp": "2025-08-03T20:16:49.796710",
+    "details": {
+      "removed_datasets": [],
+      "retained_datasets": []
+    }
+  },
+  {
+    "step": "quality_control",
+    "timestamp": "2025-08-03T20:16:49.796743",
+    "details": {
+      "filter_cells": true,
+      "max_mitochondrial_percent": 20
+    }
+  }
+]

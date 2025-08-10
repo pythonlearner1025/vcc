@@ -1,0 +1,138 @@
+{
+  "input_paths": {
+    "vcc_data_path": "/workspace/vcc/data/raw/competition_support_set",
+    "k562": "/workspace/vcc/data/raw/competition_support_set/k562.h5",
+    "jurkat": "/workspace/vcc/data/raw/competition_support_set/jurkat.h5",
+    "hepg2": "/workspace/vcc/data/raw/competition_support_set/hepg2.h5",
+    "rpe1": "/workspace/vcc/data/raw/competition_support_set/rpe1.h5",
+    "k562_gwps": "/workspace/vcc/data/raw/competition_support_set/k562_gwps.h5",
+    "competition_train": "/workspace/vcc/data/raw/competition_support_set/competition_train.h5"
+  },
+  "output_path": "/workspace/vcc/data/processed/chunked",
+  "chunk_size": 50000,
+  "compression_level": 9,
+  
+  "datasets": {
+    "k562": {
+      "include": true,
+      "cell_type": "K562",
+      "max_cells": null,
+      "required": false,
+      "description": "K562 erythroleukemia cell line - full dataset"
+    },
+    "jurkat": {
+      "include": true,
+      "cell_type": "Jurkat",
+      "max_cells": null,
+      "required": false,
+      "description": "Jurkat T-lymphocyte cell line - full dataset"
+    },
+    "hepg2": {
+      "include": true,
+      "cell_type": "HepG2",
+      "max_cells": null,
+      "required": false,
+      "description": "HepG2 hepatocellular carcinoma cell line - full dataset"
+    },
+    "rpe1": {
+      "include": true,
+      "cell_type": "RPE1",
+      "max_cells": null,
+      "required": false,
+      "description": "RPE1 retinal pigment epithelial cell line - full dataset"
+    },
+    "k562_gwps": {
+      "include": true,
+      "cell_type": "K562_GWPS",
+      "max_cells": null,
+      "required": false,
+      "description": "K562 genome-wide perturbation screen - full dataset"
+    },
+    "competition_train": {
+      "include": true,
+      "cell_type": "Mixed",
+      "max_cells": null,
+      "required": true,
+      "description": "Competition training dataset - full scale"
+    }
+  },
+  
+  "filtering": {
+    "min_cells_per_dataset": 0,
+    "min_genes_per_dataset": 0,
+    "max_cells_per_dataset": null
+  },
+  
+  "quality_control": {
+    "filter_cells": false,
+    "max_mitochondrial_percent": 15,
+    "min_umi_count": 1000,
+    "max_umi_count": 100000,
+    "min_gene_count": 500,
+    "max_gene_count": 10000
+  },
+  
+  "gene_processing": {
+    "use_vcc_genes": true,
+    "order_by_vcc": true,
+    "strict_vcc_compliance": true,
+    "filter_by_variance": false,
+    "min_variance": 0.05,
+    "hvg_selection": false,
+    "n_top_genes": 18808
+  },
+  
+  "cell_processing": {
+    "filter_by_gene_count": false,
+    "min_genes_per_cell": 0,
+    "normalize_counts": false,
+    "log_transform": false,
+    "scale_features": false,
+    "remove_batch_effects": false
+  },
+  
+  "subset_to_control_cells": true,
+  
+  "control_indicators": {
+    "target_gene": ["non-targeting", "control", "ctrl", "negative", "scramble", "NT"],
+    "perturbation_type": ["control", "ctrl", "none", "negative", "NT"],
+    "condition": ["control", "ctrl", "dmso", "vehicle", "untreated", "baseline"]
+  },
+  
+  "output_settings": {
+    "save_raw_counts": true,
+    "save_normalized_counts": false,
+    "save_metadata": true,
+    "compression_algorithm": "gzip",
+    "create_backup": true,
+    "validate_chunks": true
+  },
+  
+  "processing_steps": [
+    "validate_inputs",
+    "load_datasets",
+    "filter_datasets", 
+    "quality_control",
+    "combine_datasets",
+    "process_genes",
+    "process_cells",
+    "create_chunks",
+    "validate_output"
+  ],
+
+  "validation": {
+    "verify_gene_order": true,
+    "check_data_integrity": true,
+    "validate_metadata": true,
+    "log_statistics": true
+  },
+
+  
+  "parallel_processing": {
+    "use_multiprocessing": true,
+    "max_workers": 8,
+    "chunk_processing_parallel": true,
+    "memory_monitoring": true,
+    "progress_logging": true
+  }
+}
