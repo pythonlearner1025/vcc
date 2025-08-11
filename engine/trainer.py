@@ -62,6 +62,8 @@ class LossSpec:
 class ExperimentConfig:
     run_name: str
     eval_mode: bool = False
+    test_prep_mode: bool = False
+    test_genes_path: str = "."
     output_dir: str = "checkpoints"
     seed: int = 42
     device: str = "cuda"
@@ -337,7 +339,8 @@ class Trainer:
                 with get_autocast_ctx(self.model, autocast_dtype):
                     losses = self.loss_adapter(self.model, batch_std, steps_done, total_val_steps)
                 loss, raw_loss = losses
-                val_losses.append(loss.item())
+                print(loss.item(), raw_loss.item())
+                val_losses.append(raw_loss.item())
                 steps_done += 1
                 print(f"steps_done: {steps_done}")
 
@@ -356,7 +359,7 @@ class Trainer:
         full_eval = bool(getattr(getattr(self.model, "config", object()), "full_eval", False))
         if full_eval:
             try:
-                from evaluate import _prepare_gene_mappings, _run_validation_merged
+                from evaluate import _prepare_gene_mappings, _run_validation_merged, _run_test_generation
                 # Prepare gene mappings based on the dataset's AnnData
                 # Attempt to locate paths from model.config; fallback to dataset attributes
                 cfg_obj = getattr(self.model, "config", None)
@@ -375,9 +378,14 @@ class Trainer:
 
                 # Build simple args namespace for evaluate routine
                 class _Args:
-                    val_genes_number = 10
-                    val_set_size = getattr(cfg_obj, "vcc_set_size", getattr(cfg_obj, "pretrain_batch_size", 16))
+                    set_size = ds_spec.dataloader_args.get("set_size", getattr(cfg_obj, "pretrain_batch_size", 32))
+                    vocab_size = ds_spec.dataloader_args.get("vocab_size", getattr(cfg_obj, "vocab_size", 128))
+                    batch_size = ds_spec.dataloader_args.get("batch_size", getattr(cfg_obj, "batch_size", 4))
+                    test_genes_path = self.cfg.test_genes_path
                     blacklist_path = getattr(cfg_obj, "blacklist_path", "assets/blacklist.txt")
+                
+                # cfg datasets
+                # 
 
                 # Create output dir inside run_dir
                 out_dir = self.run_dir / f"eval_ep{self.global_epoch}"
@@ -398,26 +406,44 @@ class Trainer:
                         diffusion_obj = _PMD(cfg_obj)
                     except Exception:
                         diffusion_obj = None
-
-                _run_validation_merged(
-                    cfg_obj,
-                    self.model,
-                    diffusion_obj,
-                    tokenizer,
-                    detok,
-                    gene_names,
-                    hvg_to_full,
-                    hvg_gene_ids,
-                    _Args,
-                    self.device,
-                    out_dir,
-                    batch_to_idx=self.global_batch_mapping,
-                    val_ds=val_dataset,
-                    val_dl=val_loader,
-                    max_genes=getattr(cfg_obj, "max_eval_genes", 10),
-                )
+                
+                if self.cfg.test_prep_mode:
+                    print("test prep mode")
+                    _run_test_generation(
+                        cfg_obj,
+                        self.model,
+                        diffusion_obj,
+                        detok,
+                        gene_names,
+                        hvg_to_full,
+                        hvg_gene_ids,
+                        _Args,
+                        self.device,
+                        out_dir,
+                        1
+                    )
+                else:
+                    _run_validation_merged(
+                        cfg_obj,
+                        self.model,
+                        diffusion_obj,
+                        tokenizer,
+                        detok,
+                        gene_names,
+                        hvg_to_full,
+                        hvg_gene_ids,
+                        _Args,
+                        self.device,
+                        out_dir,
+                        batch_to_idx=self.global_batch_mapping,
+                        val_ds=val_dataset,
+                        val_dl=val_loader,
+                        max_genes=getattr(cfg_obj, "max_eval_genes", 10),
+                    )
             except Exception as e:
+                import traceback
                 print(f"[eval] full_eval failed: {e}")
+                print(f"[eval] Traceback:\n{traceback.format_exc()}")
 
     def _train_phase(self, ds_spec: DatasetSpec, dataloader: DataLoader) -> None:
         device = self.device

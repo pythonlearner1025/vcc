@@ -135,7 +135,11 @@ def _prepare_gene_mappings(
 
 
 def _tokens_to_expression(tokens: torch.LongTensor, detokenizer) -> np.ndarray:
-    """Convert token tensor (B,N) to numpy float32 (B,N)."""
+    """Convert token tensor (..., N) to numpy float32 with the same leading shape.
+
+    Accepts either 2D or higher-rank tensors; the output numpy array preserves
+    the input shape and converts values to float32.
+    """
     with torch.no_grad():
         vals = detokenizer(tokens.cpu())  # (B,N)
     return vals.numpy().astype(np.float32)
@@ -228,54 +232,51 @@ def _run_validation_merged(
 
     steps = 0
     for sample in val_dl:
-        #if steps >= max_genes:
+        #if steps >= 1:
         #    break
         steps += 1
         print(f"num genes: {steps}")
         # Tokens from collator (already tokenised)
-        pert_tok = sample["tokens"].squeeze(0)   # (S,N) – perturbed tokens
-        ctrl_tok  = sample["control"].squeeze(0)  # (S,N) – control tokens
-        gene_idxs_raw = sample["target_gene_idx"]
-        gene_idxs = gene_idxs_raw.to(device, non_blocking=True)
-        batches = sample["batch_idx"]
-        S, N = pert_tok.shape
+        pert_tok = sample["tokens"]   # (B,S,N) – perturbed tokens
+        ctrl_tok  = sample["control"]  # (B,S,N) – control tokens
+        gene_idxs = sample["target_gene_idx"].to(device, non_blocking=True)  # (B,S)
+        batch_idx = sample["batch_idx"].to(device, non_blocking=True)        # (B,S)
+        B, S, N = pert_tok.shape
+        print(f"pert_tok.shape: {pert_tok.shape}")
 
         # Control set tokens are already provided by the collator
         tokens_ctrl = ctrl_tok.to(device, non_blocking=True)
-        # Also build float control baseline via detokeniser for metrics
-        #ctrl_expr = _tokens_to_expression(ctrl_tok, detokenizer)  # (S,N) float32
-        #ctrl_expr = detokenizer(ctrl_tok).to(device, non_blocking=True)
+        # Build float control baseline via detokeniser for metrics (CPU numpy)
+        ctrl_expr = _tokens_to_expression(ctrl_tok, detokenizer)  # (B,S,N) float32
 
-        batch_to_idx = val_ds.batch_to_idx
-        batch_idx = torch.tensor([batch_to_idx.get(b, 0) for b in batches], dtype=torch.long).to(device, non_blocking=True)
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+            # Sampler expects explicit (B,S,N) shape
             pred_tokens = diffusion.p_sample_loop(
                 model,
-                shape=(S, cfg.n_genes),
+                shape=(B, S, cfg.n_genes),
                 control_set=tokens_ctrl,
                 target_gene_idx=gene_idxs,
-                batch_idx=batch_idx,
-                device=device,
-                return_aux=False
+                batch_idx=batch_idx
             )
 
-        # Convert tokens → expression.
-        # If Δ-training, add predicted Δ back to control baseline; otherwise treat as absolute.
-        pred_expr_2k = _tokens_to_expression(pred_tokens, detokenizer)
+        pred_expr_2k = _tokens_to_expression(pred_tokens, detokenizer)  # (B,S,N)
         # Ground-truth perturbed expression from provided perturbed tokens
-        true_expr_2k = _tokens_to_expression(pert_tok, detokenizer)
+        true_expr_2k = _tokens_to_expression(pert_tok, detokenizer)     # (B,S,N)
 
-        # Map to 18 k space
-        pred_full = _build_18k_matrix(pred_expr_2k, hvg_to_full, len(gene_names))
-        true_full = _build_18k_matrix(true_expr_2k, hvg_to_full, len(gene_names))
-        ctrl_full = _build_18k_matrix(ctrl_expr, hvg_to_full, len(gene_names))
+        # Map to 18 k space per batch element
+        for b in range(B):
+            pred_full = _build_18k_matrix(pred_expr_2k[b], hvg_to_full, len(gene_names))
+            true_full = _build_18k_matrix(true_expr_2k[b], hvg_to_full, len(gene_names))
+            ctrl_full = _build_18k_matrix(ctrl_expr[b], hvg_to_full, len(gene_names))
 
-        X_true_parts.extend([ctrl_full, true_full])
-        X_pred_parts.extend([ctrl_full, pred_full])
-        # Append labels for control and perturbed cells (S each)
-        obs_labels.extend(["non-targeting"] * S + [gene_names[i] for i in gene_idxs_raw])
+            X_true_parts.extend([ctrl_full, true_full])
+            X_pred_parts.extend([ctrl_full, pred_full])
 
-
+            # Append labels for control and perturbed cells (S each) for this batch item
+            batch_gene_idxs = gene_idxs[b].view(-1).tolist()
+            obs_label = ["non-targeting"] * S + [gene_names[i] for i in batch_gene_idxs]
+            obs_labels.extend(obs_label)
+    
     X_true = np.concatenate(X_true_parts, axis=0)
     X_pred = np.concatenate(X_pred_parts, axis=0)
     obs_df = pd.DataFrame({"target_gene": obs_labels})
@@ -329,6 +330,10 @@ def _run_test_generation(
     ‣ Performs sampling *and* detokenisation entirely on the GPU.
     ‣ Only the final (already‑dense) 18 k‑gene expression matrix is copied
       back to the host – once per mini‑batch.
+      # required
+      - cfg.vocab_size
+      - cfg.vcc_set_size 
+      - cfg.n_genes
     """
     import pandas as pd
     import scanpy as sc
@@ -342,21 +347,34 @@ def _run_test_generation(
     full_idx_t    = hvg_to_full_t[valid_mask_t].long()
     n_full        = len(gene_names)
 
-    # Helper to scatter 2 k expression into 18 k space on GPU
-    def _scatter_to_full(expr_2k: torch.Tensor) -> torch.Tensor:
-        full = torch.zeros(expr_2k.size(0), n_full,
-                           dtype=expr_2k.dtype,
-                           device=expr_2k.device)
-        full.index_copy_(1, full_idx_t, expr_2k[:, valid_mask_t])
+    # Helper to scatter n k expression into 18 k space on GPU
+    def _scatter_to_full(expr_nk: torch.Tensor) -> torch.Tensor:
+        full = torch.zeros(expr_nk.size(0), n_full,
+                           dtype=expr_nk.dtype,
+                           device=expr_nk.device)
+        full.index_copy_(1, full_idx_t, expr_nk[:, valid_mask_t])
         return full
 
-    # Use Dleta tokenizer
-    tokenizer, _ = create_logbin_tokenizer(cfg.vocab_size)
+    # Use config-driven sizes (args may not define these)
+    vocab_size = int(getattr(cfg, "vocab_size"))
+    set_size = int(getattr(cfg, "vcc_set_size", 64))
+    batch_size_cfg = int(getattr(cfg, "vcc_batch_size", 1))
+
+    tokenizer, _ = create_logbin_tokenizer(vocab_size)
+
+    # Precompute GPU detokenisation bin centres once
+    # bins length == vocab_size; bins[1:] are log edges; last centre uses upper bound
+    bins_dev = tokenizer.bins.to(device)
+    bin_centres_dev = torch.zeros(vocab_size, device=device, dtype=torch.float32)
+    bin_centres_dev[0] = 0.0
+    if vocab_size > 2:
+        bin_centres_dev[1:-1] = (bins_dev[1:-1] + bins_dev[2:]) * 0.5
+    bin_centres_dev[-1] = bins_dev[-1]
 
     # ------------------------------------------------------------------
     # Load control cells once, keep in backed mode
     # ------------------------------------------------------------------
-    adata_ctrl = sc.read_h5ad(cfg.finetune_data_path, backed="r")
+    adata_ctrl = sc.read_h5ad("/competition_train.h5", backed="r")
     ctrl_idx   = np.where(adata_ctrl.obs["target_gene"].values == "non-targeting")[0]
     if len(ctrl_idx) == 0:
         raise RuntimeError("Dataset contains no non‑targeting control cells")
@@ -371,15 +389,18 @@ def _run_test_generation(
         dtype=np.int32,
     )
 
+    # Materialise control HVG matrix once into host RAM to avoid repeated CSR->dense conversions
+    ctrl_full_block = adata_ctrl[ctrl_idx, hvg_idx].X
+    if not isinstance(ctrl_full_block, np.ndarray):
+        ctrl_full_block = ctrl_full_block.toarray()
+    ctrl_full_block = ctrl_full_block.astype(np.float32, copy=False)
+
     # RNG for control‑cell sampler
     rng = np.random.default_rng(0)
-
     def _next_control_expr_cpu() -> np.ndarray:
         """Sample S control cells → (S,2000) FP32 numpy (CPU)."""
-        sel = rng.choice(ctrl_idx, size=cfg.vcc_set_size, replace=False)
-        X   = adata_ctrl[sel, hvg_idx].X
-        return X.toarray().astype(np.float32) if not isinstance(X, np.ndarray) else X
-
+        sel_pos = rng.choice(ctrl_full_block.shape[0], size=S, replace=False)
+        return ctrl_full_block[sel_pos]
     # ------------------------------------------------------------------
     # Main generation loop
     # ------------------------------------------------------------------
@@ -391,61 +412,73 @@ def _run_test_generation(
     all_expr_full_cpu: List[np.ndarray] = []
     all_obs_labels:   List[str]        = []
 
-    mask_token = cfg.vocab_size - 1
-    S          = cfg.vcc_set_size
+    mask_token = vocab_size
+    S          = set_size 
 
     model.eval().requires_grad_(False)
     torch.cuda.empty_cache()
 
-    for gene in tqdm(test_genes, desc="test‑genes"):
-        is_control = gene == "non-targeting"
+    # Allow batching multiple target genes per diffusion call (B > 1)
+    B_cfg = batch_size_cfg
+    for i in tqdm(range(0, len(test_genes), B_cfg), desc="test‑genes"):
+        batch_genes = test_genes[i:i + B_cfg]
 
-        # Pre‑compute target‑gene index tensor (GPU) if needed
-        if not is_control and gene not in gene_name_to_hvg:
-            print(f"[WARN] gene '{gene}' not in HVG list – skipping")
-            continue
-        if not is_control:
-            tgt_idx_t = torch.full((S,), gene_name_to_hvg[gene],
-                                   dtype=torch.long,
-                                   device=device)
-
+        # Prepare control sets for each batch element: (B_eff, S, 2000)
+        B_eff = len(batch_genes)
         for _ in range(test_sample_size):
-            # ---------- control cells CPU → GPU (once per mini‑batch) ----------
-            ctrl_expr_cpu = _next_control_expr_cpu()
-            tokens_ctrl   = tokenizer(ctrl_expr_cpu)             # CPU LongTensor
-            tokens_ctrl   = tokens_ctrl.pin_memory()             # allow async copy
-            tokens_ctrl_t = tokens_ctrl.to(device, non_blocking=True)
+            ctrl_expr_cpu_batch = np.stack([
+                _next_control_expr_cpu() for _ in range(B_eff)
+            ], axis=0)  # (B_eff, S, 2000)
 
-            if is_control:
-                # Simply return real control cells – still scatter on GPU
+            # Tokenise controls directly on GPU to avoid CPU round-trips
+            ctrl_expr_t = torch.from_numpy(ctrl_expr_cpu_batch).to(device, non_blocking=True)
+            tokens_ctrl_t = tokenizer(ctrl_expr_t).long()
+
+            # Split into predicted vs control-only entries
+            pred_indices: List[int] = []
+            pred_gene_ids: List[int] = []
+            control_indices: List[int] = []
+            for b, g in enumerate(batch_genes):
+                gid = gene_name_to_hvg.get(g)
+                if gid is None:
+                    print(f"[WARN] gene '{g}' not in HVG list – skipping")
+                    # treat as no-op for this position
+                    continue
+                pred_indices.append(b)
+                pred_gene_ids.append(gid)
+
+            # Generate predictions for non-control targets in the batch
+            if pred_indices:
+                B_pred = len(pred_indices)
+                tgt_idx_t = torch.as_tensor(pred_gene_ids, dtype=torch.long, device=device)
+                tgt_idx_t = tgt_idx_t.view(B_pred, 1).expand(B_pred, S)  # (B_pred,S)
+                batch_idx_t = torch.zeros((B_pred, S), dtype=torch.long, device=device)
+                
+                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                    pred_tokens = diffusion.p_sample_loop(
+                        model,
+                        shape=(B_pred, S, cfg.n_genes),
+                        control_set=tokens_ctrl_t.index_select(0, torch.as_tensor(pred_indices, device=device)),
+                        target_gene_idx=tgt_idx_t,
+                        batch_idx=batch_idx_t
+                    )  # (B_pred,S,N)
+
+                # Detokenise on GPU using precomputed bin centres
+                pred_tokens_clamped = pred_tokens.clamp_(0, vocab_size - 1)
+                pred_expr_2k = bin_centres_dev[pred_tokens_clamped]  # (B_pred,S,N) float
+                # Scatter each predicted target to 18k and append
+                for j, b in enumerate(pred_indices):
+                    expr_full_cpu = _scatter_to_full(pred_expr_2k[j].view(S, -1)).detach().cpu().numpy()
+                    all_expr_full_cpu.append(expr_full_cpu)
+                    all_obs_labels.extend([batch_genes[b]] * S)
+
+            # Append control-only entries directly
+            for b in control_indices:
                 expr_full_cpu = _scatter_to_full(
-                    torch.from_numpy(ctrl_expr_cpu).to(device)) \
-                    .cpu().numpy()
-            else:
-                # ------------------ forward diffusion sampling ------------------
-                pred_tokens = diffusion.p_sample_loop(
-                    model,
-                    shape          = (S, cfg.n_genes),
-                    control_set    = tokens_ctrl_t,
-                    target_gene_idx= tgt_idx_t,
-                    batch_idx      = torch.zeros(S, dtype=torch.long,
-                                                 device=device),
-                    device         = device,
-                )
-
-                # ---------------- on‑GPU detokenise & Δ‑addition -----------------
-                pred_expr_2k = detokenizer(pred_tokens)           # float32
-                if cfg.target_is_delta:
-                    ctrl_expr_t = torch.from_numpy(ctrl_expr_cpu)\
-                                        .to(device, non_blocking=True)
-                    pred_expr_2k = torch.clamp(ctrl_expr_t + pred_expr_2k, min=0)
-
-                expr_full_cpu = _scatter_to_full(pred_expr_2k).cpu().numpy()
-
-            # book‑keeping
-            all_expr_full_cpu.append(expr_full_cpu)
-            all_obs_labels.extend([gene] * S if not is_control
-                                  else ["non-targeting"] * S)
+                     torch.from_numpy(ctrl_expr_cpu_batch[b]).to(device)
+                 ).detach().cpu().numpy()
+                all_expr_full_cpu.append(expr_full_cpu)
+                all_obs_labels.extend(["non-targeting"] * S)
 
     # ------------------------------------------------------------------
     # Concatenate & save
@@ -462,9 +495,9 @@ def _run_test_generation(
     # Check if we already have control cells from test_genes
     n_existing_controls = all_obs_labels.count("non-targeting")
     
-    if n_existing_controls < cfg.vcc_set_size:
-        # Add control cells to reach at least cfg.vcc_set_size total
-        n_to_add = cfg.vcc_set_size - n_existing_controls
+    if n_existing_controls < set_size:
+        # Add control cells to reach at least args.val_set_size total
+        n_to_add = set_size - n_existing_controls
         print(f"Appending {n_to_add} real control cells (existing: {n_existing_controls})...")
         
         # Sample control cells
@@ -475,7 +508,7 @@ def _run_test_generation(
         # Convert to full gene space on GPU
         ctrl_expr_full = _scatter_to_full(
             torch.from_numpy(ctrl_expr_2k).to(device)
-        ).cpu().numpy()
+        ).detach().cpu().numpy()
         
         # Append to existing data
         X_full = np.vstack([X_full, ctrl_expr_full])
@@ -575,5 +608,5 @@ if __name__ == "__main__":
     main()
 
 '''
-cell-eval prep -i evals/eval_20250805_051322/test_predictions_plus_ctrl.h5ad -g /workspace/vcc/data/vcc_data/gene_names.csv
+cell-eval prep -i checkpoints/scrna_to_vcc_diffusion_20250811_002641/eval_ep9/test_predictions.h5ad -g /workspace/vcc/data/vcc_data/gene_names.csv
 '''

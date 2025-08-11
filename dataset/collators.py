@@ -59,7 +59,7 @@ class OrionCollator:
             ctrl = sample["control_expr"]    # (S,N)
             S, N = pert.shape
             # Tokenise
-            pert_tok = self.tokenizer((per).unsqueeze(0)).squeeze(0)  # (S,N)
+            pert_tok = self.tokenizer(pert)  # (S,N)
             ctrl_tok = self.tokenizer(ctrl)  # (S,N)
             perts.append(pert_tok.long())
             ctrls.append(ctrl_tok.long())
@@ -103,7 +103,7 @@ class VCCCollator:
             pert = sample["perturbed_expr"].squeeze()  # (S,N)
             ctrl = sample["control_expr"].squeeze()    # (S,N)
             S, N = pert.shape
-            pert_tok = self.tokenizer(pert.unsqueeze(0)).squeeze(0)  # (S,N)
+            pert_tok = self.tokenizer(pert)  # (S,N)
             ctrl_tok = self.tokenizer(ctrl)  # (S,N)
             perts.append(pert_tok.long())
             ctrls.append(ctrl_tok.long())
@@ -116,12 +116,6 @@ class VCCCollator:
         control = torch.stack(ctrls, dim=0)  # (B,S,N)
         batch_idx = torch.stack(batch_ids, dim=0)  # (B,S,)
         target_gene_idx = torch.stack(tgt_ids, dim=0)  # (B,S,)
-        
-        # TODO remove
-        #control_zeros = torch.zeros_like(control)  # (B,S,N)
-        #target_gene_idx = torch.zeros_like(target_gene_idx)  # (B,S,N)
-        #batch_idx = torch.zeros_like(batch_idx)  # (B,S,)
-
         delta_means = torch.stack(delta_means, dim=0)  # (B,S,)
         out = {
             "tokens": tokens,

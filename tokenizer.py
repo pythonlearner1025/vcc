@@ -22,9 +22,11 @@ class TokenizedScRNADataset(Dataset):
 
 class SimpleTokenizer:
     def __init__(self, vocab_size, max_value):
-        self.vocab_size = vocab_size - 1  # Reserve last token for [MASK]
+        # Use full data vocabulary [0 .. vocab_size-1] for value tokens.
+        # The diffusion model reserves the mask token at id == vocab_size.
+        self.vocab_size = vocab_size
         self.max_value = max_value
-        self.mask_token = vocab_size - 1
+        self.mask_token = vocab_size  # not used here; mask handled by diffusion
         
         # Define bins for expression values - use log-scale for better distribution
         # Bin 0: exactly 0 (very common in scRNA-seq)
@@ -33,7 +35,7 @@ class SimpleTokenizer:
         self.bins[1:] = torch.logspace(
             np.log10(0.1), 
             np.log10(max_value), 
-            self.vocab_size - 1 # -2 because its inclusive
+            self.vocab_size - 1
         )
 
         self.normalize_checked = False 
@@ -80,7 +82,11 @@ class SimpleTokenizer:
             bin_centers[i] = (self.bins[i] + self.bins[i+1]) / 2
         bin_centers[-1] = self.bins[-1]  # Last bin uses upper bound
         
-        return bin_centers[tokens]
+        # Guard against occasional mask ids or out-of-range values by clamping
+        if not isinstance(tokens, torch.Tensor):
+            tokens = torch.as_tensor(tokens)
+        tokens_clamped = tokens.clamp(0, self.vocab_size - 1)
+        return bin_centers[tokens_clamped]
 
 def create_logbin_tokenizer(vocab_size: int = 64, max_value: float = 9.2):
     tokenizer = SimpleTokenizer(vocab_size, max_value)
