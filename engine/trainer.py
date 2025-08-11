@@ -402,8 +402,8 @@ class Trainer:
                 diffusion_obj = getattr(self.model, "_generic_trainer_diffusion", None)
                 if diffusion_obj is None:
                     try:
-                        from models.diffusion import PartialMaskingDiffusion as _PMD
-                        diffusion_obj = _PMD(cfg_obj)
+                        from models.diffusion import AbsorbingMaskMD4Continuous as _MD4
+                        diffusion_obj = _MD4(cfg_obj)
                     except Exception:
                         diffusion_obj = None
                 

@@ -695,458 +695,11 @@ class ConditionalDiffusionTransformer(nn.Module):
             "de_rank_score": self.de_rank_head(h).squeeze(-1),
         }
 
-class PartialMaskingDiffusion:
-    """Discrete diffusion with partial masking strategy."""
-    
-    def __init__(self, config: ConditionalModelConfig):
-        self.config = config
-        self.n_timesteps = config.n_timesteps
-        # Data vocabulary size (excludes [MASK])
-        self.data_vocab_size = config.vocab_size
-        self.mask_ratio = config.mask_ratio # TODO change this? 
-        # Dedicated [MASK] token id placed right after data vocab by default
-        self.mask_token_id: int = int(config.mask_token_id if config.mask_token_id is not None else self.data_vocab_size)
-        print(f'mask_token_id: {self.mask_token_id} (data_vocab_size={self.data_vocab_size})')
-        
-        # Cosine schedule
-        s = 0.008
-        steps = torch.arange(self.n_timesteps + 1, dtype=torch.float32)
-        alphas = torch.cos((steps / self.n_timesteps + s) / (1 + s) * math.pi * 0.5) ** 2
-        alphas = alphas / alphas[0]
-        base_probs = 1 - alphas[:-1]
-        # Finetune-time target: end at finetune_mask_ratio_end
-        eps = 1e-8
-        self.p_mask_probs = base_probs * (self.config.finetune_mask_ratio_end / (base_probs[-1] + eps))
-        # Pretrain-time target: end at pretrain_mask_ratio
-        self.p_mask_probs_pretrain = base_probs * (self.config.pretrain_mask_ratio / (base_probs[-1] + eps))
-        
-        # Load token weights for frequency-aware masking
-        self.token_weights = None
-        if config.token_distribution_json:
-            self.token_weights = self._compute_token_mask_weights(config.token_distribution_json)
-    
-    def _compute_token_mask_weights(self, token_distribution_json: str, smoothing: float = 1.0) -> torch.Tensor:
-        """Compute token mask weights based on inverse frequency."""
-        with open(token_distribution_json, 'r') as f:
-            token_counts = json.load(f)
-        
-        counts = np.zeros(self.data_vocab_size)
-        total_count = 0
-        for k, v in token_counts.items():
-            k = int(k)
-            if k < self.data_vocab_size:
-                counts[k] = v
-                total_count += v
-        
-        # Calculate frequencies
-        frequencies = counts / (total_count + 1e-10)
-        
-        # For tokens not in the distribution, use median frequency
-        seen_mask = counts > 0
-        if seen_mask.any():
-            median_freq = np.median(frequencies[seen_mask])
-        else:
-            median_freq = 1.0 / self.data_vocab_size
-        
-        # Set frequency for unseen tokens
-        frequencies[~seen_mask] = median_freq
-        
-        # Compute weights from frequencies with smoothing
-        # Higher weight for rarer tokens. Use a gentle power law to avoid extreme values.
-        # Example: weight ∝ (1 / (f + eps))^alpha with alpha in [0,1]
-        eps = smoothing / self.data_vocab_size
-        alpha = 0.5
-        weights = (1.0 / (frequencies + eps)) ** alpha
-        
-        # Normalize so average weight is 1.0 (preserves overall mask rate)
-        weights = np.minimum(weights / weights.mean(), 4.0)
-        
-        return torch.tensor(weights, dtype=torch.float32)
-    
-    
-    def q_sample(
-        self, 
-        x_start: torch.LongTensor, 
-        t: torch.LongTensor,
-        mask_ratio: float | torch.Tensor,
-        step: int = 0,
-    ) -> Tuple[torch.LongTensor, torch.BoolTensor]:
-        """
-        Forward diffusion: partially mask tokens based on timestep.
-        
-        Returns:
-            x_noisy: Partially masked tokens
-            mask: Boolean mask indicating which positions were masked
-        """
-        B, S, N = x_start.shape
-        device = x_start.device
-        # Resolve mask token id
-        mask_token = self.mask_token_id
-
-        # Use provided mask ratio; support per-sample tensors and floats
-        if torch.is_tensor(mask_ratio):
-            mask_prob = mask_ratio.to(device).view(B)
-        else:
-            mask_prob = torch.full((B,), float(mask_ratio), device=device)
-        
-        if self.token_weights is None:
-            # Uniform masking per-position
-            rand = torch.rand(B, S, N, device=device)
-            mask = rand < mask_prob.view(B, 1, 1)
-        else:
-            # Token-aware masking with annealing
-            if self.config.token_weighting_annealing_steps is None or self.config.token_weighting_annealing_steps == 0:
-                # No annealing - use full frequency-based masking
-                annealing_factor = 1.0
-            else:
-                annealing_factor = min(1.0, step / self.config.token_weighting_annealing_steps)
-            
-            # Get frequency-based weights for tokens
-            freq_weights = self.token_weights.to(device)[x_start]  # shape: [B, S, N]
-            
-            # Blend uniform weights (1.0) with frequency weights based on annealing
-            weights = (1.0 - annealing_factor) + annealing_factor * freq_weights 
-            
-            # Scale mask probability by token weight
-            scaled_probs = weights * mask_prob.view(B, 1, 1)
-            rand = torch.rand(B, S, N, device=device)
-            mask = rand < scaled_probs.clamp(0, 1)
-        
-        # Apply mask
-        x_noisy = torch.where(mask, mask_token, x_start)
-        return x_noisy, mask
-
-    @staticmethod
-    @torch.no_grad()
-    def build_de_targets(delta, signif_mode="percentile", signif_arg=0.10, mlm_mask=None):
-        B, N = delta.shape
-        abs_delta = delta.abs()
-        if mlm_mask is None:
-            valid_mask = torch.isfinite(delta)
-        else:
-            valid_mask = torch.isfinite(delta) & mlm_mask
-        de_sig = torch.zeros_like(abs_delta, dtype=torch.bool)
-        if signif_mode == "percentile":
-            for b in range(B):
-                vb = valid_mask[b]
-                if vb.sum() == 0: continue
-                k = max(1, int(vb.sum().item() * signif_arg))
-                vals = abs_delta[b][vb]
-                thr = vals.topk(k).values[-1]
-                de_sig[b] = (abs_delta[b] >= thr) & vb
-        else:
-            de_sig = (abs_delta >= signif_arg) & valid_mask
-        de_dir     = (delta > 0).long()
-        rank_score = abs_delta
-        return de_sig, de_dir, rank_score, valid_mask
-
-    def _bce_with_logits_masked(self, logits: torch.Tensor, target: torch.Tensor, mask: torch.Tensor, pos_weight: Optional[float] = None):
-        # logits/target/mask: (B, N)
-        if pos_weight is not None:
-            pw = torch.tensor(pos_weight, device=logits.device, dtype=logits.dtype)
-            loss_fn = nn.BCEWithLogitsLoss(reduction="none", pos_weight=pw)
-        else:
-            loss_fn = nn.BCEWithLogitsLoss(reduction="none")
-        loss = loss_fn(logits, target.float())
-        denom = mask.float().sum().clamp_min(1.0)
-        loss = (loss * mask.float()).sum() / denom
-        return loss
-
-    def _ce_masked(self, logits: torch.Tensor, target: torch.Tensor, mask: torch.Tensor):
-        # logits: (B,N,2) | target: (B,N) | mask: (B,N)
-        loss = F.cross_entropy(logits.view(-1, 2), target.contiguous().view(-1), reduction="none")
-        loss = loss.view_as(mask)
-        denom = mask.float().sum().clamp_min(1.0)
-        loss = (loss * mask.float()).sum() / denom
-        return loss
-
-    def _ranknet_loss(self, scores, targets, mask, num_pairs=1024, margin=0.0, top_percent=0.1):
-        # scores/targets/mask: (B,S,N)
-        s = scores.mean(dim=1)   # (B,N)
-        t = targets.mean(dim=1)  # (B,N)
-        m = mask.any(dim=1)      # (B,N)
-        B, N = s.shape
-        eps = 0.05 * self.config.token_max_value
-        total = 0.0; denom = 0
-        for b in range(B):
-            valid = m[b]
-            tb, sb = t[b], s[b]
-            top_mask = valid & (tb >= eps)
-            bot_mask = valid & (tb <  eps)
-            if top_mask.sum()==0 or bot_mask.sum()==0: continue
-            k_top = max(1, int(top_mask.sum().item()*top_percent))
-            k_bot = max(1, int(bot_mask.sum().item()*top_percent))
-            top_idx = torch.where(top_mask)[0][ tb[top_mask].topk(k_top).indices ]
-            bot_idx = torch.where(bot_mask)[0][ (-tb[bot_mask]).topk(k_bot).indices ]
-            n = min(num_pairs, top_idx.numel(), bot_idx.numel())
-            if n == 0: continue
-            ti = top_idx[torch.randint(0, top_idx.numel(), (n,), device=sb.device)]
-            tj = bot_idx[torch.randint(0, bot_idx.numel(), (n,), device=sb.device)]
-            total += (-F.logsigmoid(sb[ti] - sb[tj] - margin)).mean()
-            denom += 1
-        return (total/denom) if denom>0 else s.new_zeros(())
-
-    def compute_loss(
-        self,
-        model: nn.Module,
-        x_start: torch.LongTensor,
-        control_set: Optional[torch.LongTensor] = None,
-        target_gene_idx: Optional[torch.LongTensor] = None,
-        batch_idx: Optional[torch.LongTensor] = None,
-        step: int = 0,
-        max_steps: int = 1000,
-        # ---- new knobs ----
-        lambda_de: float = 0.5,
-        lambda_dir: float = 0.2,
-        lambda_rank: float = 0.2,
-        de_pos_weight: Optional[float] = 2.0,
-        signif_mode: str = "percentile",
-        signif_arg: float = 0.1,
-        # ---- optional direct DE inputs ----
-        delta_means: Optional[torch.FloatTensor] = None,
-    ) -> torch.Tensor:
-        """
-        Compute training loss with partial masking and cross-attention conditioning.
-        """
-        
-        B, S, N = x_start.shape
-        device = x_start.device
-        
-        # Sample random timesteps from [1, T-1] to avoid zero-mask edge case at t=0
-        # (t=0 yields mask ratio ~0 which can create empty masks and NaNs)
-        t = torch.randint(1, self.n_timesteps, (B,), device=device)
-        
-        # Determine mask ratio from timestep schedule (t-dependent training)
-        is_conditioned = control_set is not None
-        if is_conditioned:
-            mask_ratio_vec = self.p_mask_probs.to(device)[t]
-        else:
-            mask_ratio_vec = self.p_mask_probs_pretrain.to(device)[t]
-
-        # Optionally inject some fully masked samples during finetuning to match sampling-time start
-        if is_conditioned and getattr(self.config, "finetune_full_mask_prob", 0.0) > 0.0:
-            full_mask_mask = (torch.rand(B, device=device) < float(self.config.finetune_full_mask_prob))
-            mask_ratio_vec = torch.where(full_mask_mask, torch.ones_like(mask_ratio_vec), mask_ratio_vec)
-        
-        # Partial masking using per-sample ratios
-        x_noisy, mlm_mask = self.q_sample(x_start, t, mask_ratio_vec, step=step)
-        '''
-        | Timestep | p\_mask\_probs | masked_tokens (total 6288)  |
-        | -------- | -------------- | - |
-        | 0        | 0.000000       | 0 |
-        | 1        | 0.011981       | 75 |
-        | 2        | 0.042598       | 268 |
-        | 3        | 0.090694       | 570 |
-        | 4        | 0.154449       | 971 |
-        | 5        | 0.231451       | 1455 |
-        | 6        | 0.318788       | 2004 |
-        | 7        | 0.413158       | 2598 |
-        | 8        | 0.510989       | 3213 |
-        | 9        | 0.608582       | 3826 |
-        | 10       | 0.702247       | 4415 |
-        | 11       | 0.788438       | 4957 |
-        | 12       | 0.863898       | 5432 |
-        | 13       | 0.925771       | 5821 |
-        | 14       | 0.971718       | 6110 |
-        | 15       | 1.000000       | 6288 |
-        '''
-        # Predict original tokens
-        control_ctx = control_set if isinstance(control_set, torch.Tensor) else None
-        out = model(
-            x_noisy, t,
-            target_gene_idx=target_gene_idx,
-            batch_idx=batch_idx,
-            control_context=control_ctx,
-            return_aux=True,
-        )
-        logits = out["logits"] if isinstance(out, dict) else out
-        # Restrict to data vocabulary during training loss
-        logits_data = logits[..., :self.data_vocab_size]
-        
-        # Compute loss only on masked positions; guard against rare empty-mask batches
-        if mlm_mask.any():
-            main_loss = F.cross_entropy(
-                logits_data[mlm_mask].view(-1, self.data_vocab_size),
-                x_start[mlm_mask].view(-1),
-                reduction='mean'
-            )
-        else:
-            main_loss = logits.new_zeros(())
-
-        # (4) aux DE losses (only if we have controls)
-        aux_loss = logits.new_zeros(())
-        aux_sig = logits.new_zeros(())
-        aux_dir = logits.new_zeros(())
-        aux_rank = logits.new_zeros(())
-
-        # TODO try with no ramp. No change in MLM loss with and without ramp
-        # makes me think it doesn't actually hurt
-        def ramp(step, frac=0.2):
-            return min(1.0, step / max(1, int(max_steps*frac)))
-        scale = ramp(step)
-        if control_set is not None and isinstance(out, dict) and (delta_means is not None):
-            # Reduce MLM mask over set dimension to per-gene mask for DE target building
-            mlm_mask_gene = mlm_mask.any(dim=1)  # (B, N)
-            de_sig, de_dir, rank_score, valid = self.build_de_targets(
-                delta_means,
-                signif_mode=signif_mode,
-                signif_arg=signif_arg,
-                mlm_mask=mlm_mask_gene,
-            )
-
-            B2, S2, N2, _ = logits.shape
-            # Expand per-gene targets across set dimension
-            de_sig      = de_sig.unsqueeze(1).expand(-1, S2, -1)       # (B, S, N)
-            de_dir_mask = de_sig                                      # (B, S, N)
-            de_dir      = de_dir.unsqueeze(1).expand(-1, S2, -1)       # (B, S, N)
-            rank_score  = rank_score.unsqueeze(1).expand(-1, S2, -1)   # (B, S, N)
-            valid       = valid.unsqueeze(1).expand(-1, S2, -1)        # (B, S, N)
-
-            # Restrict aux to masked genes at each set position
-            valid = valid & mlm_mask
-            de_dir_mask  = valid & de_dir_mask
-
-            # (4a) significance BCE (all valid positions)
-            aux_sig = self._bce_with_logits_masked(
-                out["de_sig_logit"], de_sig, valid, pos_weight=de_pos_weight
-            ) * lambda_de * scale
-            aux_loss = aux_loss + aux_sig
-
-            # (4b) direction CE (only where significant)
-            if de_dir_mask.any():
-                aux_dir = self._ce_masked(
-                    out["de_dir_logits"], de_dir, de_dir_mask
-                ) * lambda_dir * scale
-                aux_loss = aux_loss + aux_dir
-
-            # (4c) ranking on |Δ| using scalar score head
-            aux_rank = self._ranknet_loss(
-                out["de_rank_score"], rank_score, valid, num_pairs=512
-            ) * lambda_rank * scale
-            aux_loss = aux_loss + aux_rank
-        total_loss = main_loss + aux_loss
-
-        # Stash detailed loss breakdown for logging
-        try:
-            self._last_loss_stats = {
-                "loss_main": float(main_loss.detach().item()),
-                "loss_aux": float(aux_loss.detach().item()),
-                "loss_aux_de": float(aux_sig.detach().item()),
-                "loss_aux_dir": float(aux_dir.detach().item()),
-                "loss_aux_rank": float(aux_rank.detach().item()),
-                "loss_total": float(total_loss.detach().item()),
-            }
-        except Exception:
-            pass
-
-        return total_loss
-    
-    @torch.no_grad()
-    def p_sample_loop(
-        self,
-        model: nn.Module,
-        shape: Tuple[int, int, int],
-        control_set: Optional[torch.LongTensor] = None,
-        target_gene_idx: Optional[torch.LongTensor] = None,
-        batch_idx: Optional[torch.LongTensor] = None,
-        temperature: float = 1.0,
-        device: str = 'cuda',
-        return_aux: bool = False
-    ) -> torch.LongTensor:
-        """
-        Generate samples with cross-attention conditioning and optional partial context.
-        Expected shapes:
-        - shape: (B, S, N) where
-          B = number of different perturbation targets in the batch
-          S = set size (number of control/perturbed cells per target)
-          N = number of genes (sequence length)
-        - control_set: (B,S,N) tokens. If (S,N), it will be treated as B=1.
-        - target_gene_idx: (B,S) indices (one per cell) or (B,) / (S,) which will be broadcast.
-        - batch_idx: (B,S) batch ids or (B,) / (S,) which will be broadcast.
-        """
-        B, S, N = shape
-
-        # Resolve mask token and start with all masks, with S set positions
-        mask_token = self.mask_token_id
-        x = torch.full((B, S, N), int(mask_token), device=device, dtype=torch.long)
-
-        # Prepare conditioning to match S dimension
-        control_context = None
-        if isinstance(control_set, torch.Tensor):
-            if control_set.ndim == 3:
-                # If B dimension is 1 but provided as (1,S,N) that's fine
-                control_context = control_set
-            elif control_set.ndim == 2:
-                # Treat as B=1
-                control_context = control_set.unsqueeze(0)  # (1,S,N)
-            elif control_set.ndim == 1:
-                # Treat as B=S=1
-                control_context = control_set.view(1, 1, -1)  # (1,1,N)
-        # Normalize target_gene_idx and batch_idx to (B,S)
-        if isinstance(target_gene_idx, torch.Tensor):
-            if target_gene_idx.ndim == 1:
-                # If length matches B or S, broadcast appropriately
-                if target_gene_idx.shape[0] == B:
-                    target_gene_idx = target_gene_idx.view(B, 1).expand(B, S)
-                elif target_gene_idx.shape[0] == S:
-                    target_gene_idx = target_gene_idx.view(1, S).expand(B, S)
-                else:
-                    target_gene_idx = target_gene_idx.view(1, 1).expand(B, S)
-        if isinstance(batch_idx, torch.Tensor):
-            if batch_idx.ndim == 1:
-                if batch_idx.shape[0] == B:
-                    batch_idx = batch_idx.view(B, 1).expand(B, S)
-                elif batch_idx.shape[0] == S:
-                    batch_idx = batch_idx.view(1, S).expand(B, S)
-                else:
-                    batch_idx = batch_idx.view(1, 1).expand(B, S)
-        # Iterative denoising
-        for t in reversed(range(self.n_timesteps)):
-            t_batch = torch.full((B,), t, device=device, dtype=torch.long)
-            
-            # Get model predictions with pre-encoded conditioning
-            logits = model(
-                x, t_batch,
-                target_gene_idx=target_gene_idx,
-                batch_idx=batch_idx,
-                control_context=control_context,
-                return_aux=False
-            )  # (B,S,N,V)
-            
-            logits = logits / temperature
-            # Restrict to data vocabulary for ancestral sampling
-            logits = logits[..., :self.data_vocab_size]
-
-            # Determine which positions to unmask at this step
-            current_mask_prob = self.p_mask_probs[t]
-            if t > 0:
-                next_mask_prob = self.p_mask_probs[t-1]
-            else:
-                next_mask_prob = 0.0
-            
-            # Positions currently masked
-            is_masked = (x == mask_token)
-            
-            # Probability of unmasking
-            unmask_prob = 1.0 - (next_mask_prob / (current_mask_prob + 1e-8))
-            unmask_prob = min(max(unmask_prob, 0.0), 1.0)
-            
-            # Randomly select positions to unmask
-            unmask = torch.rand_like(is_masked.float()) < unmask_prob
-            unmask = unmask & is_masked
-            
-            # Sample new tokens for positions to unmask (data tokens only)
-            if unmask.any():
-                probs = F.softmax(logits, dim=-1)  # (B,S,N,V_data)
-                new_tokens = torch.multinomial(probs.view(-1, self.data_vocab_size), 1).view(B, S, N)
-                x[unmask] = new_tokens[unmask]
-        
-        return x
 
 class AbsorbingMaskMD4Continuous(nn.Module):
     """
     Continuous-time per-token absorbing-mask diffusion (MD4-style)
-    (Without per-token weighting, which requires REINFORCE)
+    with auxiliary DE losses ported from PartialMaskingDiffusion.
     """
 
     def __init__(self, config: ConditionalModelConfig):
@@ -1155,7 +708,7 @@ class AbsorbingMaskMD4Continuous(nn.Module):
         self.K = int(config.vocab_size)
         self.mask_token_id = int(config.mask_token_id if config.mask_token_id is not None else self.K)
         self.eps = 1e-4
-        self.t1 = 1e-2#float(getattr(config, "t1", 1e-2))
+        self.t1 = 1e-2  # float(getattr(config, "t1", 1e-2))
         self.antithetic = bool(getattr(config, "antithetic_time_sampling", True))
 
         # Per-token polynomial exponent w_v (fixed schedule by default; non-trainable)
@@ -1164,13 +717,11 @@ class AbsorbingMaskMD4Continuous(nn.Module):
 
     # ---- Schedule and derivatives ----
     def alpha(self, t: torch.Tensor) -> torch.Tensor:
-        """α(t)[v] for continuous t ∈ [t1, 1.0]."""
-        t_exp = t.unsqueeze(-1)              # [B,1]
-        w = F.softplus(self.power_const).to(t.device)           # [K]
-        return 1.0 - (1.0 - self.eps) * t_exp**w
+        t_exp = t.unsqueeze(-1)  # [B,1]
+        w = F.softplus(self.power_const).to(t.device)  # [K]
+        return 1.0 - (1.0 - self.eps) * t_exp ** w
 
     def dgamma_times_alpha(self, t: torch.Tensor) -> torch.Tensor:
-        """|dγ(t) × α(t)| magnitude for polynomial schedule = w_v / t (positive)."""
         t_exp = t.unsqueeze(-1)
         w = F.softplus(self.power_const).to(t.device)
         return w / t_exp
@@ -1185,6 +736,79 @@ class AbsorbingMaskMD4Continuous(nn.Module):
         keep_prob = keep_prob.view_as(x0)
         survive = torch.rand_like(keep_prob, dtype=keep_prob.dtype) < keep_prob
         return torch.where(survive, x0, torch.full_like(x0, self.mask_token_id))
+
+    # ---- Helpers (ported) ----
+    @staticmethod
+    @torch.no_grad()
+    def build_de_targets(delta, signif_mode="percentile", signif_arg=0.10, mlm_mask=None):
+        B, N = delta.shape
+        abs_delta = delta.abs()
+        if mlm_mask is None:
+            valid_mask = torch.isfinite(delta)
+        else:
+            valid_mask = torch.isfinite(delta) & mlm_mask
+        de_sig = torch.zeros_like(abs_delta, dtype=torch.bool)
+        if signif_mode == "percentile":
+            for b in range(B):
+                vb = valid_mask[b]
+                if vb.sum() == 0:
+                    continue
+                k = max(1, int(vb.sum().item() * signif_arg))
+                vals = abs_delta[b][vb]
+                thr = vals.topk(k).values[-1]
+                de_sig[b] = (abs_delta[b] >= thr) & vb
+        else:
+            de_sig = (abs_delta >= signif_arg) & valid_mask
+        de_dir = (delta > 0).long()
+        rank_score = abs_delta
+        return de_sig, de_dir, rank_score, valid_mask
+
+    def _bce_with_logits_masked(self, logits: torch.Tensor, target: torch.Tensor, mask: torch.Tensor, pos_weight: Optional[float] = None):
+        if pos_weight is not None:
+            pw = torch.tensor(pos_weight, device=logits.device, dtype=logits.dtype)
+            loss_fn = nn.BCEWithLogitsLoss(reduction="none", pos_weight=pw)
+        else:
+            loss_fn = nn.BCEWithLogitsLoss(reduction="none")
+        loss = loss_fn(logits, target.float())
+        denom = mask.float().sum().clamp_min(1.0)
+        loss = (loss * mask.float()).sum() / denom
+        return loss
+
+    def _ce_masked(self, logits: torch.Tensor, target: torch.Tensor, mask: torch.Tensor):
+        loss = F.cross_entropy(logits.view(-1, 2), target.contiguous().view(-1), reduction="none")
+        loss = loss.view_as(mask)
+        denom = mask.float().sum().clamp_min(1.0)
+        loss = (loss * mask.float()).sum() / denom
+        return loss
+
+    def _ranknet_loss(self, scores, targets, mask, num_pairs=1024, margin=0.0, top_percent=0.1):
+        s = scores.mean(dim=1)  # (B,N)
+        t = targets.mean(dim=1)  # (B,N)
+        m = mask.any(dim=1)  # (B,N)
+        B, N = s.shape
+        eps = 0.05 * self.config.token_max_value
+        total = 0.0
+        denom = 0
+        for b in range(B):
+            valid = m[b]
+            tb, sb = t[b], s[b]
+            top_mask = valid & (tb >= eps)
+            bot_mask = valid & (tb < eps)
+            if top_mask.sum() == 0 or bot_mask.sum() == 0:
+                continue
+            k_top = max(1, int(top_mask.sum().item() * top_percent))
+            k_bot = max(1, int(bot_mask.sum().item() * top_percent))
+            top_idx = torch.where(top_mask)[0][tb[top_mask].topk(k_top).indices]
+            bot_idx = torch.where(bot_mask)[0][(-tb[bot_mask]).topk(k_bot).indices]
+            n = min(num_pairs, top_idx.numel(), bot_idx.numel())
+            if n == 0:
+                continue
+            ti = top_idx[torch.randint(0, top_idx.numel(), (n,), device=sb.device)]
+            tj = bot_idx[torch.randint(0, bot_idx.numel(), (n,), device=sb.device)]
+            total += (-F.logsigmoid(sb[ti] - sb[tj] - margin)).mean()
+            denom += 1
+        return (total / denom) if denom > 0 else s.new_zeros(())
+
     # ---- Training loss ----
     def compute_loss(
         self,
@@ -1193,11 +817,18 @@ class AbsorbingMaskMD4Continuous(nn.Module):
         control_set: Optional[torch.LongTensor] = None,
         target_gene_idx: Optional[torch.LongTensor] = None,
         batch_idx: Optional[torch.LongTensor] = None,
-        **_: dict,
+        step: int = 0,
+        max_steps: int = 1000,
+        lambda_de: float = 0.5,
+        lambda_dir: float = 0.2,
+        lambda_rank: float = 0.2,
+        de_pos_weight: Optional[float] = 2.0,
+        signif_mode: str = "percentile",
+        signif_arg: float = 0.1,
+        delta_means: Optional[torch.FloatTensor] = None,
+        return_aux: bool = True,
     ) -> torch.Tensor:
-        """
-        Continuous-time MD4 objective with REINFORCE variance reduction.
-        """
+        """Continuous-time MD4 objective with optional auxiliary DE losses."""
         B = x0.shape[0]
         device = x0.device
 
@@ -1210,7 +841,7 @@ class AbsorbingMaskMD4Continuous(nn.Module):
         # Scale to [t1, 1.0]
         t = (1 - self.t1) * t + self.t1
 
-        # Single z_t sample (no REINFORCE)
+        # Single z_t sample
         zt = self.q_sample(x0, t)
         out = model(
             zt,
@@ -1218,25 +849,82 @@ class AbsorbingMaskMD4Continuous(nn.Module):
             target_gene_idx=target_gene_idx,
             batch_idx=batch_idx,
             control_context=control_set,
-            return_aux=False,
+            return_aux=return_aux,
         )
-        logits = out["logits"]
-        loss, raw_loss = self._masked_ce_loss(zt, x0, logits, t)
-        return loss, raw_loss
+        logits = out["logits"] if isinstance(out, dict) else out
+
+        main_loss, raw_main_loss = self._masked_ce_loss(zt, x0, logits, t)
+
+        aux_loss = logits.new_zeros(())
+        aux_sig = logits.new_zeros(())
+        aux_dir = logits.new_zeros(())
+        aux_rank = logits.new_zeros(())
+
+        def ramp(cur_step, frac=0.2):
+            return min(1.0, cur_step / max(1, int(max_steps * frac)))
+
+        scale = ramp(step)
+        if return_aux and (control_set is not None) and isinstance(out, dict) and (delta_means is not None):
+            # Build DE targets using per-gene mask derived from zt
+            mlm_mask = (zt == self.mask_token_id)  # (B,S,N) boolean
+            mlm_mask_gene = mlm_mask.any(dim=1)    # (B,N)
+            de_sig, de_dir, rank_score, valid = self.build_de_targets(
+                delta_means,
+                signif_mode=signif_mode,
+                signif_arg=signif_arg,
+                mlm_mask=mlm_mask_gene,
+            )
+
+            # Expand to (B,S,N)
+            B2, S2, N2, _ = logits.shape
+            de_sig = de_sig.unsqueeze(1).expand(-1, S2, -1)
+            de_dir_mask = de_sig
+            de_dir = de_dir.unsqueeze(1).expand(-1, S2, -1)
+            rank_score = rank_score.unsqueeze(1).expand(-1, S2, -1)
+            valid = valid.unsqueeze(1).expand(-1, S2, -1)
+
+            # Restrict aux to masked genes at each set position
+            valid = valid & mlm_mask
+            de_dir_mask = valid & de_dir_mask
+
+            # Compute individual aux losses
+            aux_sig = self._bce_with_logits_masked(out["de_sig_logit"], de_sig, valid, pos_weight=de_pos_weight) * lambda_de * scale
+            aux_loss = aux_loss + aux_sig
+
+            if de_dir_mask.any():
+                aux_dir = self._ce_masked(out["de_dir_logits"], de_dir, de_dir_mask) * lambda_dir * scale
+                aux_loss = aux_loss + aux_dir
+
+            aux_rank = self._ranknet_loss(out["de_rank_score"], rank_score, valid, num_pairs=512) * lambda_rank * scale
+            aux_loss = aux_loss + aux_rank
+
+        total_loss = main_loss + aux_loss
+
+        # Stash detailed loss breakdown for logging
+        try:
+            self._last_loss_stats = {
+                "loss_main": float(main_loss.detach().item()),
+                "loss_main_unweighted": float(raw_main_loss.detach().item()),
+                "loss_aux": float(aux_loss.detach().item()),
+                "loss_aux_de": float(aux_sig.detach().item()),
+                "loss_aux_dir": float(aux_dir.detach().item()),
+                "loss_aux_rank": float(aux_rank.detach().item()),
+                "loss_total": float(total_loss.detach().item()),
+            }
+        except Exception:
+            pass
+
+        return total_loss
 
     def _masked_ce_loss(self, x_t, x0, logits, t):
-        """
-        Masked cross-entropy weighted by dgamma_times_alpha(t),
-        as in MD4's continuous-time ELBO integrand.
-        """
-        # Ensure we have logits over data + mask classes
+        # Ensure we have logits over data classes only (exclude mask category)
         log_probs = F.log_softmax(logits[..., : self.K], dim=-1)
-        one_hot_x0 = F.one_hot(x0.clamp_max(self.K-1), num_classes=self.K).float()
+        one_hot_x0 = F.one_hot(x0.clamp_max(self.K - 1), num_classes=self.K).float()
         neg_ce = -(one_hot_x0 * log_probs).sum(dim=-1)  # [B,S,N]
         mask = (x_t == self.mask_token_id).float()
         weight = self.dgamma_times_alpha(t).mean(dim=-1).view(x_t.shape[0], 1, 1)
         loss = (mask * neg_ce * weight).sum(dim=(1, 2)) / mask.sum(dim=(1, 2)).clamp_min(1.0)
-        unweighted_loss = (mask * neg_ce).sum(dim=(1, 2)) / mask.sum(dim=(1, 2))
+        unweighted_loss = (mask * neg_ce).sum(dim=(1, 2)) / mask.sum(dim=(1, 2)).clamp_min(1.0)
         return loss.mean(), unweighted_loss.mean()
 
     # ---- Inference ----
@@ -1249,15 +937,10 @@ class AbsorbingMaskMD4Continuous(nn.Module):
         target_gene_idx: Optional[torch.LongTensor] = None,
         batch_idx: Optional[torch.LongTensor] = None,
     ):
-        """
-        Continuous-time ancestral sampler from t=1.0 to t1 using MD4's update rule.
-        shape: (B, *data_shape) — must match model output's spatial shape.
-        """
         B = shape[0]
         device = next(model.parameters()).device
         x_t = torch.full(shape, self.mask_token_id, device=device, dtype=torch.long)
 
-        # Define discrete step grid from 1.0 down to t1
         times = torch.linspace(1.0, self.t1, self.config.n_timesteps, device=device)
 
         for i in range(len(times) - 1):
@@ -1267,8 +950,8 @@ class AbsorbingMaskMD4Continuous(nn.Module):
             t_batch = torch.full((B,), t_val, device=device)
             s_batch = torch.full((B,), s_val, device=device)
 
-            alpha_t = self.alpha(t_batch)  # [B,K]
-            alpha_s = self.alpha(s_batch)  # [B,K]
+            alpha_t = self.alpha(t_batch)
+            alpha_s = self.alpha(s_batch)
 
             logits = model(
                 x_t,
@@ -1278,25 +961,19 @@ class AbsorbingMaskMD4Continuous(nn.Module):
                 control_context=control_set,
                 return_aux=False,
             )
-            # Some model configs always return aux dicts; extract logits if needed
             if isinstance(logits, dict):
                 logits = logits.get("logits", logits)
-            mean_preds = F.softmax(logits[..., :self.K], dim=-1)  # [B,...,K+1]
+            mean_preds = F.softmax(logits[..., : self.K], dim=-1)
 
-            # Compute unmask probability for each vocab entry: (α_s - α_t) / (1 - α_t)
-            # For fixed schedule, α is same for all v in 0..K-1
             unmask_prob = (alpha_s[:, 0] - alpha_t[:, 0]) / (1.0 - alpha_t[:, 0]).clamp_min(1e-8)
-            # Broadcast to data shape
             unmask_prob = unmask_prob.view(B, *([1] * (x_t.ndim - 1)))
 
-            # Decide which masked positions to unmask at this step (Bernoulli per position)
             is_mask = (x_t == self.mask_token_id)
             rand = torch.rand_like(is_mask.float())
             unmask = (rand < unmask_prob).to(is_mask.dtype) & is_mask
 
-            # If unmasking, sample from data logits only (exclude mask category entirely)
             if unmask.any():
-                probs_data = mean_preds  # (..., K)
+                probs_data = mean_preds
                 x_new = torch.multinomial(probs_data.view(-1, self.K), 1).view_as(x_t)
                 x_t = torch.where(unmask, x_new, x_t)
 

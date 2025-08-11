@@ -59,11 +59,11 @@ import torch
 from tokenizer import (
     create_logbin_tokenizer
 )
-      # noqa: E402  – defined at top-level
+# noqa: E402  – defined at top-level
 from models.diffusion import (
     ConditionalDiffusionTransformer,
     ConditionalModelConfig,
-    PartialMaskingDiffusion,
+    AbsorbingMaskMD4Continuous,
 )
 from dataset.vcc_paired_dataloader import (
     create_vcc_train_val_dataloaders
@@ -91,7 +91,7 @@ def _load_checkpoint(ckpt_dir: Path, device: torch.device):
     model = model.to(device, non_blocking=True)
     model.eval().requires_grad_(False)
 
-    diffusion = PartialMaskingDiffusion(config)
+    diffusion = AbsorbingMaskMD4Continuous(config)
     return config, model, diffusion
 
 def _prepare_gene_mappings(
@@ -194,7 +194,7 @@ def _write_anndata(
 def _run_validation_merged(
     cfg: ConditionalModelConfig,
     model: torch.nn.Module,
-    diffusion: PartialMaskingDiffusion,
+    diffusion: AbsorbingMaskMD4Continuous,
     tokenizer,
     detokenizer,
     gene_names: List[str],
@@ -314,7 +314,7 @@ def _run_validation_merged(
 def _run_test_generation(
     cfg: ConditionalModelConfig,
     model: torch.nn.Module,
-    diffusion: PartialMaskingDiffusion,
+    diffusion: AbsorbingMaskMD4Continuous,
     detokenizer,                           # delta detokeniser passed in main()
     gene_names: List[str],
     hvg_to_full: np.ndarray,
