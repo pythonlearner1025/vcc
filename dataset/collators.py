@@ -59,7 +59,8 @@ class OrionCollator:
             ctrl = sample["control_expr"]    # (S,N)
             S, N = pert.shape
             # Tokenise
-            pert_tok = self.tokenizer(pert)  # (S,N)
+            delta = pert - ctrl
+            pert_tok = self.tokenizer(delta)  # (S,N)
             ctrl_tok = self.tokenizer(ctrl)  # (S,N)
             perts.append(pert_tok.long())
             ctrls.append(ctrl_tok.long())
@@ -103,8 +104,10 @@ class VCCCollator:
             pert = sample["perturbed_expr"].squeeze()  # (S,N)
             ctrl = sample["control_expr"].squeeze()    # (S,N)
             S, N = pert.shape
-            pert_tok = self.tokenizer(pert)  # (S,N)
-            ctrl_tok = self.tokenizer(ctrl)  # (S,N)
+            # Tokenise targets as deltas and context as control
+            delta = pert - ctrl
+            pert_tok = self.tokenizer(delta)  # (S,N) – targets are Δ tokens
+            ctrl_tok = self.tokenizer(ctrl)   # (S,N) – context encodes control
             perts.append(pert_tok.long())
             ctrls.append(ctrl_tok.long())
             batch_ids.append(torch.tensor([self.batch_to_idx.get(b, 0) for b in sample["pert_batches"]], dtype=torch.long))

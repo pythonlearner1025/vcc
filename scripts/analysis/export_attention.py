@@ -124,10 +124,10 @@ def main() -> None:
     X = np.stack([ds[i].numpy() for i in rows], dtype=np.float32)
 
     # Tokenise ----------------------------------------------------------------
-    from ..tokenizer import create_logbin_tokenizer
+    from ..tokenizer import create_delta_tokenizer
 
-    tokenizer, detokenizer = create_logbin_tokenizer(cfg["vocab_size"])
-    tokens = tokenizer(X).long()
+    tokenizer, detokenizer = create_delta_tokenizer(cfg["vocab_size"])
+    tokens = tokenizer(np.zeros_like(X)).long()
 
     # Model -------------------------------------------------------------------
     from models.diffusion import ConditionalDiffusionTransformer, ConditionalModelConfig

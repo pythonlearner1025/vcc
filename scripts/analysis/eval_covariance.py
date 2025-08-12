@@ -237,11 +237,13 @@ def main() -> None:
     real_between = float(np.nanmean(spearmanr(real_syn, real_mt, axis=0).correlation))
 
     # 4) Model inference --------------------------------------------------
-    from ..tokenizer import create_logbin_tokenizer
+    from ..tokenizer import create_delta_tokenizer
     from models.diffusion import ConditionalDiffusionTransformer, ConditionalModelConfig
 
-    tokenizer, detokenizer = create_logbin_tokenizer(cfg["vocab_size"])
-    tokens = tokenizer(X).long()
+    tokenizer, detokenizer = create_delta_tokenizer(cfg["vocab_size"])
+    # For covariance eval, treat input X as baseline (control) and mask SYN/MT positions to predict Δ, then reconstruct
+    tokens_ctrl = tokenizer(np.zeros_like(X)).long()
+    tokens = tokens_ctrl.clone()
     mask_token = cfg["vocab_size"] - 1
     for idx in syn_idx + mt_idx:
         tokens[:, idx] = mask_token
@@ -256,12 +258,9 @@ def main() -> None:
     model = model.to(device).eval().requires_grad_(False)
 
     vocab_size = cfg["vocab_size"]
-    # Build expected expression per token.  The tokenizer reserves the last
-    # token ID (vocab_size-1) as [MASK] and `detokenizer` is defined only for
-    # the first `vocab_size-1` IDs.  We therefore call it on that range and
-    # pad the mask-token position with the highest bin value.
+    # Build expected Δ per token (pad mask id with last bin centre)
     detok_vec = detokenizer(torch.arange(vocab_size - 1))  # (V-1,)
-    detok_vec = torch.cat([detok_vec, detok_vec[-1:].clone()])  # Pad for mask id
+    detok_vec = torch.cat([detok_vec, detok_vec[-1:].clone()])
 
 
     batch = 32
@@ -271,8 +270,8 @@ def main() -> None:
             tb = tokens[i : i + batch].to(device)
             logits = model(tb, torch.zeros(tb.size(0), dtype=torch.long, device=device))
             probs = torch.softmax(logits, dim=-1)  # (B,N,V)
-            exp_vals = torch.einsum("bnv,v->bn", probs, detok_vec.to(device))
-            pred_expr[i : i + batch] = exp_vals.cpu().numpy()
+            delta_vals = torch.einsum("bnv,v->bn", probs, detok_vec.to(device))
+            pred_expr[i : i + batch] = delta_vals.cpu().numpy()
 
     pred_syn = pred_expr[:, syn_idx]
     pred_mt = pred_expr[:, mt_idx]

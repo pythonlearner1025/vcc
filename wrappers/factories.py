@@ -5,7 +5,7 @@ import torch
 from dataset.scrna_hvg_dataset import create_scrna_hvg_dataloader
 from dataset.orion_paired import create_orion_train_val_dataloaders
 from dataset.vcc_paired_dataloader import create_vcc_train_val_dataloaders
-from tokenizer import create_logbin_tokenizer, TokenizedScRNADataset
+from tokenizer import create_delta_tokenizer, TokenizedScRNADataset
 
 
 def _read_hvgs(hvg_info_path: str) -> List[str]:
@@ -25,7 +25,7 @@ def create_orion_finetune(
     random_seed: int = 42,
 ) -> Tuple[Tuple[Any, torch.utils.data.DataLoader], Tuple[Any, torch.utils.data.DataLoader]]:
     hvg_genes = _read_hvgs(hvg_info_path)
-    tokenizer, _ = create_logbin_tokenizer(vocab_size, max_value=max_value)
+    tokenizer, _ = create_delta_tokenizer(vocab_size, max_value=max_value)
     (orion_train_ds, orion_train_dl), (orion_val_ds, orion_val_dl) = create_orion_train_val_dataloaders(
         batches_dir=data_dir,
         hvg_gene_ids=hvg_genes,
@@ -66,7 +66,7 @@ def create_scrna_pretrain(
     if preload_cache and use_cache:
         for i in range(len(scrna_dataset.batch_files)):
             _ = scrna_dataset._load_batch(i)
-    tokenizer, _ = create_logbin_tokenizer(vocab_size=vocab_size, max_value=max_value)
+    tokenizer, _ = create_delta_tokenizer(vocab_size=vocab_size, max_value=max_value)
     tokenized = TokenizedScRNADataset(scrna_dataset, tokenizer)
     dataloader = torch.utils.data.DataLoader(
         tokenized,
@@ -97,7 +97,7 @@ def create_vcc_finetune(
     blacklist_path: str = "assets/blacklist.txt",
 ) -> Tuple[Tuple[Any, torch.utils.data.DataLoader], Tuple[Any, torch.utils.data.DataLoader]]:
     hvg_genes = _read_hvgs(hvg_info_path)
-    tokenizer, _ = create_logbin_tokenizer(vocab_size, max_value=max_value)
+    tokenizer, _ = create_delta_tokenizer(vocab_size, max_value=max_value)
     (vcc_dataset, vcc_dataloader), (val_dataset, val_dataloader) = create_vcc_train_val_dataloaders(
         tokenizer=tokenizer,
         adata_path=adata_path,

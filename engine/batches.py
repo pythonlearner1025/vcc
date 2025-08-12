@@ -22,7 +22,6 @@ def _try_get_unique_batches(obj: Any) -> List[str]:
             pass
     return []
 
-
 def discover_phase_batches(phase_name: str, dataset: Any, dataloader: DataLoader) -> List[str]:
     names: List[str] = []
     names.extend(_try_get_unique_batches(dataset))
@@ -45,7 +44,6 @@ def build_global_batch_mapping(phases: Sequence[Tuple[str, Any, DataLoader]]) ->
         all_names.extend(local)
     unique = sorted(list(set(all_names)))
     return {name: idx for idx, name in enumerate(unique)}
-
 
 class _CollateWithBatchIndex:
     def __init__(self, base_collate, mapping: Dict[str, int], default_name: str):

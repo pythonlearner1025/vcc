@@ -91,7 +91,7 @@ class SimpleTokenizer:
 def create_logbin_tokenizer(vocab_size: int = 64, max_value: float = 9.2):
     tokenizer = SimpleTokenizer(vocab_size, max_value)
     return tokenizer, tokenizer.detokenize
-'''
+
 class DeltaTokenizer:
     """Symmetric tokenizer for perturbation Δ values.
 
@@ -178,8 +178,7 @@ class DeltaTokenizer:
         tokens_clamped = tokens.clamp(0, self._value_vocab_size - 1)
         return centres[tokens_clamped]
 
-def create_delta_tokenizer(vocab_size: int = 256, max_abs: float = 9.2, min_abs: float = 1e-3):
+def create_delta_tokenizer(vocab_size: int = 256, max_value: float = 9.2, min_abs: float = 1e-3):
     """Factory matching the signature of ``create_logbin_tokenizer`` used elsewhere."""
-    tok = DeltaTokenizer(vocab_size=vocab_size, max_abs=max_abs, min_abs=min_abs)
+    tok = DeltaTokenizer(vocab_size=vocab_size, max_abs=max_value, min_abs=min_abs)
     return tok, tok.detokenize
-'''

@@ -392,8 +392,8 @@ class Trainer:
                 out_dir.mkdir(parents=True, exist_ok=True)
 
                 # Tokeniser/Detokeniser for delta tokens
-                from tokenizer import create_logbin_tokenizer
-                tokenizer, detok = create_logbin_tokenizer(getattr(cfg_obj, "vocab_size", 128), max_value=getattr(cfg_obj, "token_max_value", 10.82))
+                from tokenizer import create_delta_tokenizer
+                tokenizer, detok = create_delta_tokenizer(getattr(cfg_obj, "vocab_size", 128), max_value=getattr(cfg_obj, "token_max_value", 10.82))
 
                 # Ensure val_dataset has mapping
                 setattr(val_dataset, "batch_to_idx", self.global_batch_mapping)

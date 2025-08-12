@@ -119,10 +119,11 @@ if __name__ == "__main__":
     # ---------------------------------------------------------------------
     # 4. Tokenise counts and mask the two genes
     # ---------------------------------------------------------------------
-    from ..tokenizer import create_logbin_tokenizer
+    from ..tokenizer import create_delta_tokenizer
 
-    tokenizer, _ = create_logbin_tokenizer(cfg_dict["vocab_size"])
-    tokens = tokenizer(expr).long()  # (N, 2000)
+    tokenizer, _ = create_delta_tokenizer(cfg_dict["vocab_size"])
+    # Use zero baseline (control) and mask target genes to predict Δ
+    tokens = tokenizer(np.zeros_like(expr)).long()  # (N, 2000)
     mask_token = cfg_dict["vocab_size"] - 1
     tokens[:, idx_rbfox3] = mask_token
     tokens[:, idx_gfap] = mask_token

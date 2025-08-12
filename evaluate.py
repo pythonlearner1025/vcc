@@ -57,7 +57,7 @@ import torch
 # -----------------------------------------------------------------------------
 
 from tokenizer import (
-    create_logbin_tokenizer
+    create_delta_tokenizer
 )
 # noqa: E402  – defined at top-level
 from models.diffusion import (
@@ -191,6 +191,7 @@ def _write_anndata(
 # Validation evaluation
 # -----------------------------------------------------------------------------
 
+import torch.nn.functional as F
 def _run_validation_merged(
     cfg: ConditionalModelConfig,
     model: torch.nn.Module,
@@ -210,8 +211,26 @@ def _run_validation_merged(
 ):
     """Generate one merged prediction/ground-truth pair for all
     validation genes and run cell-eval once."""
-    mask_token = cfg.vocab_size - 1
     # Default: if caller did not supply val_ds/dl we will create VCC val loader below
+
+    # ------------------------------------------------------------------
+    # Optional: verify that HVG list used at eval matches training config
+    # ------------------------------------------------------------------
+    try:
+        train_hvg_ids_path = getattr(cfg, "hvg_ids_path", None)
+        if train_hvg_ids_path:
+            train_hvg_ids_path = Path(str(train_hvg_ids_path))
+            if train_hvg_ids_path.exists():
+                with open(train_hvg_ids_path) as _f:
+                    train_hvg_ids = [ln.strip() for ln in _f if ln.strip()]
+                if len(train_hvg_ids) != len(hvg_gene_ids) or train_hvg_ids != hvg_gene_ids:
+                    print("[diag] WARNING: HVG list mismatch between training config and current eval input.")
+                    print(f"        train_hvg_ids_path={train_hvg_ids_path}")
+                    print(f"        n_train={len(train_hvg_ids)} n_eval={len(hvg_gene_ids)}  (lists_equal={train_hvg_ids==hvg_gene_ids})")
+            else:
+                print(f"[diag] NOTE: Training HVG path not found on disk: {train_hvg_ids_path}")
+    except Exception as e:
+        print(f"[diag] Failed to verify HVG alignment: {e}")
 
     # ------------------------------------------------------------------
     # Build merged batch_to_idx mapping identical to training
@@ -224,7 +243,7 @@ def _run_validation_merged(
             base_ds = val_ds.dataset if hasattr(val_ds, 'dataset') else val_ds
             vcc_batches = []
         batch_to_idx = _build_global_batch_mapping(cfg, vcc_batches)
-    setattr(val_ds, 'batch_to_idx', batch_to_idx)
+        setattr(val_ds, 'batch_to_idx', batch_to_idx)
 
     X_true_parts = []
     X_pred_parts = []
@@ -249,6 +268,36 @@ def _run_validation_merged(
         # Build float control baseline via detokeniser for metrics (CPU numpy)
         ctrl_expr = _tokens_to_expression(ctrl_tok, detokenizer)  # (B,S,N) float32
 
+        # ------------------------------------------------------------------
+        # Diagnostics: index ranges and basic sanity checks (once per step)
+        # ------------------------------------------------------------------
+        try:
+            gi_min = int(gene_idxs.min().item())
+            gi_max = int(gene_idxs.max().item())
+            print(f"[diag] gene_idx range: [{gi_min}, {gi_max}]  expected within [0, {cfg.n_genes-1}]")
+            if gi_min < 0 or gi_max >= int(getattr(cfg, "n_genes")):
+                raise AssertionError("target_gene_idx contains out-of-range values vs cfg.n_genes")
+        except Exception as e:
+            print(f"[diag] gene_idx range check failed: {e}")
+
+        try:
+            bi_min = int(batch_idx.min().item())
+            bi_max = int(batch_idx.max().item())
+            # Try to infer expected range from config if available
+            n_batches_expected = (
+                getattr(cfg, "n_batches", None)
+                or getattr(cfg, "num_batches", None)
+                or getattr(cfg, "batch_vocab_size", None)
+            )
+            if n_batches_expected is not None:
+                print(f"[diag] batch_idx range: [{bi_min}, {bi_max}]  expected within [0, {int(n_batches_expected)-1}]")
+                if bi_min < 0 or bi_max >= int(n_batches_expected):
+                    print("[diag] WARNING: batch_idx appears out of expected range from training config")
+            else:
+                print(f"[diag] batch_idx range: [{bi_min}, {bi_max}]  (no expected size in cfg)")
+        except Exception as e:
+            print(f"[diag] batch_idx range check failed: {e}")
+
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
             # Sampler expects explicit (B,S,N) shape
             pred_tokens = diffusion.p_sample_loop(
@@ -256,12 +305,115 @@ def _run_validation_merged(
                 shape=(B, S, cfg.n_genes),
                 control_set=tokens_ctrl,
                 target_gene_idx=gene_idxs,
-                batch_idx=batch_idx
+                batch_idx=None #temporarily disable batch conditioning
             )
+    
 
-        pred_expr_2k = _tokens_to_expression(pred_tokens, detokenizer)  # (B,S,N)
-        # Ground-truth perturbed expression from provided perturbed tokens
-        true_expr_2k = _tokens_to_expression(pert_tok, detokenizer)     # (B,S,N)
+        # In delta mode: detokenizer returns Δ; reconstruct expr = control + Δ
+        delta_pred_2k = _tokens_to_expression(pred_tokens, detokenizer)  # (B,S,N)
+        pred_expr_2k = (ctrl_expr + delta_pred_2k).astype(np.float32)
+        # Ground truth: provided perturbed tokens are Δ tokens in delta mode
+        delta_true_2k = _tokens_to_expression(pert_tok, detokenizer)     # (B,S,N)
+        true_expr_2k = (ctrl_expr + delta_true_2k).astype(np.float32)
+
+        # ------------------------------------------------------------------
+        # Diagnostics: copy-through, mask usage, and correlations
+        # ------------------------------------------------------------------
+        try:
+            # Equality rate with control tokens (copy-through)
+            eq_frac = (pred_tokens == tokens_ctrl).float().mean().item()
+            # Difference rate vs ground truth tokens
+            neq_true_frac = (pred_tokens != pert_tok.to(pred_tokens.device)).float().mean().item()
+
+            # Mask fraction in predictions
+            num_classes = int(getattr(diffusion, "K", cfg.vocab_size))
+            mask_token_id = int(getattr(diffusion, "mask_token_id", num_classes))
+            mask_frac = (pred_tokens == mask_token_id).float().mean().item()
+
+            # Per-cell Pearson correlations
+            def _safe_corr(a: np.ndarray, b: np.ndarray) -> float:
+                if a.ndim != 1:
+                    a = a.reshape(-1)
+                if b.ndim != 1:
+                    b = b.reshape(-1)
+                if a.size < 2 or b.size < 2:
+                    return float("nan")
+                a_std = float(a.std() + 1e-8)
+                b_std = float(b.std() + 1e-8)
+                if a_std == 0.0 or b_std == 0.0:
+                    return float("nan")
+                a_c = a - a.mean()
+                b_c = b - b.mean()
+                return float((a_c * b_c).mean() / (a_std * b_std))
+
+            per_cell_ctrl_pred = []
+            per_cell_true_pred = []
+            for b in range(B):
+                for s in range(S):
+                    per_cell_ctrl_pred.append(_safe_corr(ctrl_expr[b, s], pred_expr_2k[b, s]))
+                    per_cell_true_pred.append(_safe_corr(true_expr_2k[b, s], pred_expr_2k[b, s]))
+
+            # Per-gene correlation (across all cells) – flatten over B and S
+            per_gene_corr = []
+            pred_flat = pred_expr_2k.reshape(B * S, N)
+            true_flat = true_expr_2k.reshape(B * S, N)
+            for g in range(N):
+                per_gene_corr.append(_safe_corr(true_flat[:, g], pred_flat[:, g]))
+
+            # Summarise
+            def _nanmean(x: list[float]) -> float:
+                arr = np.asarray([v for v in x if not np.isnan(v)], dtype=np.float32)
+                return float(arr.mean()) if arr.size > 0 else float("nan")
+            def _nanmedian(x: list[float]) -> float:
+                arr = np.asarray([v for v in x if not np.isnan(v)], dtype=np.float32)
+                return float(np.median(arr)) if arr.size > 0 else float("nan")
+
+            print(f"[diag] copy-through: pred==control token fraction = {eq_frac:.4f}")
+            print(f"[diag] pred vs true token mismatch fraction = {neq_true_frac:.4f}")
+            print(f"[diag] mask token fraction in predictions = {mask_frac:.4f}")
+            print(f"[diag] per-cell corr(ctrl, pred): mean={_nanmean(per_cell_ctrl_pred):.4f} median={_nanmedian(per_cell_ctrl_pred):.4f}")
+            print(f"[diag] per-cell corr(true, pred): mean={_nanmean(per_cell_true_pred):.4f} median={_nanmedian(per_cell_true_pred):.4f}")
+            print(f"[diag] per-gene corr(true, pred): mean={_nanmean(per_gene_corr):.4f} median={_nanmedian(per_gene_corr):.4f}")
+
+            # Persist diagnostics for this step
+            diag = {
+                "step": int(steps),
+                "B": int(B),
+                "S": int(S),
+                "N": int(N),
+                "gene_idx_min": gi_min if 'gi_min' in locals() else None,
+                "gene_idx_max": gi_max if 'gi_max' in locals() else None,
+                "batch_idx_min": bi_min if 'bi_min' in locals() else None,
+                "batch_idx_max": bi_max if 'bi_max' in locals() else None,
+                "copy_through_frac": float(eq_frac),
+                "pred_vs_true_token_mismatch_frac": float(neq_true_frac),
+                "mask_token_frac": float(mask_frac),
+                "per_cell_corr_ctrl_pred_mean": _nanmean(per_cell_ctrl_pred),
+                "per_cell_corr_ctrl_pred_median": _nanmedian(per_cell_ctrl_pred),
+                "per_cell_corr_true_pred_mean": _nanmean(per_cell_true_pred),
+                "per_cell_corr_true_pred_median": _nanmedian(per_cell_true_pred),
+                "per_gene_corr_true_pred_mean": _nanmean(per_gene_corr),
+                "per_gene_corr_true_pred_median": _nanmedian(per_gene_corr),
+            }
+            try:
+                (out_dir / "diagnostics").mkdir(parents=True, exist_ok=True)
+                with open((out_dir / "diagnostics" / f"step_{steps:04d}.json"), "w") as f:
+                    json.dump(diag, f, indent=2)
+            except Exception as e:
+                print(f"[diag] failed to write diagnostics JSON: {e}")
+        except Exception as e:
+            print(f"[diag] diagnostics computation failed: {e}")
+        
+        # Print stats
+        print(f"Predicted expression stats:")
+        print(f"  Mean: {pred_expr_2k.mean():.3f}")
+        print(f"  Median: {np.median(pred_expr_2k):.3f}")
+        print(f"  Max: {np.max(pred_expr_2k):.3f}")
+
+        print(f"True expression stats:")
+        print(f"  Mean: {true_expr_2k.mean():.3f}")
+        print(f"  Median: {np.median(true_expr_2k):.3f}")
+        print(f"  Max: {np.max(true_expr_2k):.3f}")
 
         # Map to 18 k space per batch element
         for b in range(B):
@@ -274,7 +426,11 @@ def _run_validation_merged(
 
             # Append labels for control and perturbed cells (S each) for this batch item
             batch_gene_idxs = gene_idxs[b].view(-1).tolist()
-            obs_label = ["non-targeting"] * S + [gene_names[i] for i in batch_gene_idxs]
+            mapped_labels = [
+                (gene_names[int(hvg_to_full[i])] if (0 <= i < len(hvg_to_full) and int(hvg_to_full[i]) >= 0) else "<UNK>")
+                for i in batch_gene_idxs
+            ]
+            obs_label = ["non-targeting"] * S + mapped_labels
             obs_labels.extend(obs_label)
     
     X_true = np.concatenate(X_true_parts, axis=0)
@@ -360,7 +516,7 @@ def _run_test_generation(
     set_size = int(getattr(cfg, "vcc_set_size", 64))
     batch_size_cfg = int(getattr(cfg, "vcc_batch_size", 1))
 
-    tokenizer, _ = create_logbin_tokenizer(vocab_size)
+    tokenizer, _ = create_delta_tokenizer(vocab_size)
 
     # Precompute GPU detokenisation bin centres once
     # bins length == vocab_size; bins[1:] are log edges; last centre uses upper bound
@@ -412,7 +568,6 @@ def _run_test_generation(
     all_expr_full_cpu: List[np.ndarray] = []
     all_obs_labels:   List[str]        = []
 
-    mask_token = vocab_size
     S          = set_size 
 
     model.eval().requires_grad_(False)
@@ -463,12 +618,14 @@ def _run_test_generation(
                         batch_idx=batch_idx_t
                     )  # (B_pred,S,N)
 
-                # Detokenise on GPU using precomputed bin centres
+                # Detokenise on GPU using precomputed bin centres (Δ predictions)
                 pred_tokens_clamped = pred_tokens.clamp_(0, vocab_size - 1)
-                pred_expr_2k = bin_centres_dev[pred_tokens_clamped]  # (B_pred,S,N) float
-                # Scatter each predicted target to 18k and append
+                delta_pred_2k = bin_centres_dev[pred_tokens_clamped]  # (B_pred,S,N) float
+                # Scatter each predicted target to 18k and add control baseline
                 for j, b in enumerate(pred_indices):
-                    expr_full_cpu = _scatter_to_full(pred_expr_2k[j].view(S, -1)).detach().cpu().numpy()
+                    pred_full = _scatter_to_full(delta_pred_2k[j].view(S, -1))
+                    ctrl_full = _scatter_to_full(torch.from_numpy(ctrl_expr_cpu_batch[b]).to(device))
+                    expr_full_cpu = (ctrl_full + pred_full).detach().cpu().numpy()
                     all_expr_full_cpu.append(expr_full_cpu)
                     all_obs_labels.extend([batch_genes[b]] * S)
 
@@ -563,7 +720,7 @@ def main():
     # ---------------------------------------------------------------------
     # 2. Tokeniser / detokeniser
     # ---------------------------------------------------------------------
-    tokenizer, detokenizer = create_logbin_tokenizer(cfg.vocab_size)
+    tokenizer, detokenizer = create_delta_tokenizer(cfg.vocab_size)
     # 3. Gene mappings (18k list + HVG idx mapping)
     # ---------------------------------------------------------------------
     gene_names, hvg_to_full, hvg_gene_ids = _prepare_gene_mappings(cfg.finetune_data_path, args.hvg_ids_path)
