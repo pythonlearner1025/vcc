@@ -101,6 +101,7 @@ class ConditionalModelConfig:
     mem_slots: int = 8           # M, choose so S·M ≤ 256 (with S set size)
     compressor_iters: int = 2    # routing iterations
     mem_kdim: Optional[int] = None  # projection dim for Q/K in decode (defaults to dim)
+    use_memory_rope: bool = True  # Apply RoPE to memory tokens for structured attention
 
     # Training target type
     target_is_delta: bool = True  # Predict Δ rather than raw counts during fine-tune
@@ -118,6 +119,7 @@ class ConditionalModelConfig:
     n_technical_batches: int = 48  # Estimate of unique batches across datasets
     batch_embed_dim: int = 64  # Batch embedding dimension
     use_batch_conditioning: bool = False
+    use_memory_rope: bool = True
     # Latent context compression: number of latent summary tokens (0 = disabled)
     context_compressed_len: int = 0
     
@@ -431,7 +433,8 @@ class RotaryPositionalEmbedding(nn.Module):
             raise ValueError("RoPE requires even hidden dimension")
         self.dim = dim
         self.base = float(base)
-        inv_freq = 1.0 / (self.base ** (torch.arange(0, dim, 2) / dim))
+        # Fix: Correct frequency calculation for RoPE
+        inv_freq = 1.0 / (self.base ** (torch.arange(0, dim, 2).float() / dim))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
     def _sin_cos(self, positions: torch.Tensor, dtype: torch.dtype, device: torch.device):
@@ -633,6 +636,14 @@ class ConditionalDiffusionTransformer(nn.Module):
 
         # Rotary positional embedding along gene dimension
         self.rope = RotaryPositionalEmbedding(config.dim)
+        
+        # Memory RoPE: Apply positional encoding to compressed memory tokens
+        # Pros: Ordered specialization, structured attention, better routing
+        # Cons: Loss of permutation invariance, slightly more complex
+        self.use_memory_rope = getattr(config, 'use_memory_rope', True)
+        if self.use_memory_rope:
+            # Use different base for memory (slower rotation for broader context)
+            self.memory_rope = RotaryPositionalEmbedding(config.dim, base=50000.0)
 
         self.ln_f = LayerNorm(config.dim)
         self.head = nn.Linear(config.dim, config.vocab_size + 1)
@@ -739,9 +750,16 @@ class ConditionalDiffusionTransformer(nn.Module):
         if context_emb is not None:
             context_emb = self.rope(context_emb, positions)
 
-        # Compress per-set genes to memory tokens and run trunk over flattened memory
+        # Compress per-set genes to memory tokens
+        # Note: Using RoPE-encoded features for compression to maintain positional awareness
         mem = self.compressor(x)                        # (B,S,M,D)
         mem_seq = mem.view(B, S * self.mem_slots, -1)  # (B,S·M,D)
+
+        # Apply RoPE to memory tokens for structured attention patterns
+        # Each memory slot gets positional identity: enables specialization & routing
+        if self.use_memory_rope:
+            mem_positions = torch.arange(S * self.mem_slots, device=tokens.device)
+            mem_seq = self.memory_rope(mem_seq, mem_positions)
 
         lat = mem_seq
         use_ckpt = self.config.grad_ckpt and self.training and torch.is_grad_enabled()
@@ -753,6 +771,7 @@ class ConditionalDiffusionTransformer(nn.Module):
 
         mem_kv = lat.view(B, S, self.mem_slots, -1)  # (B,S,M,D)
         # Decode from genes to memory using FlashAttention-based module
+        # Use the RoPE-encoded features for query in decode attention
         ctx = self.decode_attn(gene_q=x, mem_kv=mem_kv)  # (B,S,N,D)
         h = self.ln_f(ctx)
         vocab_logits = self.head(h)
@@ -1073,7 +1092,7 @@ class AbsorbingMaskMD4Continuous(nn.Module):
 
         return x_t
 
-def create_muon_optimizer(model: nn.Module, config: ConditionalModelConfig):
+def create_muon_optimizer(model: nn.Module, config: ConditionalModelConfig, use_muon=False):
     """Create Muon optimizer with weight decay.
 
     Falls back to a non-distributed variant when ``torch.distributed`` is not
@@ -1099,9 +1118,13 @@ def create_muon_optimizer(model: nn.Module, config: ConditionalModelConfig):
         if any(x in n for x in ["token_emb", "id_emb", "batch_embed", "ln", "norm"])
     ]
 
+    print(f"use_muon: {use_muon}")
+
     param_groups = [
-        dict(params=hidden_weights, use_muon=True,
-             lr=config.muon_lr, weight_decay=0.01),
+        dict(params=hidden_weights, use_muon=use_muon,
+             lr=config.muon_lr if use_muon else config.adam_lr, 
+             weight_decay=0.01,
+             **({"betas": (0.9, 0.95)} if not use_muon else {})),
         dict(params=hidden_gains_biases + nonhidden_params, use_muon=False,
              lr=config.adam_lr, betas=(0.9, 0.95), weight_decay=0.01),
     ]
