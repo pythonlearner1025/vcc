@@ -99,7 +99,7 @@ class Trainer:
             self.cfg.model.config_args["n_technical_batches"] = pad_batches_for_fp8(n_batches)
         print("n_technical_batches: ", self.cfg.model.config_args["n_technical_batches"])
         # Now build model/optim/loss
-        self.model = self._build_model().to(self.device)
+        self.model = self._build_model().to(self.device, dtype=torch.bfloat16)
         print(f"\nModel parameters: {sum(p.numel() for p in self.model.parameters()):,}\n")
         self.optimizer, self.scheduler = self._build_optimizer()
         self.loss_adapter = self._build_loss_adapter()
@@ -185,7 +185,8 @@ class Trainer:
         LossClass = import_from_string(self.cfg.loss.loss_class)
         loss_obj = LossClass(**self.cfg.loss.loss_args)
         def _adapter(model: torch.nn.Module, batch: Batch, phase_step: int, total_phase_steps) -> torch.Tensor:
-            return loss_obj.compute_loss(model, batch, phase_step, total_phase_steps)
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                return loss_obj.compute_loss(model, batch, phase_step, total_phase_steps)
         return _adapter
 
     def _export_config(self) -> Dict[str, Any]:

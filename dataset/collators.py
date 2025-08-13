@@ -74,6 +74,7 @@ class OrionCollator:
         control = torch.stack(ctrls, dim=0)  # (B,S,N)
         batch_idx = torch.stack(batch_ids, dim=0)  # (B,S,)
         target_gene_idx = torch.stack(tgt_ids, dim=0)  # (B,S,)
+        assert (target_gene_idx >= 0).all(), "target_gene_idx contains negative values"
         delta_means = torch.stack(delta_means, dim=0)  # (B,S,)
         out = {
             "tokens": tokens,

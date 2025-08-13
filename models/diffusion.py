@@ -97,6 +97,11 @@ class ConditionalModelConfig:
     n_genes: int = 2000  # Number of HVGs
     n_latents: int = 256
 
+    # Learned set compressor (per set) → memory tokens (M ≪ N)
+    mem_slots: int = 8           # M, choose so S·M ≤ 256 (with S set size)
+    compressor_iters: int = 2    # routing iterations
+    mem_kdim: Optional[int] = None  # projection dim for Q/K in decode (defaults to dim)
+
     # Training target type
     target_is_delta: bool = True  # Predict Δ rather than raw counts during fine-tune
     
@@ -273,7 +278,7 @@ class AugmentedGeneEmbedding(nn.Module):
             return id_vec
 
         # 4‑line sequence branch
-        seq_vec = self.esm_proj(self.esm_emb(idx).float())
+        seq_vec = self.esm_proj(self.esm_emb(idx))
         fused = self.mix(torch.cat([id_vec, torch.tanh(self.gate) * seq_vec], dim=-1))
         return fused
 class GroupedQueryAttention(nn.Module):
@@ -318,7 +323,6 @@ class GroupedQueryAttention(nn.Module):
         M = kv.shape[1]  # kv sequence length (6288)
         
         # Project queries for all heads
-        # (128, 6288, 12, 57)
         q = self.q_proj(x).view(B, N, self.n_head, self.head_dim)  # (B, N, H, HD)
         
         # Project grouped key/value
@@ -326,14 +330,24 @@ class GroupedQueryAttention(nn.Module):
         kv_proj = self.kv_proj(kv).view(B, M, self.n_group, 2*self.head_dim)  # (B, M, G, 2*HD)
         k, v = kv_proj.chunk(2, dim=-1)  # Each is (B, M, G, HD)
 
-        if HAS_FLASH_ATTN:
+        # QK-norm (RMS along head_dim) before dot-product for stability
+        eps = 1e-6
+        def rmsnorm_lastdim(t: torch.Tensor) -> torch.Tensor:
+            # Normalize in fp32, cast back to original dtype to ensure FA sees bf16/fp16
+            rms_inv = (t.float().pow(2).mean(dim=-1, keepdim=True) + eps).rsqrt().to(t.dtype)
+            return t * rms_inv
+
+        q_norm = rmsnorm_lastdim(q)
+
+        if HAS_FLASH_ATTN and x.is_cuda:
             # Flash attention natively supports GQA when k,v have fewer heads than q
             # Ensure k and v are contiguous after chunk operation
             k = k.contiguous()  # (B, M, G, HD)
             v = v.contiguous()  # (B, M, G, HD)
             
+            # Flash attn expects (B, N, H, HD) for q and (B, M, G, HD) for grouped k/v
             out = flash_attn_func(
-                q, k, v,
+                q_norm, k, v,
                 dropout_p=0.0,
                 softmax_scale=None,  # Will default to 1/sqrt(head_dim)
                 causal=False,
@@ -349,7 +363,7 @@ class GroupedQueryAttention(nn.Module):
             #  Fallback: PyTorch SDPA with K/V group expansion
             # ------------------------------------------------------------------
             # Transpose for SDPA format: (B, H, N, HD)
-            q = q.transpose(1, 2)  # (B, H, N, HD)
+            qn = q_norm.transpose(1, 2)  # (B, H, N, HD)
             
             # Expand k, v from groups to all heads
             # Each group serves heads_per_group query heads
@@ -359,10 +373,11 @@ class GroupedQueryAttention(nn.Module):
             v = v.unsqueeze(2).expand(-1, -1, self.heads_per_group, -1, -1)  # (B, M, heads_per_group, G, HD)
             v = v.reshape(B, M, self.n_head, self.head_dim).transpose(1, 2)  # (B, H, M, HD)
             
-            # Use PyTorch's SDPA with optional flash attention backend
-            with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
+            # Use PyTorch's SDPA; pick backend based on device
+            backend = SDPBackend.FLASH_ATTENTION if qn.is_cuda else SDPBackend.MATH
+            with sdpa_kernel(backend):
                 out = F.scaled_dot_product_attention(
-                    q, k, v, 
+                    qn, k, v, 
                     dropout_p=0.0, 
                     is_causal=False
                 )  # (B, H, N, HD)
@@ -403,6 +418,152 @@ class TransformerBlock(nn.Module):
         
         x = x + self.residual_scale * self.mlp(self.ln2(x))
         return x
+
+class RotaryPositionalEmbedding(nn.Module):
+    """Rotary positional embedding applied along the gene axis (N).
+
+    Applies 2D rotations to interleaved feature pairs. Expects even hidden dim.
+    """
+
+    def __init__(self, dim: int, base: float = 10000.0):
+        super().__init__()
+        if dim % 2 != 0:
+            raise ValueError("RoPE requires even hidden dimension")
+        self.dim = dim
+        self.base = float(base)
+        inv_freq = 1.0 / (self.base ** (torch.arange(0, dim, 2) / dim))
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+
+    def _sin_cos(self, positions: torch.Tensor, dtype: torch.dtype, device: torch.device):
+        freqs = torch.outer(positions, self.inv_freq)  # (N, D/2)
+        cos = freqs.cos()
+        sin = freqs.sin()
+        return cos[None, None, ...], sin[None, None, ...]  # (1,1,N,D/2)
+
+    @staticmethod
+    def _apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+        x_even = x[..., 0::2]
+        x_odd = x[..., 1::2]
+        x_rot_even = x_even * cos - x_odd * sin
+        x_rot_odd = x_even * sin + x_odd * cos
+        out = torch.empty_like(x)
+        out[..., 0::2] = x_rot_even
+        out[..., 1::2] = x_rot_odd
+        return out
+
+    def forward(self, x: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+        # x: (B,S,N,D), positions: (N,)
+        cos, sin = self._sin_cos(positions, x.dtype, x.device)
+        return self._apply_rope(x, cos, sin)
+
+class LearnedSetCompressorFA(nn.Module):
+    """
+    Compress (B,S,N,D) genes -> (B,S,M,D) memory using slot attention with FlashAttention.
+    Permutation-invariant (no positions required).
+    """
+
+    def __init__(self, dim: int, M: int = 8, heads: int = 8, iters: int = 2):
+        super().__init__()
+        assert dim % heads == 0
+        self.M, self.H, self.Hd = M, heads, dim // heads
+        self.iters = int(iters)
+        self.slots = nn.Parameter(torch.randn(1, 1, M, dim) * 0.02)
+        self.q_proj = Linear(dim, dim, bias=False)
+        self.k_proj = Linear(dim, dim, bias=False)
+        self.v_proj = Linear(dim, dim, bias=False)
+        self.o_proj = Linear(dim, dim, bias=False)
+        self.norm_gene = LayerNorm(dim)
+        self.norm_slot = LayerNorm(dim)
+
+    def _reshape_h(self, x: torch.Tensor) -> torch.Tensor:
+        B_, L, D = x.shape
+        return x.view(B_, L, self.H, self.Hd)
+
+    def forward(self, x_gene: torch.Tensor) -> torch.Tensor:
+        """
+        x_gene: (B,S,N,D)
+        returns mem: (B,S,M,D)
+        """
+        B, S, N, D = x_gene.shape
+        BS = B * S
+
+        # pre-norm gene features
+        xg = self.norm_gene(x_gene).reshape(BS, N, D)
+        k = self._reshape_h(self.k_proj(xg))  # (BS,N,H,Hd)
+        v = self._reshape_h(self.v_proj(xg))  # (BS,N,H,Hd)
+
+        # init slots per set
+        slots = self.slots.expand(B, S, -1, -1).reshape(BS, self.M, D)
+        for _ in range(self.iters):
+            qs = self._reshape_h(self.q_proj(self.norm_slot(slots)))  # (BS,M,H,Hd)
+
+            if HAS_FLASH_ATTN:
+                out = flash_attn_func(
+                    qs, k, v,
+                    dropout_p=0.0,
+                    softmax_scale=None,
+                    causal=False,
+                )  # (BS,M,H,Hd)
+            else:
+                qh = qs.transpose(1, 2)  # (BS,H,M,Hd)
+                kh = k.transpose(1, 2)   # (BS,H,N,Hd)
+                vh = v.transpose(1, 2)   # (BS,H,N,Hd)
+                out = F.scaled_dot_product_attention(qh, kh, vh, dropout_p=0.0, is_causal=False)
+                out = out.transpose(1, 2)  # (BS,M,H,Hd)
+
+            out = out.reshape(BS, self.M, D)
+            slots = slots + self.o_proj(out)  # residual update
+
+        mem = slots.view(B, S, self.M, D)
+        return mem
+
+class DecodeAttentionFA(nn.Module):
+    """
+    Attend from genes (N) to set memory (M) using FlashAttention.
+    Maps (B,S,N,D) gene queries over (B,S,M,D) memory -> (B,S,N,D_out)
+    """
+
+    def __init__(self, dim: int, heads: int = 8, ctx_dim: Optional[int] = None):
+        super().__init__()
+        assert dim % heads == 0
+        self.H, self.Hd = heads, dim // heads
+        d_out = ctx_dim or dim
+        self.q_proj = Linear(dim, dim, bias=False)
+        self.k_proj = Linear(dim, dim, bias=False)
+        self.v_proj = Linear(dim, dim, bias=False)
+        self.o_proj = Linear(dim, d_out, bias=False)
+        self.q_norm = LayerNorm(dim)
+        self.k_norm = LayerNorm(dim)
+
+    def _reshape_h(self, x: torch.Tensor) -> torch.Tensor:
+        B_, L, D = x.shape
+        return x.view(B_, L, self.H, self.Hd)
+
+    def forward(self, gene_q: torch.Tensor, mem_kv: torch.Tensor) -> torch.Tensor:
+        """
+        gene_q: (B,S,N,D)
+        mem_kv: (B,S,M,D)
+        returns ctx: (B,S,N,D_out)
+        """
+        B, S, N, D = gene_q.shape
+        _, _, M, _ = mem_kv.shape
+        BS = B * S
+
+        q = self._reshape_h(self.q_proj(self.q_norm(gene_q).reshape(BS, N, D)))  # (BS,N,H,Hd)
+        k = self._reshape_h(self.k_proj(self.k_norm(mem_kv).reshape(BS, M, D)))  # (BS,M,H,Hd)
+        v = self._reshape_h(self.v_proj(mem_kv.reshape(BS, M, D)))               # (BS,M,H,Hd)
+
+        if HAS_FLASH_ATTN:
+            out = flash_attn_func(q, k, v, dropout_p=0.0, softmax_scale=None, causal=False)  # (BS,N,H,Hd)
+        else:
+            qh = q.transpose(1, 2)  # (BS,H,N,Hd)
+            kh = k.transpose(1, 2)  # (BS,H,M,Hd)
+            vh = v.transpose(1, 2)  # (BS,H,M,Hd)
+            out = F.scaled_dot_product_attention(qh, kh, vh, dropout_p=0.0, is_causal=False)
+            out = out.transpose(1, 2)  # (BS,N,H,Hd)
+
+        out = out.reshape(BS, N, D)
+        return self.o_proj(out).view(B, S, N, -1)
 
 class ConditionalDiffusionTransformer(nn.Module):
     """Conditional discrete diffusion transformer with residual scaling in blocks."""
@@ -447,23 +608,31 @@ class ConditionalDiffusionTransformer(nn.Module):
         )
 
         self.control_id_emb = nn.Embedding(1, config.dim)
-        self.n_latents = getattr(config, "n_latents", 512)
-        self.lat = nn.Parameter(torch.randn(1, self.n_latents, config.dim) * 0.02)
+        # Learned set compressor (FlashAttention) to produce memory tokens per set
+        self.mem_slots = int(getattr(config, "n_latents", 8))
+        self.compressor = LearnedSetCompressorFA(
+            dim=config.dim,
+            M=self.mem_slots,
+            heads=config.n_head,
+            iters=int(getattr(config, "compressor_iters", 2)),
+        )
 
         gqa_groups = max(1, config.n_head // 2)
         self.blocks = nn.ModuleList([
             TransformerBlock(config.dim, config.n_head, config.ffn_mult, n_group=gqa_groups, residual_scale=residual_scale)
             for _ in range(config.n_layer)
         ])
-        self.cross_attn_decode = TransformerBlock(config.dim, config.n_head, config.ffn_mult, n_group=gqa_groups, residual_scale=residual_scale)
+        # Decode attention from genes to memory using FlashAttention
+        self.decode_attn = DecodeAttentionFA(config.dim, heads=config.n_head, ctx_dim=config.dim)
 
         self.target_flag = nn.Embedding(2, config.dim)
         self.segment_emb = nn.Embedding(2, config.dim)
 
         self.lat_q_ln = LayerNorm(config.dim)
         self.kv_ln = LayerNorm(config.dim)
-        self.gene_q_ln = LayerNorm(config.dim)
-        self.lat_kv_ln = LayerNorm(config.dim)
+
+        # Rotary positional embedding along gene dimension
+        self.rope = RotaryPositionalEmbedding(config.dim)
 
         self.ln_f = LayerNorm(config.dim)
         self.head = nn.Linear(config.dim, config.vocab_size + 1)
@@ -526,7 +695,7 @@ class ConditionalDiffusionTransformer(nn.Module):
         token_emb = self.token_emb(tokens)
         context_emb = self.token_emb(control_context) if control_context is not None else None
 
-        gene_feat = self._cached_gene_features.to(tokens.device).unsqueeze(0).unsqueeze(0).expand(B, S, -1, -1)
+        gene_feat = self._cached_gene_features.unsqueeze(0).unsqueeze(0).expand(B, S, -1, -1)
         token_emb = self.fuse_proj(torch.cat([token_emb, gene_feat], dim=-1))
         if context_emb is not None:
             context_emb = self.fuse_proj(torch.cat([context_emb, gene_feat], dim=-1))
@@ -564,28 +733,28 @@ class ConditionalDiffusionTransformer(nn.Module):
             flag = torch.zeros(B, S, N, dtype=torch.long, device=tokens.device)
         x = x + self.target_flag(flag)
 
-        x_seq = x.view(B, S * N, -1)
+        # Apply RoPE to x and context along gene axis (N)
+        positions = torch.arange(N, device=tokens.device)
+        x = self.rope(x, positions)
         if context_emb is not None:
-            x_seq = x_seq + self.segment_emb.weight[0]
-            context_emb = context_emb + self.segment_emb.weight[1]
-            context_seq = context_emb.view(B, S * N, -1)
-            kv_x = torch.cat([x_seq, context_seq], dim=1)
-        else:
-            kv_x = x_seq
+            context_emb = self.rope(context_emb, positions)
 
-        lat = self.lat.expand(B, -1, -1)
+        # Compress per-set genes to memory tokens and run trunk over flattened memory
+        mem = self.compressor(x)                        # (B,S,M,D)
+        mem_seq = mem.view(B, S * self.mem_slots, -1)  # (B,S·M,D)
+
+        lat = mem_seq
         use_ckpt = self.config.grad_ckpt and self.training and torch.is_grad_enabled()
-        kv = self.kv_ln(kv_x)
-        for i, block in enumerate(self.blocks):
-            ctx = kv if i % 2 == 0 else None
+        for _, block in enumerate(self.blocks):
             if use_ckpt:
-                lat = torch.utils.checkpoint.checkpoint(lambda _lat, _ctx: block(_lat, _ctx), lat, ctx, use_reentrant=True)
+                lat = torch.utils.checkpoint.checkpoint(lambda _lat: block(_lat, kv=None), lat, use_reentrant=True)
             else:
-                lat = block(lat, kv=ctx)
+                lat = block(lat, kv=None)  # self-attention over memory only
 
-        x_seq = x_seq + self.cross_attn_decode(self.gene_q_ln(x_seq), kv=self.lat_kv_ln(lat))
-        x = x_seq.view(B, S, N, -1)
-        h = self.ln_f(x)
+        mem_kv = lat.view(B, S, self.mem_slots, -1)  # (B,S,M,D)
+        # Decode from genes to memory using FlashAttention-based module
+        ctx = self.decode_attn(gene_q=x, mem_kv=mem_kv)  # (B,S,N,D)
+        h = self.ln_f(ctx)
         vocab_logits = self.head(h)
 
         if not (return_aux or self.return_aux):
@@ -613,15 +782,13 @@ class AbsorbingMaskMD4Continuous(nn.Module):
         self.eps = 1e-4
         self.t1 = 1e-2  # float(getattr(config, "t1", 1e-2))
         self.antithetic = bool(getattr(config, "antithetic_time_sampling", True))
-
         # Per-token polynomial exponent w_v (fixed schedule by default; non-trainable)
-        power_init = torch.ones(self.K) * float(getattr(config, "power_init", 1.0))
-        self.register_buffer("power_const", power_init)
+        self.power_const = torch.ones(self.K) * float(getattr(config, "power_init", 1.0))
 
     # ---- Schedule and derivatives ----
     def alpha(self, t: torch.Tensor) -> torch.Tensor:
         # Scalar α(t). If you want per-class exponents w_v, aggregate to scalar here.
-        w = F.softplus(self.power_const).mean().to(t.device)  # or just a single learnable scalar
+        w = F.softplus(self.power_const).mean()  # or just a single learnable scalar
         return 1.0 - (1.0 - self.eps) * t.clamp_min(1e-8) ** w
 
     def dgamma_times_alpha(self, t: torch.Tensor) -> torch.Tensor:
