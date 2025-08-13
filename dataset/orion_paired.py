@@ -74,20 +74,31 @@ class OrionPairedDataset(Dataset):  # noqa: E501
             print("OrionPairedDataset: HVG list contains Ensembl IDs, building mapping to gene symbols...")
             self._build_ensembl_to_symbol_map()
             
+            # Also check which Ensembl IDs are unmapped in the actual data
+            self._check_unmapped_genes()
+            
             # Convert HVG Ensembl IDs to gene symbols
             hvg_symbols = []
             unmapped = []
+            kept_as_ensembl = []
+            
             for ensembl_id in hvg_gene_ids:
-                if ensembl_id in self._ensembl_to_symbol_map:
+                if ensembl_id in self._unmapped_ensembl_ids:
+                    # This gene wasn't properly mapped in the data, keep as Ensembl ID
+                    hvg_symbols.append(ensembl_id)
+                    kept_as_ensembl.append(ensembl_id)
+                elif ensembl_id in self._ensembl_to_symbol_map:
                     hvg_symbols.append(self._ensembl_to_symbol_map[ensembl_id])
                 else:
                     unmapped.append(ensembl_id)
             
+            if kept_as_ensembl:
+                print(f"  Kept {len(kept_as_ensembl)} genes as Ensembl IDs (unmapped in data)")
             if unmapped:
-                print(f"  Warning: {len(unmapped)} HVG Ensembl IDs could not be mapped to gene symbols")
+                print(f"  Warning: {len(unmapped)} HVG Ensembl IDs could not be mapped")
             
-            print(f"  Mapped {len(hvg_symbols)}/{len(hvg_gene_ids)} HVG Ensembl IDs to gene symbols")
-            hvg_gene_ids = hvg_symbols  # Use gene symbols for filtering
+            print(f"  Converted {len(hvg_symbols)}/{len(hvg_gene_ids)} HVG genes for matching")
+            hvg_gene_ids = hvg_symbols  # Use converted list for filtering
 
         # Apply HVG filtering if provided
         if hvg_gene_ids is not None:
@@ -179,6 +190,34 @@ class OrionPairedDataset(Dataset):  # noqa: E501
             print(f"  Warning: Could not load symbol2ens.pkl: {e}, falling back to data-based mapping")
             self._build_ensembl_to_symbol_map_from_data()
     
+    def _check_unmapped_genes(self) -> None:
+        """Check which Ensembl IDs are unmapped (gene_symbol == ensembl_id) in the data."""
+        self._unmapped_ensembl_ids = set()
+        
+        meta_paths = sorted(self.root.glob("*.json"))
+        if not meta_paths:
+            return
+            
+        # Check the first batch file
+        meta = json.loads(meta_paths[0].read_text())
+        h5_path = str(meta.get("file", meta_paths[0].with_suffix(".h5ad")))
+        
+        try:
+            adata = sc.read_h5ad(h5_path, backed="r")
+            
+            if "gene_symbol" in adata.var.columns:
+                for ensembl_id, gene_symbol in zip(adata.var_names, adata.var["gene_symbol"]):
+                    # If gene_symbol is the same as ensembl_id, it's unmapped
+                    if str(ensembl_id).startswith("ENSG") and str(gene_symbol) == str(ensembl_id):
+                        self._unmapped_ensembl_ids.add(str(ensembl_id))
+            
+            adata.file.close()
+            
+            if self._unmapped_ensembl_ids:
+                print(f"  Found {len(self._unmapped_ensembl_ids)} unmapped Ensembl IDs in data")
+        except Exception as e:
+            print(f"  Warning: Could not check unmapped genes: {e}")
+    
     def _build_ensembl_to_symbol_map_from_data(self) -> None:
         """Fallback method to build mapping from data files if symbol2ens.pkl is not available."""
         meta_paths = sorted(self.root.glob("*.json"))
@@ -195,8 +234,13 @@ class OrionPairedDataset(Dataset):  # noqa: E501
             # Build the mapping
             if "gene_symbol" in adata.var.columns:
                 for ensembl_id, gene_symbol in zip(adata.var_names, adata.var["gene_symbol"]):
-                    # Skip entries where gene_symbol is the same as ensembl_id (unmapped)
-                    if not str(gene_symbol).startswith("ENSG"):
+                    # For unmapped genes (where symbol == ensembl_id), keep the Ensembl ID as the symbol
+                    # This ensures we don't lose genes like ENSG00000170846 that weren't properly mapped
+                    if str(gene_symbol).startswith("ENSG") and str(ensembl_id) == str(gene_symbol):
+                        # Keep the Ensembl ID as the symbol for unmapped genes
+                        self._ensembl_to_symbol_map[str(ensembl_id)] = str(gene_symbol)
+                    elif not str(gene_symbol).startswith("ENSG"):
+                        # Normal case: gene symbol is different from Ensembl ID
                         self._ensembl_to_symbol_map[str(ensembl_id)] = str(gene_symbol)
             
             adata.file.close()
