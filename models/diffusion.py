@@ -475,7 +475,8 @@ class LearnedSetCompressorFA(nn.Module):
         self.k_proj = Linear(dim, dim, bias=False)
         self.v_proj = Linear(dim, dim, bias=False)
         self.o_proj = Linear(dim, dim, bias=False)
-        self.norm_gene = LayerNorm(dim)
+        # Removed norm_gene to preserve RoPE information and prevent gradient instability
+        # self.norm_gene = LayerNorm(dim)  
         self.norm_slot = LayerNorm(dim)
 
     def _reshape_h(self, x: torch.Tensor) -> torch.Tensor:
@@ -490,8 +491,8 @@ class LearnedSetCompressorFA(nn.Module):
         B, S, N, D = x_gene.shape
         BS = B * S
 
-        # pre-norm gene features
-        xg = self.norm_gene(x_gene).reshape(BS, N, D)
+        # Project gene features directly (no norm to preserve RoPE)
+        xg = x_gene.reshape(BS, N, D)
         k = self._reshape_h(self.k_proj(xg))  # (BS,N,H,Hd)
         v = self._reshape_h(self.v_proj(xg))  # (BS,N,H,Hd)
 
@@ -639,11 +640,12 @@ class ConditionalDiffusionTransformer(nn.Module):
         
         # Memory RoPE: Apply positional encoding to compressed memory tokens
         # Pros: Ordered specialization, structured attention, better routing
-        # Cons: Loss of permutation invariance, slightly more complex
+        # Cons: Loss of permutation invariance, might need tuning for stability
         self.use_memory_rope = getattr(config, 'use_memory_rope', True)
         if self.use_memory_rope:
-            # Use different base for memory (slower rotation for broader context)
-            self.memory_rope = RotaryPositionalEmbedding(config.dim, base=50000.0)
+            # Use same base as gene RoPE for stability (10000.0)
+            # Higher bases can cause gradient instability during early training
+            self.memory_rope = RotaryPositionalEmbedding(config.dim, base=10000.0)
 
         self.ln_f = LayerNorm(config.dim)
         self.head = nn.Linear(config.dim, config.vocab_size + 1)

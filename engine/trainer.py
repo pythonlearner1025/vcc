@@ -500,10 +500,18 @@ class Trainer:
                 self.optimizer.zero_grad(set_to_none=True)
                 loss, raw_loss = losses
                 loss.backward()
-                # Calculate and print gradient norm before clipping
-                total_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), float('inf'))
-                print(f"Gradient norm before clipping: {total_norm:.4f}")
-                # Now clip to 1.0
+                # Calculate gradient norm before clipping (without modifying gradients)
+                total_norm = 0.0
+                for p in self.model.parameters():
+                    if p.grad is not None:
+                        param_norm = p.grad.data.norm(2).item()
+                        total_norm += param_norm ** 2
+                total_norm = total_norm ** 0.5
+                
+                # Log gradient norm if it's large
+                print(f"gradient norm before clipping: {total_norm:.4f}")
+                
+                # Clip gradients to prevent explosion
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
                 self.optimizer.step()
                 # Per-dataset schedule: linear warmup then immediate linear cooldown (no flat section),

@@ -39,7 +39,7 @@ model:
     finetune_full_mask_prob: 0.05
     use_fp8: false
     full_eval: true
-    use_aux: false
+    use_aux: true
 
 optimizer:
   optimizer_class: models.diffusion:create_muon_optimizer
