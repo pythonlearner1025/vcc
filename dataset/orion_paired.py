@@ -142,8 +142,45 @@ class OrionPairedDataset(Dataset):  # noqa: E501
     # ------------------------------------------------------------------
     
     def _build_ensembl_to_symbol_map(self) -> None:
-        """Build a mapping from Ensembl IDs to gene symbols from the data files."""
-        # Use the first available h5ad file to build the mapping
+        """Build a mapping from Ensembl IDs to gene symbols using symbol2ens.pkl."""
+        # Try multiple possible locations for the symbol2ens.pkl file
+        possible_paths = [
+            Path("/workspace/vcc/symbol2ens.pkl"),
+            Path("symbol2ens.pkl"),
+            self.root.parent / "symbol2ens.pkl",
+            Path("assets/symbol2ens.pkl"),
+        ]
+        
+        symbol2ens_path = None
+        for path in possible_paths:
+            if path.exists():
+                symbol2ens_path = path
+                break
+        
+        if symbol2ens_path is None:
+            print(f"  Warning: Could not find symbol2ens.pkl file, falling back to data-based mapping")
+            # Fallback to building from data files
+            self._build_ensembl_to_symbol_map_from_data()
+            return
+        
+        try:
+            # Load the symbol to Ensembl mapping
+            with symbol2ens_path.open("rb") as f:
+                symbol2ens = pickle.load(f)
+            
+            # Invert the mapping to get Ensembl to symbol
+            for symbol, ensembl in symbol2ens.items():
+                # Only add if it's a valid Ensembl ID
+                if ensembl.startswith("ENSG"):
+                    self._ensembl_to_symbol_map[ensembl] = symbol
+            
+            print(f"  Built mapping for {len(self._ensembl_to_symbol_map)} Ensembl IDs to gene symbols from {symbol2ens_path}")
+        except Exception as e:
+            print(f"  Warning: Could not load symbol2ens.pkl: {e}, falling back to data-based mapping")
+            self._build_ensembl_to_symbol_map_from_data()
+    
+    def _build_ensembl_to_symbol_map_from_data(self) -> None:
+        """Fallback method to build mapping from data files if symbol2ens.pkl is not available."""
         meta_paths = sorted(self.root.glob("*.json"))
         if not meta_paths:
             return
@@ -163,9 +200,9 @@ class OrionPairedDataset(Dataset):  # noqa: E501
                         self._ensembl_to_symbol_map[str(ensembl_id)] = str(gene_symbol)
             
             adata.file.close()
-            print(f"  Built mapping for {len(self._ensembl_to_symbol_map)} Ensembl IDs to gene symbols")
+            print(f"  Built mapping for {len(self._ensembl_to_symbol_map)} Ensembl IDs to gene symbols from data")
         except Exception as e:
-            print(f"  Warning: Could not build Ensembl to symbol mapping: {e}")
+            print(f"  Warning: Could not build Ensembl to symbol mapping from data: {e}")
 
     # ------------------------------------------------------------------
     # Metadata scanning helpers
