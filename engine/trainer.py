@@ -11,6 +11,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from engine.utils import Batch, adapt_batch, get_autocast_ctx, save_checkpoint
+from engine.agc import adaptive_clip_grad
 
 
 @dataclass
@@ -380,7 +381,7 @@ class Trainer:
                 # Build simple args namespace for evaluate routine
                 class _Args:
                     set_size = ds_spec.dataloader_args.get("set_size", getattr(cfg_obj, "pretrain_batch_size", 32))
-                    vocab_size = ds_spec.dataloader_args.get("vocab_size", getattr(cfg_obj, "vocab_size", 128))
+                    vocab_size = ds_spec.dataloader_args.get("vocab_size", getattr(cfg_obj, "vocab_size", 64))
                     batch_size = ds_spec.dataloader_args.get("batch_size", getattr(cfg_obj, "batch_size", 4))
                     test_genes_path = self.cfg.test_genes_path
                     blacklist_path = getattr(cfg_obj, "blacklist_path", "assets/blacklist.txt")
@@ -394,7 +395,7 @@ class Trainer:
 
                 # Tokeniser/Detokeniser for delta tokens
                 from tokenizer import create_delta_tokenizer
-                tokenizer, detok = create_delta_tokenizer(getattr(cfg_obj, "vocab_size", 128), max_value=getattr(cfg_obj, "token_max_value", 10.82))
+                tokenizer, detok = create_delta_tokenizer(getattr(cfg_obj, "vocab_size", 64), max_value=getattr(cfg_obj, "token_max_value", 10.82))
 
                 # Ensure val_dataset has mapping
                 setattr(val_dataset, "batch_to_idx", self.global_batch_mapping)
@@ -408,39 +409,41 @@ class Trainer:
                     except Exception:
                         diffusion_obj = None
                 
-                if self.cfg.test_prep_mode:
-                    print("test prep mode")
-                    _run_test_generation(
-                        cfg_obj,
-                        self.model,
-                        diffusion_obj,
-                        detok,
-                        gene_names,
-                        hvg_to_full,
-                        hvg_gene_ids,
-                        _Args,
-                        self.device,
-                        out_dir,
-                        1
-                    )
-                else:
-                    _run_validation_merged(
-                        cfg_obj,
-                        self.model,
-                        diffusion_obj,
-                        tokenizer,
-                        detok,
-                        gene_names,
-                        hvg_to_full,
-                        hvg_gene_ids,
-                        _Args,
-                        self.device,
-                        out_dir,
-                        batch_to_idx=self.global_batch_mapping,
-                        val_ds=val_dataset,
-                        val_dl=val_loader,
-                        max_genes=getattr(cfg_obj, "max_eval_genes", 10),
-                    )
+                # Run full evaluation without tracking gradients to avoid autograd graph buildup
+                with torch.no_grad():
+                    if self.cfg.test_prep_mode:
+                        print("test prep mode")
+                        _run_test_generation(
+                            cfg_obj,
+                            self.model,
+                            diffusion_obj,
+                            detok,
+                            gene_names,
+                            hvg_to_full,
+                            hvg_gene_ids,
+                            _Args,
+                            self.device,
+                            out_dir,
+                            1
+                        )
+                    else:
+                        _run_validation_merged(
+                            cfg_obj,
+                            self.model,
+                            diffusion_obj,
+                            tokenizer,
+                            detok,
+                            gene_names,
+                            hvg_to_full,
+                            hvg_gene_ids,
+                            _Args,
+                            self.device,
+                            out_dir,
+                            batch_to_idx=self.global_batch_mapping,
+                            val_ds=val_dataset,
+                            val_dl=val_loader,
+                            max_genes=getattr(cfg_obj, "max_eval_genes", 10),
+                        )
             except Exception as e:
                 import traceback
                 print(f"[eval] full_eval failed: {e}")
@@ -488,6 +491,9 @@ class Trainer:
                 self._eval(ds_spec)
                 break
             epoch_losses: List[float] = []
+            # Initialize gradient norm tracking variables
+            last_grad_norm_before = 0.0
+            last_grad_norm_after = 0.0
             self.model.train()
             start_t = time.time()
             for step_idx, batch in enumerate(dataloader):
@@ -500,19 +506,11 @@ class Trainer:
                 self.optimizer.zero_grad(set_to_none=True)
                 loss, raw_loss = losses
                 loss.backward()
-                # Calculate gradient norm before clipping (without modifying gradients)
-                total_norm = 0.0
-                for p in self.model.parameters():
-                    if p.grad is not None:
-                        param_norm = p.grad.data.norm(2).item()
-                        total_norm += param_norm ** 2
-                total_norm = total_norm ** 0.5
-                
-                # Log gradient norm if it's large
-                print(f"gradient norm before clipping: {total_norm:.4f}")
-                
-                # Clip gradients to prevent explosion
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                # Adaptive Gradient Clipping (AGC)
+                grad_norm_before, grad_norm_after = adaptive_clip_grad(self.model.parameters(), clip_factor=0.01)
+                # Store gradient norms for logging
+                last_grad_norm_before = grad_norm_before
+                last_grad_norm_after = grad_norm_after
                 self.optimizer.step()
                 # Per-dataset schedule: linear warmup then immediate linear cooldown (no flat section),
                 # using phase-local steps and total phase steps.
@@ -545,6 +543,8 @@ class Trainer:
                         "train/epoch": self.global_epoch,
                         "train/global_step": self.global_step,
                         "train/lr": lr_overall,
+                        "train/grad_norm_before": last_grad_norm_before,
+                        "train/grad_norm_after": last_grad_norm_after,
                     }
                     if has_split:
                         if lr_muon is not None:
@@ -567,7 +567,7 @@ class Trainer:
                         lr_str = f"lr_muon {lr_muon:.3e} lr_adam {lr_adam:.3e}"
                     else:
                         lr_str = f"lr {lr_overall:.3e}"
-                    print(f"[Epoch {local_epoch}][{phase_step}/{total_steps_per_phase}] | loss {stats['train/loss']:.3f} avg_loss {stats['train/loss_avg']:.3f} | {lr_str} | lr_overall {lr_overall:.3e}")
+                    print(f"[Epoch {local_epoch}][{phase_step}/{total_steps_per_phase}] | loss {stats['train/loss']:.3f} avg_loss {stats['train/loss_avg']:.3f} | grad_norm: {last_grad_norm_before:.3f} -> {last_grad_norm_after:.3f} | {lr_str} | lr_overall {lr_overall:.3e}")
                     self._log(stats)
                 if self.global_step % max(1, ds_spec.save_every_steps) == 0:
                     self._save(f"ep{self.global_epoch}_step{self.global_step}")

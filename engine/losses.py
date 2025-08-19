@@ -31,6 +31,8 @@ class DiffusionLoss:
             diffusion = self._create(getattr(model, "config", None), **self.diffusion_args)
             setattr(model, "_generic_trainer_diffusion", diffusion)
         diffusion = getattr(model, "_generic_trainer_diffusion")
+        print(f"Batch attributes:")
+        print(f"  soft_targets: {batch.soft_targets.shape if batch.soft_targets is not None else None}")
         losses = diffusion.compute_loss(
             model,
             batch.tokens,
@@ -38,6 +40,7 @@ class DiffusionLoss:
             target_gene_idx=batch.target_gene_idx,
             batch_idx=batch.batch_idx,
             delta_means=batch.delta_means,
+            soft_targets=batch.soft_targets,
             step=phase_step,
             max_steps=total_phase_steps,
             lambda_de=self.lambda_de,

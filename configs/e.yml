@@ -1,5 +1,5 @@
 run_name: scrna_to_vcc_diffusion
-#resume_from: checkpoints/scrna_to_vcc_diffusion_20250811_234339/checkpoint_ep9.pt
+resume_from: checkpoints/scrna_to_vcc_diffusion_20250814_212823/checkpoint_ep0_step1500.pt
 output_dir: checkpoints
 seed: 42
 device: cuda
@@ -15,19 +15,19 @@ model:
   config_class: models.diffusion:ConditionalModelConfig
   config_args:
     #n_xattn_loops: 12
-    dim: 784
+    dim: 640
     n_head: 16
-    n_layer: 16
+    n_layer: 12
     ffn_mult: 8
     # Learned set compressor: S·M = S * n_latents 
     n_latents: 256
-    compressor_iters: 2
+    compressor_iters: 1
     use_memory_rope: true  # Apply RoPE to memory tokens for structured attention
-    vocab_size: 128
+    vocab_size: 31
     token_max_value: 10.82
     n_genes: 6288
     n_total_genes: 6288
-    gene_embed_dim: 784
+    gene_embed_dim: 640
     n_technical_batches: 48
     batch_embed_dim: 40
     use_batch_conditioning: false
@@ -39,7 +39,8 @@ model:
     finetune_full_mask_prob: 0.05
     use_fp8: false
     full_eval: true
-    use_aux: true
+    use_aux: false
+    esm_matrix_path: esm_all.pt
 
 optimizer:
   optimizer_class: models.diffusion:create_muon_optimizer
@@ -50,9 +51,9 @@ loss:
   loss_args:
     diffusion_class: models.diffusion:AbsorbingMaskMD4Continuous
     # Aux loss knobs
-    lambda_de: 0.05
-    lambda_dir: 0.02
-    lambda_rank: 0.020
+    lambda_de: 0.05 #0.05
+    lambda_dir: 0.02 #0.02
+    lambda_rank: 0.02 #0.020
     de_pos_weight: 9.0
     signif_mode: percentile
     signif_arg: 0.1
@@ -60,25 +61,25 @@ loss:
 # Datasets stack with wrappers that compute HVGs/tokenizers internally
 # Provide simple arguments only.
 datasets:
-  # - name: orion_finetune
-  #   dataloader_factory: wrappers.factories:create_orion_finetune
-  #   dataloader_args:
-  #     data_dir: data/batched_5e4_norm
-  #     hvg_info_path: assets/hvg_seuratv3_6288.txt
-  #     set_size: 32
-  #     batch_size: 4
-  #     vocab_size: 128
-  #     max_value: 10.82
-  #     num_workers: 4
-  #   epochs: 1
-  #   log_every_steps: 1
-  #   save_every_steps: 1500
-  #   eval_every_epochs: 3
-  #   max_steps: 1000000
-  #   muon_lr: 0.02
-  #   adam_lr: 0.0002
-  #   warmup_steps: 125
-  #   token_weighting_annealing_steps: 1
+  #- name: orion_finetune
+  #  dataloader_factory: wrappers.factories:create_orion_finetune
+  #  dataloader_args:
+  #    data_dir: data/batched_5e4_norm
+  #    hvg_info_path: assets/hvg_seuratv3_6288.txt
+  #    set_size: 32
+  #    batch_size: 5
+  #    vocab_size: 31
+  #    max_value: 10.82
+  #    num_workers: 4
+  #  epochs: 0
+  #  log_every_steps: 1
+  #  save_every_steps: 1500
+  #  eval_every_epochs: 3
+  #  max_steps: 3000
+  #  muon_lr: 0.02
+  #  adam_lr: 0.0002
+  #  warmup_steps: 125
+  #  token_weighting_annealing_steps: 1
 
   - name: vcc_finetune
     dataloader_factory: wrappers.factories:create_vcc_finetune
@@ -86,7 +87,7 @@ datasets:
       adata_path: /competition_train.h5
       hvg_info_path: assets/hvg_seuratv3_6288.txt
       set_size: 32
-      vocab_size: 128
+      vocab_size: 31
       max_value: 10.82 
       batch_size: 5
       n_samples_per_gene_train: 10
@@ -101,6 +102,6 @@ datasets:
     eval_every_epochs: 3
     max_steps: null
     muon_lr: 0.02
-    adam_lr: 0.0001
-    warmup_steps: 250
+    adam_lr: 0.0002
+    warmup_steps: 125
     token_weighting_annealing_steps: 1

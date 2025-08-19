@@ -92,93 +92,92 @@ def create_logbin_tokenizer(vocab_size: int = 64, max_value: float = 9.2):
     tokenizer = SimpleTokenizer(vocab_size, max_value)
     return tokenizer, tokenizer.detokenize
 
-class DeltaTokenizer:
-    """Symmetric tokenizer for perturbation Δ values.
-
-    The vocabulary is split evenly between down-regulation (negative Δ) and up-regulation (positive Δ).
-    The final token id (``vocab_size-1``) is reserved for the `[MASK]` token used by the diffusion model.
+@torch.no_grad()
+def fit_delta_bins_quantiles(delta_all: torch.Tensor, K: int, eps: float = 1e-6):
     """
+    Fit quantile-based bins for delta tokenization.
+    
+    delta_all: (T, N) or (T,) all Δ samples across training (flatten ok)
+    K: total vocab including mask -> usable bins = K-1
+    Returns: bins tensor of length (K-1) for torch.bucketize (symmetrized around 0)
+    """
+    assert K % 2 == 0, "prefer even K so middle token is neutral"
+    V = K - 1                      # usable value bins (exclude mask)
+    half = V // 2                  # tokens per side, neutral sits at index `half`
 
-    def __init__(self, vocab_size: int = 256, max_abs: float = 9.2, min_abs: float = 1e-3):
-        """Args
-        -----
-        vocab_size:
-            Total vocabulary size **including** the mask token. Must be even so that the neutral
-            token sits exactly in the centre.
-        max_abs:
-            Largest absolute Δ (in log1p-space) to represent explicitly (≈log1p(10 000)=9.21).
-            Any value with |Δ| > ``max_abs`` will be clipped to the most extreme non-mask token.
-        min_abs:
-            Smallest non-zero |Δ| distinguishable by the tokenizer. Values |Δ| < ``min_abs`` are
-            assigned to the neutral bin (token ``half``).
-        """
-        # ------------------------------------------------------------------
-        # Sanity checks & bookkeeping
-        # ------------------------------------------------------------------
-        assert vocab_size % 2 == 0, "Prefer even vocab so that the mid-token encodes Δ≈0."
+    x = delta_all.abs().reshape(-1)
+    x = x[torch.isfinite(x)]
+    x = x[x > 0]                   # ignore exact 0 for magnitude quantiles
+    
+    # Quantile cutpoints for magnitudes (half bins on + side)
+    # Use monotone increasing quantiles from small to large magnitudes
+    q = torch.linspace(0, 1, steps=half+1, dtype=x.dtype, device=x.device)
+    q[0] = eps; q[-1] = 1 - eps    # avoid degenerate edges
+    pos_edges = torch.quantile(x, q)[1:]  # length = half
 
-        # Reserve last id for [MASK]
-        self.mask_token: int = vocab_size - 1
-        self._value_vocab_size: int = vocab_size - 1  # usable ids 0‥vocab_size-2
+    # Symmetric edges vector of length V (neg side, 0, pos side)
+    neg_edges = -pos_edges.flip(0)
+    bins = torch.cat([neg_edges, torch.tensor([0.0], device=x.device, dtype=x.dtype), pos_edges])  # len V
+    return bins  # pass to tokenizer as `self.bins`
 
-        self._half: int = self._value_vocab_size // 2  # token index representing Δ≈0
+class DeltaTokenizer:
+    """
+    Tokenizer for Δ with K data bins (no mask inside).
+    |Δ| < min_abs -> neutral mid token.
+    Supports both logspace and quantile-based binning.
+    """
+    def __init__(self, value_vocab_size: int = 64, max_abs: float = 9.2, min_abs: float = 1e-3, 
+                 delta_all: torch.Tensor = None, use_quantiles: bool = False):
+        assert value_vocab_size >= 3 and value_vocab_size % 2 == 1, \
+            "Prefer odd K so there is an exact neutral bin."
+        self.K = int(value_vocab_size)
+        self.half = self.K // 2
+        self.min_abs = float(min_abs)
 
-        # ------------------------------------------------------------------
-        # Build symmetric bin edges around 0
-        # ------------------------------------------------------------------
-        # Positive bin edges (> 0), distributed logarithmically in Δ-space
-        pos_edges = torch.logspace(
-            np.log10(min_abs),
-            np.log10(max_abs),
-            steps=self._half,
-            base=10.0,
-        )
-        neg_edges = -pos_edges.flip(0)
+        if use_quantiles and delta_all is not None:
+            # Use quantile-based bins fitted to actual data distribution
+            # Note: fit_delta_bins_quantiles expects K to include mask token
+            # So we pass K+1 since our K is the number of value bins
+            self.bins = fit_delta_bins_quantiles(delta_all, K=self.K+1, eps=1e-6)
+        else:
+            # Use original logspace binning
+            pos_edges = torch.logspace(np.log10(min_abs), np.log10(max_abs), steps=self.half, base=10.0)
+            neg_edges = -pos_edges.flip(0)
+            self.bins = torch.cat([neg_edges, torch.tensor([0.0]), pos_edges])  # len = K
 
-        # 0 sits exactly in the middle so that token `half` encodes Δ≈0
-        self.bins = torch.cat([neg_edges, torch.tensor([0.0]), pos_edges])  # len == _value_vocab_size
-
-    # ---------------------------------------------------------------------
-    # Public API
-    # ---------------------------------------------------------------------
     def __call__(self, x: torch.Tensor | np.ndarray) -> torch.Tensor:
-        """Vectorised tokenisation.
-
-        Any value outside the representable range will be saturated to the most extreme
-        non-mask token, never the `[MASK]` token.
-        """
         if not isinstance(x, torch.Tensor):
             x = torch.as_tensor(x)
-
-        # Keep `bins` on the same device as input for speed
         if x.device != self.bins.device:
             self.bins = self.bins.to(x.device)
+        tokens = torch.bucketize(x, self.bins).clamp(0, self.K - 1)
+        neutral = (x.abs() < self.min_abs)
+        tokens[neutral] = self.half
+        return tokens
 
-        tokens = torch.bucketize(x, self.bins)
-        return tokens.clamp(0, self._value_vocab_size - 1)  # ‑- reserve final id for [MASK]
-
-    # ------------------------------------------------------------------
-    # Helper for inverse transform (approximate)
-    # ------------------------------------------------------------------
     def detokenize(self, tokens: torch.Tensor) -> torch.Tensor:
-        """Map discrete tokens back to the centre of their bins (approximate Δ)."""
-        if tokens.device != self.bins.device:
-            bins = self.bins.to(tokens.device)
-        else:
-            bins = self.bins
-
-        # Bin centres – last token shares the last bin edge (saturating)
-        centres = torch.zeros(self._value_vocab_size, device=bins.device)
-        # Default: mid-bin centres
+        bins = self.bins if tokens.device == self.bins.device else self.bins.to(tokens.device)
+        centres = torch.empty(self.K, device=bins.device)
         centres[:-1] = (bins[:-1] + bins[1:]) / 2
         centres[-1] = bins[-1]
-        # Explicitly enforce neutral token to 0
-        centres[self._half] = 0.0
+        centres[self.half] = 0.0
+        return centres[tokens.clamp(0, self.K - 1)]
 
-        tokens_clamped = tokens.clamp(0, self._value_vocab_size - 1)
-        return centres[tokens_clamped]
-
-def create_delta_tokenizer(vocab_size: int = 256, max_value: float = 9.2, min_abs: float = 1e-3):
-    """Factory matching the signature of ``create_logbin_tokenizer`` used elsewhere."""
-    tok = DeltaTokenizer(vocab_size=vocab_size, max_abs=max_value, min_abs=min_abs)
+def create_delta_tokenizer(vocab_size: int = 64, max_value: float = 9.2, min_abs: float = 1e-3,
+                          delta_all: torch.Tensor = None, use_quantiles: bool = False):
+    """
+    Create a delta tokenizer with either logspace or quantile-based binning.
+    
+    Args:
+        vocab_size: Number of vocabulary bins (excluding mask)
+        max_value: Maximum absolute value for logspace binning (ignored if use_quantiles=True)
+        min_abs: Minimum absolute value threshold for neutral bin
+        delta_all: Training delta values for fitting quantile bins (required if use_quantiles=True)
+        use_quantiles: Whether to use quantile-based binning instead of logspace
+    
+    Returns:
+        Tuple of (tokenizer, detokenize_fn)
+    """
+    tok = DeltaTokenizer(value_vocab_size=vocab_size, max_abs=max_value, min_abs=min_abs,
+                        delta_all=delta_all, use_quantiles=use_quantiles)
     return tok, tok.detokenize

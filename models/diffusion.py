@@ -90,7 +90,7 @@ class ConditionalModelConfig:
     n_layer: int = 8
     ffn_mult: int = 8
     # Data vocabulary size (number of valid expression bins)
-    vocab_size: int = 128  # 64 expression bins (data tokens only; mask is separate)
+    vocab_size: int = 64  # 64 expression bins (data tokens only; mask is separate)
     # Optional explicit mask token id; if None it defaults to vocab_size (i.e., the first id after the data vocab)
     mask_token_id: Optional[int] = None
     token_max_value: float = 9.2
@@ -111,7 +111,7 @@ class ConditionalModelConfig:
     gene_embed_dim: int = 128
     
     # ESM2 embeddings
-    esm_matrix_path: Optional[str] = None # Path to precomputed ESM2 embeddings (None to skip)
+    esm_matrix_path: Optional[str] = "esm_all.pt" # Path to precomputed ESM2 embeddings (None to skip)
     esm_proj_dim: int = 256  # Projection dimension for ESM2 embeddings
     
     # Batch conditioning
@@ -340,12 +340,14 @@ class GroupedQueryAttention(nn.Module):
             return t * rms_inv
 
         q_norm = rmsnorm_lastdim(q)
+        k_norm = rmsnorm_lastdim(k)
+        v_norm = rmsnorm_lastdim(v)
 
         if HAS_FLASH_ATTN and x.is_cuda:
             # Flash attention natively supports GQA when k,v have fewer heads than q
             # Ensure k and v are contiguous after chunk operation
-            k = k.contiguous()  # (B, M, G, HD)
-            v = v.contiguous()  # (B, M, G, HD)
+            k = k_norm.contiguous()  # (B, M, G, HD)
+            v = v_norm.contiguous()  # (B, M, G, HD)
             
             # Flash attn expects (B, N, H, HD) for q and (B, M, G, HD) for grouped k/v
             out = flash_attn_func(
@@ -369,10 +371,10 @@ class GroupedQueryAttention(nn.Module):
             
             # Expand k, v from groups to all heads
             # Each group serves heads_per_group query heads
-            k = k.unsqueeze(2).expand(-1, -1, self.heads_per_group, -1, -1)  # (B, M, heads_per_group, G, HD)
+            k = k_norm.unsqueeze(2).expand(-1, -1, self.heads_per_group, -1, -1)  # (B, M, heads_per_group, G, HD)
             k = k.reshape(B, M, self.n_head, self.head_dim).transpose(1, 2)  # (B, H, M, HD)
             
-            v = v.unsqueeze(2).expand(-1, -1, self.heads_per_group, -1, -1)  # (B, M, heads_per_group, G, HD)
+            v = v_norm.unsqueeze(2).expand(-1, -1, self.heads_per_group, -1, -1)  # (B, M, heads_per_group, G, HD)
             v = v.reshape(B, M, self.n_head, self.head_dim).transpose(1, 2)  # (B, H, M, HD)
             
             # Use PyTorch's SDPA; pick backend based on device
@@ -476,7 +478,7 @@ class LearnedSetCompressorFA(nn.Module):
         self.v_proj = Linear(dim, dim, bias=False)
         self.o_proj = Linear(dim, dim, bias=False)
         # Removed norm_gene to preserve RoPE information and prevent gradient instability
-        # self.norm_gene = LayerNorm(dim)  
+        self.norm_gene = LayerNorm(dim)  
         self.norm_slot = LayerNorm(dim)
 
     def _reshape_h(self, x: torch.Tensor) -> torch.Tensor:
@@ -493,8 +495,8 @@ class LearnedSetCompressorFA(nn.Module):
 
         # Project gene features directly (no norm to preserve RoPE)
         xg = x_gene.reshape(BS, N, D)
-        k = self._reshape_h(self.k_proj(xg))  # (BS,N,H,Hd)
-        v = self._reshape_h(self.v_proj(xg))  # (BS,N,H,Hd)
+        k = self._reshape_h(self.k_proj(self.norm_gene(xg)))  # (BS,N,H,Hd)
+        v = self._reshape_h(self.v_proj(self.norm_gene(xg)))  # (BS,N,H,Hd)
 
         # init slots per set
         slots = self.slots.expand(B, S, -1, -1).reshape(BS, self.M, D)
@@ -614,7 +616,13 @@ class ConditionalDiffusionTransformer(nn.Module):
         self.control_id_emb = nn.Embedding(1, config.dim)
         # Learned set compressor (FlashAttention) to produce memory tokens per set
         self.mem_slots = int(getattr(config, "n_latents", 8))
-        self.compressor = LearnedSetCompressorFA(
+        self.x_compressor = LearnedSetCompressorFA(
+            dim=config.dim,
+            M=self.mem_slots,
+            heads=config.n_head,
+            iters=int(getattr(config, "compressor_iters", 2)),
+        )
+        self.c_compressor = LearnedSetCompressorFA(
             dim=config.dim,
             M=self.mem_slots,
             heads=config.n_head,
@@ -751,25 +759,42 @@ class ConditionalDiffusionTransformer(nn.Module):
         x = self.rope(x, positions)
         if context_emb is not None:
             context_emb = self.rope(context_emb, positions)
+            #x = torch.cat([x, context_emb], dim=1)  # Concatenate along sequence dimension
+            cmem = self.c_compressor(context_emb)                        # (B,S,M,D) or (B,2S,M,D) if context_emb present
+            cmem_seq = cmem.view(B, S * self.mem_slots, -1)  # (B,S·M,D)
 
         # Compress per-set genes to memory tokens
         # Note: Using RoPE-encoded features for compression to maintain positional awareness
-        mem = self.compressor(x)                        # (B,S,M,D)
-        mem_seq = mem.view(B, S * self.mem_slots, -1)  # (B,S·M,D)
+        xmem = self.x_compressor(x)                        # (B,S,M,D)
+        if context_emb is not None:
+            # Apply memory RoPE along slot dimension (M) before flattening
+            if getattr(self, 'use_memory_rope', False):
+                slot_positions = torch.arange(self.mem_slots, device=tokens.device)
+                xmem = self.memory_rope(xmem, slot_positions)
+                cmem = self.memory_rope(cmem, slot_positions)
+            # Flatten to sequences for attention over slots across sets
+            xmem_seq = xmem.view(B, S * self.mem_slots, -1)  # (B,S·M,D)
+            cmem_seq = cmem.view(B, S * self.mem_slots, -1)  # (B,S·M,D)
+            # Segment/type embeddings to disambiguate sources
+            xmem_seq = xmem_seq + self.segment_emb.weight[0]
+            cmem_seq = cmem_seq + self.segment_emb.weight[1]
+            kv_for_blocks = self.kv_ln(torch.cat([xmem_seq, cmem_seq], dim=1))  # include self + control as K/V
+        else:
+            if getattr(self, 'use_memory_rope', False):
+                slot_positions = torch.arange(self.mem_slots, device=tokens.device)
+                xmem = self.memory_rope(xmem, slot_positions)
+            xmem_seq = xmem.view(B, S * self.mem_slots, -1)
+            xmem_seq = xmem_seq + self.segment_emb.weight[0]
+            # Feed explicit normalized K/V to stabilise attention scales even without context
+            kv_for_blocks = self.kv_ln(xmem_seq)
 
-        # Apply RoPE to memory tokens for structured attention patterns
-        # Each memory slot gets positional identity: enables specialization & routing
-        if self.use_memory_rope:
-            mem_positions = torch.arange(S * self.mem_slots, device=tokens.device)
-            mem_seq = self.memory_rope(mem_seq, mem_positions)
-
-        lat = mem_seq
+        lat = xmem_seq
         use_ckpt = self.config.grad_ckpt and self.training and torch.is_grad_enabled()
         for _, block in enumerate(self.blocks):
             if use_ckpt:
-                lat = torch.utils.checkpoint.checkpoint(lambda _lat: block(_lat, kv=None), lat, use_reentrant=True)
+                lat = torch.utils.checkpoint.checkpoint(lambda _lat,_kv_for_blocks : block(_lat, _kv_for_blocks), lat, kv_for_blocks, use_reentrant=True)
             else:
-                lat = block(lat, kv=None)  # self-attention over memory only
+                lat = block(lat, kv=kv_for_blocks)
 
         mem_kv = lat.view(B, S, self.mem_slots, -1)  # (B,S,M,D)
         # Decode from genes to memory using FlashAttention-based module
@@ -823,7 +848,7 @@ class AbsorbingMaskMD4Continuous(nn.Module):
         alpha_t = self.alpha(t).view(B, *([1] * (x0.ndim - 1)))  # broadcast to x0 shape
         keep_prob = alpha_t.expand_as(x0)  # same keep prob for all tokens
         survive = torch.rand_like(keep_prob, dtype=keep_prob.dtype) < keep_prob
-        return torch.where(survive, x0, torch.full_like(x0, self.mask_token_id))
+        return torch.where(survive, x0, torch.full_like(x0, self.mask_token_id)) # replaced self.mask_token_id
 
     # ---- Helpers (ported) ----
     @staticmethod
@@ -897,6 +922,92 @@ class AbsorbingMaskMD4Continuous(nn.Module):
             denom += 1
         return (total / denom) if denom > 0 else s.new_zeros(())
 
+    def _masked_ce_loss(self, x_t, x0, logits, t):
+        # Ensure we have logits over data classes only (exclude mask category)
+        log_probs = F.log_softmax(logits[..., : self.K], dim=-1)
+        one_hot_x0 = F.one_hot(x0.clamp_max(self.K-1), num_classes=self.K).float()
+        neg_ce = -(one_hot_x0 * log_probs).sum(dim=-1)  # [B,S,N]
+        mask = (x_t == self.mask_token_id).float() # replaced mask_token_id
+        weight = self.dgamma_times_alpha(t).mean(dim=-1).view(x_t.shape[0], 1, 1)
+        loss = (mask * neg_ce * weight).sum(dim=(1, 2)) / mask.sum(dim=(1, 2)).clamp_min(1.0)
+        unweighted_loss = (mask * neg_ce).sum(dim=(1, 2)) / mask.sum(dim=(1, 2)).clamp_min(1.0)
+        return loss.mean(), unweighted_loss.mean()
+
+    def _masked_ce_soft_loss(self, x_t, logits, t, soft_targets):
+        """
+        x_t:          (B,S,N) masked input tokens at step t
+        logits:       (B,S,N,K+1) model output logits (data bins + mask bin)
+        t:            (B,) time steps
+        soft_targets: (B,N,K) per gene soft target dist (sum=1 over K data bins)
+        """
+        # 1. Take log-softmax over data bins only (exclude mask bin)
+        log_probs = F.log_softmax(logits[..., : self.K], dim=-1)  # (B,S,N,K)
+        
+        # Get probabilities for KL divergence computation
+        probs = F.softmax(logits[..., : self.K], dim=-1)  # (B,S,N,K)
+
+        # 2. Broadcast soft_targets across S
+        soft_targets_b = soft_targets.unsqueeze(1).expand_as(log_probs)  # (B,S,N,K)
+
+        # 3. Negative cross-entropy with soft targets
+        neg_ce = -(soft_targets_b * log_probs).sum(dim=-1)  # (B,S,N)
+
+        # 4. Mask out positions that aren't masked in x_t
+        mask = (x_t == self.mask_token_id).float()  # (B,S,N)
+        
+        # Compute KL divergence: KL(soft_targets || predicted_probs)
+        # KL(P||Q) = sum(P * log(P/Q)) = sum(P * log(P)) - sum(P * log(Q))
+        epsilon = 1e-10  # Small value to avoid log(0)
+        soft_targets_log = torch.log(soft_targets_b + epsilon)
+        kl_div = (soft_targets_b * (soft_targets_log - log_probs)).sum(dim=-1)  # (B,S,N)
+        
+        # Average KL divergence over masked positions
+        masked_kl = (mask * kl_div).sum() / mask.sum().clamp_min(1.0)
+        
+        # Define effective_bins function
+        def effective_bins(soft_targets):  # (B,N,K)
+            p = soft_targets.clamp_min(1e-12)
+            H = -(p * p.log()).sum(dim=-1)      # (B,N)
+            eff = torch.exp(H)                  # exp(entropy)
+            return eff.median().item(), eff.mean().item()
+        
+        # Print KL divergence statistics
+        if hasattr(self, '_log_counter'):
+            self._log_counter += 1
+        else:
+            self._log_counter = 0
+            
+        if self._log_counter % 100 == 0:  # Print every 10 iterations
+            # Compute effective bins for soft targets (sharpened)
+            eff_median, eff_mean = effective_bins(soft_targets)
+            
+            # Compute effective bins for predicted probabilities (only for masked positions)
+            # Average probs across S dimension for masked positions  
+            mask_expanded = mask.unsqueeze(-1).expand_as(probs)  # (B,S,N,K)
+            masked_probs = probs * mask_expanded  # Zero out non-masked positions
+            # Average over S dimension for masked positions
+            avg_probs = masked_probs.mean(dim=1)  # (B,N,K)
+            pred_eff_median, pred_eff_mean = effective_bins(avg_probs)
+            
+            print(f"[Step {self._log_counter}] KL divergence (masked tokens): {masked_kl.item():.4f}")
+            print(f"  - Mean KL per masked position: {masked_kl.item():.4f}")
+            print(f"  - Max KL per position: {(mask * kl_div).max().item():.4f}")
+            print(f"  - Min KL per position (non-zero): {kl_div[mask > 0].min().item() if (mask > 0).any() else 0:.4f}")
+            print(f"  - Num masked tokens: {mask.sum().item():.0f}")
+            print(f"  - Effective bins (sharpened targets γ=3.0) - Median: {eff_median:.2f}, Mean: {eff_mean:.2f}")
+            print(f"  - Effective bins (predictions) - Median: {pred_eff_median:.2f}, Mean: {pred_eff_mean:.2f}")
+
+        # 5. Weight schedule (same as before)
+        weight = self.dgamma_times_alpha(t).mean(dim=-1).view(x_t.shape[0], 1, 1)
+
+        # 6. Weighted average loss over masked positions
+        loss = (mask * neg_ce * weight).sum(dim=(1, 2)) / mask.sum(dim=(1, 2)).clamp_min(1.0)
+
+        # 7. Unweighted version for logging
+        unweighted_loss = (mask * neg_ce).sum(dim=(1, 2)) / mask.sum(dim=(1, 2)).clamp_min(1.0)
+
+        return loss.mean(), unweighted_loss.mean()
+
     # ---- Training loss ----
     def compute_loss(
         self,
@@ -914,6 +1025,7 @@ class AbsorbingMaskMD4Continuous(nn.Module):
         signif_mode: str = "percentile",
         signif_arg: float = 0.1,
         delta_means: Optional[torch.FloatTensor] = None,
+        soft_targets: Optional[torch.FloatTensor] = None,
         return_aux: bool = True,
     ) -> torch.Tensor:
         """Continuous-time MD4 objective with optional auxiliary DE losses."""
@@ -941,7 +1053,8 @@ class AbsorbingMaskMD4Continuous(nn.Module):
         )
         logits = out["logits"] if isinstance(out, dict) else out
 
-        main_loss, raw_main_loss = self._masked_ce_loss(zt, x0, logits, t)
+        #main_loss, raw_main_loss = self._masked_ce_loss(zt, x0, logits, t)
+        main_loss, raw_main_loss = self._masked_ce_soft_loss(zt, logits, t, soft_targets)
 
         aux_loss = logits.new_zeros(())
         aux_sig = logits.new_zeros(())
@@ -954,7 +1067,7 @@ class AbsorbingMaskMD4Continuous(nn.Module):
         scale = ramp(step)
         if return_aux and (control_set is not None) and isinstance(out, dict) and (delta_means is not None):
             # Build DE targets using per-gene mask derived from zt
-            mlm_mask = (zt == self.mask_token_id)  # (B,S,N) boolean
+            mlm_mask = (zt == self.mask_token_id)  # replaced mask_token_id (B,S,N) boolean
             mlm_mask_gene = mlm_mask.any(dim=1)    # (B,N)
             de_sig, de_dir, rank_score, valid = self.build_de_targets(
                 delta_means,
@@ -1004,16 +1117,7 @@ class AbsorbingMaskMD4Continuous(nn.Module):
 
         return total_loss, raw_main_loss
 
-    def _masked_ce_loss(self, x_t, x0, logits, t):
-        # Ensure we have logits over data classes only (exclude mask category)
-        log_probs = F.log_softmax(logits[..., : self.K], dim=-1)
-        one_hot_x0 = F.one_hot(x0.clamp_max(self.K - 1), num_classes=self.K).float()
-        neg_ce = -(one_hot_x0 * log_probs).sum(dim=-1)  # [B,S,N]
-        mask = (x_t == self.mask_token_id).float()
-        weight = self.dgamma_times_alpha(t).mean(dim=-1).view(x_t.shape[0], 1, 1)
-        loss = (mask * neg_ce * weight).sum(dim=(1, 2)) / mask.sum(dim=(1, 2)).clamp_min(1.0)
-        unweighted_loss = (mask * neg_ce).sum(dim=(1, 2)) / mask.sum(dim=(1, 2)).clamp_min(1.0)
-        return loss.mean(), unweighted_loss.mean()
+
 
     # ---- Inference ----
     @torch.no_grad()
@@ -1061,7 +1165,7 @@ class AbsorbingMaskMD4Continuous(nn.Module):
             # reshape for broadcasting over (S,N)
             unmask_prob = unmask_prob.view(B, *([1] * (x_t.ndim - 1)))
 
-            is_mask = (x_t == self.mask_token_id)
+            is_mask = (x_t == self.K)
             if is_mask.any():
                 # sample unmask flags only on masked positions
                 rand = torch.rand_like(is_mask, dtype=probs_data.dtype)
@@ -1094,7 +1198,7 @@ class AbsorbingMaskMD4Continuous(nn.Module):
 
         return x_t
 
-def create_muon_optimizer(model: nn.Module, config: ConditionalModelConfig, use_muon=False):
+def create_muon_optimizer(model: nn.Module, config: ConditionalModelConfig, use_muon=True):
     """Create Muon optimizer with weight decay.
 
     Falls back to a non-distributed variant when ``torch.distributed`` is not
@@ -1127,8 +1231,9 @@ def create_muon_optimizer(model: nn.Module, config: ConditionalModelConfig, use_
              lr=config.muon_lr if use_muon else config.adam_lr, 
              weight_decay=0.01,
              **({"betas": (0.9, 0.95)} if not use_muon else {})),
+        # no decay on norms/embeds
         dict(params=hidden_gains_biases + nonhidden_params, use_muon=False,
-             lr=config.adam_lr, betas=(0.9, 0.95), weight_decay=0.01),
+             lr=config.adam_lr, betas=(0.9, 0.95), weight_decay=0.00),
     ]
 
     # ---------------------------------------------------------
