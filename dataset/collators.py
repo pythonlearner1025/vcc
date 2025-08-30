@@ -109,7 +109,6 @@ def gaussian_targets_from_set(delta_set: torch.Tensor, bin_centers: torch.Tensor
     weights = weights / (weights.sum(dim=1, keepdim=True) + 1e-12)
     return weights  # (N,K)
 
-
 class VCCCollator:
     """Collate for VCC dataset, supports batch_size >= 1 and flattens to (B*S, N).
 
@@ -136,33 +135,35 @@ class VCCCollator:
         delta_means = []
         soft_targets = []
         for sample in batch_list:
-            pert = sample["perturbed_expr"].squeeze()  # (S,N)
-            ctrl = sample["control_expr"].squeeze()    # (S,N)
+            pert = sample["perturbed_expr"].squeeze().mean(0).unsqueeze(0)  # (1,N)
+            ctrl = sample["control_expr"].squeeze().mean(0).unsqueeze(0)    # (1,N)
             S, N = pert.shape
             # Tokenise targets as deltas and context as control
-            delta = pert - ctrl.mean(0)
-            pert_tok = self.tokenizer(delta)  # (S,N) – targets are Δ tokens
+            pert_tok = self.tokenizer(pert)  # (S,N) – targets are Δ tokens
             ctrl_tok = self.tokenizer(ctrl)   # (S,N) – context encodes control
             perts.append(pert_tok.long())
             ctrls.append(ctrl_tok.long())
             batch_ids.append(torch.tensor([self.batch_to_idx.get(b, 0) for b in sample["pert_batches"]], dtype=torch.long))
-            tgt_ids.append(torch.tensor(sample["target_gene_idx"], dtype=torch.long).repeat(S))
-            p_mean = pert.mean(0)
-            c_mean = ctrl.mean(0)
-            delta_means.append(p_mean - c_mean)
+            tgt_ids.append(torch.tensor(sample["target_gene_idx"], dtype=torch.long))
+            delta_means.append(pert - ctrl)
             # Build Gaussian soft targets over true bin centers (not edges)
-            soft_target = gaussian_targets_from_set(delta, self._bin_centers, save_debug=False)
-            soft_targets.append(soft_target)
-        tokens = torch.stack(perts, dim=0)   # (B,S,N)
-        control = torch.stack(ctrls, dim=0)  # (B,S,N)
+            #soft_target = gaussian_targets_from_set(delta, self._bin_centers, save_debug=False)
+            #soft_targets.append(soft_target)
+        tokens = torch.stack(perts, dim=0)   # (B,1,N)
+        control = torch.stack(ctrls, dim=0)  # (B,1,N)
+        assert tokens.shape == (B, S, N)
+        #control = torch.zeros_like(control)
         batch_idx = torch.stack(batch_ids, dim=0)  # (B,S,)
-        target_gene_idx = torch.stack(tgt_ids, dim=0)  # (B,S,)
-        delta_means = torch.stack(delta_means, dim=0)  # (B,S,)
-        soft_targets = torch.stack(soft_targets, dim=0) # (B,N,K)
+        target_gene_idx = torch.stack(tgt_ids, dim=0)  # (B,1,)
+        #target_gene_idx = torch.zeros_like(target_gene_idx)
+        delta_means = torch.stack(delta_means, dim=0).squeeze()  # (B,S,)
+        assert delta_means.shape == (B,N)
         
         # Sharpen targets (lower entropy) with numerical stability
         # Default to a safer 3–5 range; allow override via env for annealing/tuning
-        target_gamma = float(os.getenv("VCC_TARGET_GAMMA", "4.0"))
+        '''
+        soft_targets = torch.stack(soft_targets, dim=0) # (B,N,K)
+        target_gamma = float(os.getenv("VCC_TARGET_GAMMA", "2.0"))
         soft_targets_orig = soft_targets.clone()  # Save original for debugging
         
         # Method 1: Temperature-based sharpening (more stable)
@@ -180,6 +181,7 @@ class VCCCollator:
         # Add small epsilon to prevent exact zeros
         st = st * 0.9999 + 1e-6 / st.shape[-1]
         st = st / st.sum(dim=-1, keepdim=True)
+        '''
         
         out = {
             "tokens": tokens,
@@ -188,7 +190,7 @@ class VCCCollator:
             "target_gene_idx": target_gene_idx,
             "tokenizer": self.tokenizer,
             "delta_means": delta_means,
-            "soft_targets": st,   # <- sharpened targets
+            "soft_targets": None,   # <- sharpened targets
             #"soft_targets_orig": soft_targets_orig  # <- original for debug
         }
         return out

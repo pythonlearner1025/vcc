@@ -251,9 +251,6 @@ class VCCPairedDataset(Dataset):
         
         # Calculate log2 fold change for the target gene BEFORE exponentiating
         gene_idx_in_adata = self.adata.var.index.get_loc(sample['gene'])
-        pert_gene_expr_log = pert_expr[:, gene_idx_in_adata].mean()
-        ctrl_gene_expr_log = ctrl_expr[:, gene_idx_in_adata].mean()
-        log2fc = (pert_gene_expr_log - ctrl_gene_expr_log) / np.log(2)
 
         pert_expr = torch.from_numpy(pert_expr).float()
         ctrl_expr = torch.from_numpy(ctrl_expr).float()
@@ -263,7 +260,6 @@ class VCCPairedDataset(Dataset):
             'control_expr': ctrl_expr,
             'target_gene': sample['gene'],
             'target_gene_idx': sample['gene_idx'],
-            'log2fc': torch.tensor(float(log2fc), dtype=torch.float32),
             'pert_batches': sample['pert_batches'].tolist(),
             'ctrl_batches': sample['ctrl_batches'].tolist(),
             'cell_type': sample['cell_type'],
@@ -365,7 +361,7 @@ def create_vcc_train_val_dataloaders(
         n_samples_per_gene=n_samples_per_gene_val,
         train_split=train_split,
         is_train=False,
-        batch_size=batch_size,
+        batch_size=24, # hardcode balcklist.txt gene size
         num_workers=0,  # Disable multiprocessing for validation
         shuffle=False,
         random_seed=random_seed,

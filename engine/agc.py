@@ -22,48 +22,42 @@ from typing import Iterable
 
 import torch
 
-
 def adaptive_clip_grad(
     parameters: Iterable[torch.nn.Parameter],
     *,
     clip_factor: float = 0.01,
     eps: float = 1e-3,
+    max_norm: float | None = None,
 ) -> tuple[float, float]:
-    """Applies Adaptive Gradient Clipping (AGC) in-place.
+    before = 0.0
+    after = 0.0
+    params = [p for p in parameters if p.grad is not None]
 
-    Parameters
-    ----------
-    parameters : Iterable[torch.nn.Parameter]
-        Model parameters to process. Typically ``model.parameters()``.
-    clip_factor : float, default 0.01
-        Maximum allowed ratio between \|g\| and \|\theta\|. Brock et al. use
-        0.01 which works well in practice.
-    eps : float, default 1e-3
-        Small constant for numerical stability and to protect parameters
-        with near-zero norms (e.g. biases).
-    
-    Returns
-    -------
-    tuple[float, float]
-        A tuple of (total_grad_norm_before, total_grad_norm_after) clipping.
-    """
-    before = 0
-    after = 0
-    for p in parameters:
-        if p.grad is None:
-            continue
-        # Detach to avoid tracking in autograd graph; keep dtype/device.
+    if not params:
+        return before, after
+
+    if max_norm is not None:
+        # Global clipping path
+        total_norm = torch.norm(torch.stack([torch.norm(p.grad.detach()) for p in params]))
+        before = total_norm.item()
+        if total_norm > max_norm:
+            scale = max_norm / (total_norm + eps)
+            for p in params:
+                p.grad.mul_(scale)
+        after = torch.norm(torch.stack([torch.norm(p.grad.detach()) for p in params])).item()
+        return before, after
+
+    # AGC path
+    for p in params:
         param_norm = torch.norm(p.detach())
         grad_norm = torch.norm(p.grad.detach())
         before += grad_norm.item()
 
-        # Compute max allowed grad norm for this parameter.
-        max_norm = (param_norm + eps) * clip_factor
-        if grad_norm > max_norm:
-            # Rescale gradient in-place.
-            clip_coef = max_norm / (grad_norm + eps)
-            p.grad.mul_(clip_coef)
-            grad_norm = grad_norm.item() * clip_coef
+        local_max = (param_norm + eps) * clip_factor
+        if grad_norm > local_max:
+            scale = local_max / (grad_norm + eps)
+            p.grad.mul_(scale)
+            grad_norm = grad_norm.item() * scale
         after += grad_norm.item()
-    
-    return before, after 
+
+    return before, after

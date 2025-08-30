@@ -1,5 +1,5 @@
 run_name: scrna_to_vcc_diffusion
-resume_from: checkpoints/scrna_to_vcc_diffusion_20250814_212823/checkpoint_ep0_step1500.pt
+#resume_from: checkpoints/scrna_to_vcc_diffusion_20250820_072032/checkpoint_ep121.pt
 output_dir: checkpoints
 seed: 42
 device: cuda
@@ -14,9 +14,9 @@ model:
   model_class: models.diffusion:ConditionalDiffusionTransformer
   config_class: models.diffusion:ConditionalModelConfig
   config_args:
-    #n_xattn_loops: 12
     dim: 640
     n_head: 16
+    n_group: 16
     n_layer: 12
     ffn_mult: 8
     # Learned set compressor: S·M = S * n_latents 
@@ -31,7 +31,7 @@ model:
     n_technical_batches: 48
     batch_embed_dim: 40
     use_batch_conditioning: false
-    n_timesteps: 16
+    n_timesteps: 64
     schedule: cosine
     pretrain_mask_ratio: 0.65
     finetune_mask_ratio_end: 1.0
@@ -61,25 +61,24 @@ loss:
 # Datasets stack with wrappers that compute HVGs/tokenizers internally
 # Provide simple arguments only.
 datasets:
-  #- name: orion_finetune
-  #  dataloader_factory: wrappers.factories:create_orion_finetune
-  #  dataloader_args:
-  #    data_dir: data/batched_5e4_norm
-  #    hvg_info_path: assets/hvg_seuratv3_6288.txt
-  #    set_size: 32
-  #    batch_size: 5
-  #    vocab_size: 31
-  #    max_value: 10.82
-  #    num_workers: 4
-  #  epochs: 0
-  #  log_every_steps: 1
-  #  save_every_steps: 1500
-  #  eval_every_epochs: 3
-  #  max_steps: 3000
-  #  muon_lr: 0.02
-  #  adam_lr: 0.0002
-  #  warmup_steps: 125
-  #  token_weighting_annealing_steps: 1
+  - name: scrna_pretrain
+    dataloader_factory: wrappers.factories:create_scrna_pretrain
+    dataloader_args:
+      data_dir: data/scRNA/processed
+      hvg_info_path: assets/hvg_seuratv3_6288.txt
+      batch_size: 128
+      vocab_size: 31
+      max_value: 10.82
+      num_workers: 4
+    epochs: 1
+    log_every_steps: 1
+    save_every_steps: 1500
+    eval_every_epochs: 1
+    max_steps: null
+    muon_lr: 0.03
+    adam_lr: 0.0003
+    warmup_steps: 1000
+    token_weighting_annealing_steps: 1
 
   - name: vcc_finetune
     dataloader_factory: wrappers.factories:create_vcc_finetune
@@ -89,19 +88,19 @@ datasets:
       set_size: 32
       vocab_size: 31
       max_value: 10.82 
-      batch_size: 5
+      batch_size: 128
       n_samples_per_gene_train: 10
       n_samples_per_gene_val: 1
       train_split: 0.8
       num_workers: 4
       random_seed: 42
       blacklist_path: assets/blacklist.txt
-    epochs: 9
+    epochs: 100 
     log_every_steps: 1
-    save_every_steps: 1500
-    eval_every_epochs: 3
+    save_every_steps: 15000
+    eval_every_epochs: 30
     max_steps: null
     muon_lr: 0.02
     adam_lr: 0.0002
-    warmup_steps: 125
+    warmup_steps: 30
     token_weighting_annealing_steps: 1

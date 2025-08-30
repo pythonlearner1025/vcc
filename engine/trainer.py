@@ -394,8 +394,8 @@ class Trainer:
                 out_dir.mkdir(parents=True, exist_ok=True)
 
                 # Tokeniser/Detokeniser for delta tokens
-                from tokenizer import create_delta_tokenizer
-                tokenizer, detok = create_delta_tokenizer(getattr(cfg_obj, "vocab_size", 64), max_value=getattr(cfg_obj, "token_max_value", 10.82))
+                from tokenizer import create_logbin_tokenizer
+                tokenizer, detok = create_logbin_tokenizer(getattr(cfg_obj, "vocab_size", 64), max_value=getattr(cfg_obj, "token_max_value", 10.82))
 
                 # Ensure val_dataset has mapping
                 setattr(val_dataset, "batch_to_idx", self.global_batch_mapping)
@@ -507,7 +507,7 @@ class Trainer:
                 loss, raw_loss = losses
                 loss.backward()
                 # Adaptive Gradient Clipping (AGC)
-                grad_norm_before, grad_norm_after = adaptive_clip_grad(self.model.parameters(), clip_factor=0.01)
+                grad_norm_before, grad_norm_after = adaptive_clip_grad(self.model.parameters(), clip_factor=0.01, max_norm=None)
                 # Store gradient norms for logging
                 last_grad_norm_before = grad_norm_before
                 last_grad_norm_after = grad_norm_after
@@ -577,7 +577,8 @@ class Trainer:
             print(f"Epoch {self.global_epoch} finished in {epoch_time:.1f}s | loss {avg_epoch_loss:.4f}")
             if (local_epoch + 1) % max(1, ds_spec.eval_every_epochs) == 0:
                 self._eval(ds_spec)
-            self._save(f"ep{self.global_epoch}")
+                # only save at eval points
+                self._save(f"ep{self.global_epoch}")
 
     def _forward_loss(self, batch: Batch) -> torch.Tensor:
         raise NotImplementedError

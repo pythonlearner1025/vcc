@@ -610,7 +610,7 @@ def create_orion_train_val_dataloaders(
     tokenizer=None,  # kept for signature parity
     prefetch_factor: int = 2,
     pin_memory: bool = False,
-    train_split: float = 0.8,
+    train_split: float = 1.0,
     shuffle_train: bool = True,
     control_label: str = "Non-Targeting",
 ):
@@ -643,7 +643,7 @@ def create_orion_train_val_dataloaders(
         prefetch_factor=prefetch_factor,
         pin_memory=pin_memory,
         collate_fn=collate_fn,
-        batch_size=batch_size,
+        batch_size=24, # hardcode to 24
     )
 
     return (train_ds, train_dl), (val_ds, val_dl)

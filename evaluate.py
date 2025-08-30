@@ -249,6 +249,8 @@ def _run_validation_merged(
     X_pred_parts = []
     obs_labels: list[str] = []
 
+    assert len(val_dl) != 0
+
     steps = 0
     for sample in val_dl:
         #if steps >= 1:
@@ -307,8 +309,6 @@ def _run_validation_merged(
                 target_gene_idx=gene_idxs,
                 batch_idx=None #temporarily disable batch conditioning
             )
-    
-
         # In delta mode: detokenizer returns Δ; reconstruct expr = control + Δ
         delta_pred_2k = _tokens_to_expression(pred_tokens, detokenizer)  # (B,S,N)
         pred_expr_2k = (ctrl_expr + delta_pred_2k).astype(np.float32)
@@ -587,6 +587,7 @@ def _run_test_generation(
 
             # Tokenise controls directly on GPU to avoid CPU round-trips
             ctrl_expr_t = torch.from_numpy(ctrl_expr_cpu_batch).to(device, non_blocking=True)
+            ctrl_expr_t = ctrl_expr_t.mean()
             tokens_ctrl_t = tokenizer(ctrl_expr_t).long()
 
             # Split into predicted vs control-only entries
@@ -765,5 +766,5 @@ if __name__ == "__main__":
     main()
 
 '''
-cell-eval prep -i checkpoints/scrna_to_vcc_diffusion_20250811_002641/eval_ep9/test_predictions.h5ad -g /workspace/vcc/data/vcc_data/gene_names.csv
+cell-eval prep -i checkpoints/scrna_to_vcc_diffusion_20250820_051531/eval_ep30/test_predictions.h5ad-g /workspace/vcc/data/vcc_data/gene_names.csv
 '''
