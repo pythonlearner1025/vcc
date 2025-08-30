@@ -17,7 +17,7 @@ def create_orion_finetune(
     data_dir: str,
     hvg_info_path: str,
     set_size: int = 128,
-    vocab_size: int = 128,
+    vocab_size: int = 64,
     max_value: float = 10.82,
     train_split: float = 0.8,
     batch_size: int = 1,
@@ -45,7 +45,7 @@ def create_scrna_pretrain(
     data_dir: str,
     hvg_info_path: str,
     batch_size: int = 128,
-    vocab_size: int = 128,
+    vocab_size: int = 64,
     max_value: float = 10.82,
     num_workers: int = 0,
     use_cache: bool = True,
@@ -68,6 +68,15 @@ def create_scrna_pretrain(
             _ = scrna_dataset._load_batch(i)
     tokenizer, _ = create_logbin_tokenizer(vocab_size=vocab_size, max_value=max_value)
     tokenized = TokenizedScRNADataset(scrna_dataset, tokenizer)
+
+    def collate_with_subbatch(S):
+        def _fn(batch):
+            x = torch.utils.data.default_collate(batch)  # (B, N)
+            B, N = x.shape
+            assert B % S == 0, f"Batch {B} not divisible by subbatch size {S}"
+            return x.view(B // S, S, N)  # (B//S, S, N)
+        return _fn
+
     dataloader = torch.utils.data.DataLoader(
         tokenized,
         batch_size=batch_size,
@@ -77,6 +86,7 @@ def create_scrna_pretrain(
         prefetch_factor=4 if num_workers > 0 else None,
         persistent_workers=True if num_workers > 0 else False,
         drop_last=True,
+        collate_fn=collate_with_subbatch(1),  # <- wrap
     )
     return tokenized, dataloader
 
@@ -86,7 +96,7 @@ def create_vcc_finetune(
     hvg_info_path: str,
     set_size: int = 128,
     batch_size: int = 1,
-    vocab_size: int = 128,
+    vocab_size: int = 64,
     max_value: float = 10.82,
     n_samples_per_gene_train: int = 10,
     n_samples_per_gene_val: int = 1,

@@ -16,6 +16,7 @@ compare_metrics.py
 *.whl
 *.tsv
 Muon/
+debug*/
 
 # out dirs
 checkpoints/

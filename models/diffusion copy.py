@@ -456,7 +456,7 @@ class LearnedSetCompressorFA(nn.Module):
         B_, L, D = x.shape
         return x.view(B_, L, self.H, self.Hd)
 
-    def forward(self, x_gene: torch.Tensor, pert = None) -> torch.Tensor:
+    def forward(self, x_gene: torch.Tensor) -> torch.Tensor:
         """
         x_gene: (B,S,N,D)
         returns mem: (B,S,M,D)
@@ -474,14 +474,6 @@ class LearnedSetCompressorFA(nn.Module):
 
         # init slots per set
         slots = self.slots.expand(B, S, -1, -1).reshape(BS, self.M, D)
-        if pert is not None:
-            # Experiment: add pert only to first 25 memory tokens
-            pert = pert.unsqueeze(1)
-            print(f"adding pert {pert.shape} to first 25 slots of {slots.shape}")
-            # Add pert to first 25 slots, leave remaining slots unchanged
-            first_25_slots = slots[:, :10] + pert  # Modified first 25 slots
-            remaining_slots = slots[:, 10:]         # Unchanged remaining slots
-            slots = torch.cat([first_25_slots, remaining_slots], dim=1)
         for _ in range(self.iters):
             qs = self._reshape_h(self.q_proj(self.norm_slot(slots)))  # (BS,M,H,Hd)
             # Apply RoPE to slot queries across the slot dimension (M)
@@ -567,9 +559,6 @@ class ConditionalDiffusionTransformer(nn.Module):
         super().__init__()
         self.config = config
         self.fp8_enabled = getattr(config, "use_fp8", False) 
-        
-        # experimental conditioning memory token
-        self.pert_memory = nn.Parameter(torch.randn(config.n_total_genes, config.dim) * 0.02)
 
         self.token_emb = nn.Embedding(config.vocab_size + 1, config.dim)
         self.gene_embed = AugmentedGeneEmbedding(
@@ -694,10 +683,10 @@ class ConditionalDiffusionTransformer(nn.Module):
         context_emb = self.token_emb(control_context) if control_context is not None else None
 
         gene_feat = self.gene_proj(self.gene_embed(self._gene_ids))      # (N, id_dim)->(N, D)
-        gene_feat_projected = gene_feat.to(token_emb.dtype).unsqueeze(0).unsqueeze(0).expand(B, S, -1, -1)
-        token_emb = self.fuse_proj(torch.cat([token_emb, gene_feat_projected], dim=-1))
+        gene_feat = gene_feat.to(token_emb.dtype).unsqueeze(0).unsqueeze(0).expand(B, S, -1, -1)
+        token_emb = self.fuse_proj(torch.cat([token_emb, gene_feat], dim=-1))
         if context_emb is not None:
-            context_emb = self.fuse_proj(torch.cat([context_emb, gene_feat_projected], dim=-1))
+            context_emb = self.fuse_proj(torch.cat([context_emb, gene_feat], dim=-1))
 
         x = token_emb
         t_emb = self.time_emb(timesteps.float())[:, None, None, :]
@@ -728,14 +717,8 @@ class ConditionalDiffusionTransformer(nn.Module):
         idx = torch.arange(N, device=tokens.device)[None, None, :]
         if target_gene_idx is not None:
             flag = (idx == tgt[:, :, None]).long()
-            #assert target_gene_idx.shape == (B,)
-            #print(target_gene_idx.shape)
-            #print(gene_feat.shape)
-            pert_feats = self.pert_memory[target_gene_idx]
-            #print(pert_feats.shape)
         else:
             flag = torch.zeros(B, S, N, dtype=torch.long, device=tokens.device)
-            pert_feats = None
         x = x + self.target_flag(flag)
 
         if context_emb is not None:
@@ -744,7 +727,7 @@ class ConditionalDiffusionTransformer(nn.Module):
 
         # Compress per-set genes to memory tokens
         # Note: Using RoPE-encoded features for compression to maintain positional awareness across genes
-        xmem = self.x_compressor(x, pert=pert_feats)  # (B,S,M,D)
+        xmem = self.x_compressor(x)  # (B,S,M,D)
 
         # Add segment/type embeddings to disambiguate sources
         xmem = xmem + self.segment_emb.weight[0]
@@ -1095,6 +1078,8 @@ class AbsorbingMaskMD4Continuous(nn.Module):
             pass
 
         return total_loss, raw_main_loss
+
+
 
     # ---- Inference ----
     @torch.no_grad()

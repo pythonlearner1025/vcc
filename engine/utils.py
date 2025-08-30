@@ -38,6 +38,7 @@ class Batch:
     batch_idx: Optional[torch.Tensor] = None
     delta_means: Optional[torch.Tensor] = None
     tokenizer: Optional[Any] = None
+    soft_targets: Optional[torch.Tensor] = None
 
 
 def adapt_batch(batch: Any, device: torch.device) -> Batch:
@@ -62,11 +63,14 @@ def adapt_batch(batch: Any, device: torch.device) -> Batch:
         batch_idx = batch.get("batch_idx")
         if batch_idx is not None:
             batch_idx = batch_idx.to(device, non_blocking=True)
-        if "delta_means" in batch and batch["delta_means"] is not None:
-            dm = batch["delta_means"]
-            delta_means = dm.to(device, non_blocking=True)
+        delta_means = batch.get("delta_means")
+        if delta_means is not None:
+            delta_means = delta_means.to(device, non_blocking=True)
+        soft_targets = batch.get("soft_targets")
+        if soft_targets is not None:
+            soft_targets = soft_targets.to(device, non_blocking=True)
         tokenizer = batch.get("tokenizer")
-        return Batch(tokens=tokens, control=control, target_gene_idx=target_gene_idx, batch_idx=batch_idx, delta_means=delta_means, tokenizer=tokenizer)
+        return Batch(tokens=tokens, control=control, target_gene_idx=target_gene_idx, batch_idx=batch_idx, delta_means=delta_means, tokenizer=tokenizer, soft_targets=soft_targets)
     if isinstance(batch, (tuple, list)) and len(batch) > 0 and isinstance(batch[0], torch.Tensor):
         tokens = batch[0].to(device, non_blocking=True)
         return Batch(tokens=tokens)

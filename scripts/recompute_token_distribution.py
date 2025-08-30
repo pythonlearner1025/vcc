@@ -31,7 +31,7 @@ from torch.utils.data import DataLoader
 # Local imports – keep them here to avoid import-time GPU allocations in PyTorch
 # -----------------------------------------------------------------------------
 from models.diffusion import ConditionalModelConfig
-from tokenizer import create_logbin_tokenizer  # Re-use the helper from train.py
+from tokenizer import create_delta_tokenizer
 from dataset.scrna_hvg_dataset import (
     ScRNADatasetWithHVGs,
     create_scrna_hvg_dataloader,
@@ -101,7 +101,7 @@ def main():
         config.vocab_size = args.vocab_size
     vocab_size = config.vocab_size
 
-    tokenizer, _ = create_logbin_tokenizer(vocab_size)
+    tokenizer, _ = create_delta_tokenizer(vocab_size)
 
     # Ensure output directory exists
     output_path = Path(args.output).expanduser().resolve()

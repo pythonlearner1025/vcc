@@ -4,7 +4,7 @@ Download a randomly sampled subset of human single-cell RNA-seq data from scBase
 Optimized for discrete diffusion transformer training with PyTorch.
 
 Usage:
-    python download.py --cell-count 1000000 --output-dir data/scRNA
+    python dataset/download.py --cell-count 30000000 --output-dir data/scRNA
 """
 
 import argparse
