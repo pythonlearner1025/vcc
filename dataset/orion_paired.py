@@ -67,6 +67,38 @@ class OrionPairedDataset(Dataset):  # noqa: E501
         self._adata_cache: Dict[str, sc.AnnData] = {}
         self._gene_symbols_cache: Dict[str, np.ndarray] = {}
         self._sample_cache: Dict[str, np.ndarray] = {}
+        self._ensembl_to_symbol_map: Dict[str, str] = {}  # Map Ensembl IDs to gene symbols
+
+        # Build Ensembl ID to gene symbol mapping if needed
+        if hvg_gene_ids is not None and hvg_gene_ids and hvg_gene_ids[0].startswith('ENSG'):
+            print("OrionPairedDataset: HVG list contains Ensembl IDs, building mapping to gene symbols...")
+            self._build_ensembl_to_symbol_map()
+            
+            # Also check which Ensembl IDs are unmapped in the actual data
+            self._check_unmapped_genes()
+            
+            # Convert HVG Ensembl IDs to gene symbols
+            hvg_symbols = []
+            unmapped = []
+            kept_as_ensembl = []
+            
+            for ensembl_id in hvg_gene_ids:
+                if ensembl_id in self._unmapped_ensembl_ids:
+                    # This gene wasn't properly mapped in the data, keep as Ensembl ID
+                    hvg_symbols.append(ensembl_id)
+                    kept_as_ensembl.append(ensembl_id)
+                elif ensembl_id in self._ensembl_to_symbol_map:
+                    hvg_symbols.append(self._ensembl_to_symbol_map[ensembl_id])
+                else:
+                    unmapped.append(ensembl_id)
+            
+            if kept_as_ensembl:
+                print(f"  Kept {len(kept_as_ensembl)} genes as Ensembl IDs (unmapped in data)")
+            if unmapped:
+                print(f"  Warning: {len(unmapped)} HVG Ensembl IDs could not be mapped")
+            
+            print(f"  Converted {len(hvg_symbols)}/{len(hvg_gene_ids)} HVG genes for matching")
+            hvg_gene_ids = hvg_symbols  # Use converted list for filtering
 
         # Apply HVG filtering if provided
         if hvg_gene_ids is not None:
@@ -75,13 +107,146 @@ class OrionPairedDataset(Dataset):  # noqa: E501
         else:
             self.hvg_gene_ids = self.gene_list  # defined in _scan_batches
 
-        self.target_genes = sorted(self._pert_cells_by_gene.keys())
+        all_target_genes = sorted(self._pert_cells_by_gene.keys())
+        
+        # Filter out target genes that are not in the HVG list
+        if hvg_gene_ids is not None:
+            hvg_set = set(hvg_gene_ids)
+            
+            # Keep only target genes that are in HVG list
+            target_genes_in_hvg = [gt for gt in all_target_genes if gt in hvg_set]
+            target_genes_not_in_hvg = [gt for gt in all_target_genes if gt not in hvg_set]
+            
+            print(f"OrionPairedDataset: Filtering target genes by HVG list...")
+            print(f"  - Total target genes: {len(all_target_genes)}")
+            print(f"  - Target genes IN HVG list: {len(target_genes_in_hvg)} ({100*len(target_genes_in_hvg)/len(all_target_genes) if all_target_genes else 0:.1f}%)")
+            print(f"  - Target genes NOT in HVG list (excluded): {len(target_genes_not_in_hvg)} ({100*len(target_genes_not_in_hvg)/len(all_target_genes) if all_target_genes else 0:.1f}%)")
+            
+            if target_genes_not_in_hvg and len(target_genes_not_in_hvg) <= 20:
+                print(f"  - Excluded non-HVG targets: {target_genes_not_in_hvg}")
+            elif target_genes_not_in_hvg:
+                print(f"  - Examples of excluded non-HVG targets: {target_genes_not_in_hvg[:10]}")
+            
+            # Remove non-HVG target genes from the perturbation dictionary
+            for gene_to_remove in target_genes_not_in_hvg:
+                del self._pert_cells_by_gene[gene_to_remove]
+            
+            self.target_genes = target_genes_in_hvg
+            print(f"  - Final number of target genes after filtering: {len(self.target_genes)}")
+        else:
+            # No HVG filtering, use all target genes
+            self.target_genes = all_target_genes
+            print(f"  - No HVG filtering applied, using all {len(self.target_genes)} target genes")
+        
+        if not self.target_genes:
+            raise RuntimeError("No target genes remain after HVG filtering! Check if HVG list overlaps with perturbed genes.")
+        
         # Pre-compute total number of samples (= genes) for __len__
         self._gene_for_set: List[str] = []
         for gt in self.target_genes:
             cells_per_gene = len(self._pert_cells_by_gene[gt])
             n_sets = (cells_per_gene + self.set_size - 1) // self.set_size
             self._gene_for_set.extend([gt] * n_sets)
+
+    # ------------------------------------------------------------------
+    # Build Ensembl to gene symbol mapping
+    # ------------------------------------------------------------------
+    
+    def _build_ensembl_to_symbol_map(self) -> None:
+        """Build a mapping from Ensembl IDs to gene symbols using symbol2ens.pkl."""
+        # Try multiple possible locations for the symbol2ens.pkl file
+        possible_paths = [
+            Path("/workspace/vcc/symbol2ens.pkl"),
+            Path("symbol2ens.pkl"),
+            self.root.parent / "symbol2ens.pkl",
+            Path("assets/symbol2ens.pkl"),
+        ]
+        
+        symbol2ens_path = None
+        for path in possible_paths:
+            if path.exists():
+                symbol2ens_path = path
+                break
+        
+        if symbol2ens_path is None:
+            print(f"  Warning: Could not find symbol2ens.pkl file, falling back to data-based mapping")
+            # Fallback to building from data files
+            self._build_ensembl_to_symbol_map_from_data()
+            return
+        
+        try:
+            # Load the symbol to Ensembl mapping
+            with symbol2ens_path.open("rb") as f:
+                symbol2ens = pickle.load(f)
+            
+            # Invert the mapping to get Ensembl to symbol
+            for symbol, ensembl in symbol2ens.items():
+                # Only add if it's a valid Ensembl ID
+                if ensembl.startswith("ENSG"):
+                    self._ensembl_to_symbol_map[ensembl] = symbol
+            
+            print(f"  Built mapping for {len(self._ensembl_to_symbol_map)} Ensembl IDs to gene symbols from {symbol2ens_path}")
+        except Exception as e:
+            print(f"  Warning: Could not load symbol2ens.pkl: {e}, falling back to data-based mapping")
+            self._build_ensembl_to_symbol_map_from_data()
+    
+    def _check_unmapped_genes(self) -> None:
+        """Check which Ensembl IDs are unmapped (gene_symbol == ensembl_id) in the data."""
+        self._unmapped_ensembl_ids = set()
+        
+        meta_paths = sorted(self.root.glob("*.json"))
+        if not meta_paths:
+            return
+            
+        # Check the first batch file
+        meta = json.loads(meta_paths[0].read_text())
+        h5_path = str(meta.get("file", meta_paths[0].with_suffix(".h5ad")))
+        
+        try:
+            adata = sc.read_h5ad(h5_path, backed="r")
+            
+            if "gene_symbol" in adata.var.columns:
+                for ensembl_id, gene_symbol in zip(adata.var_names, adata.var["gene_symbol"]):
+                    # If gene_symbol is the same as ensembl_id, it's unmapped
+                    if str(ensembl_id).startswith("ENSG") and str(gene_symbol) == str(ensembl_id):
+                        self._unmapped_ensembl_ids.add(str(ensembl_id))
+            
+            adata.file.close()
+            
+            if self._unmapped_ensembl_ids:
+                print(f"  Found {len(self._unmapped_ensembl_ids)} unmapped Ensembl IDs in data")
+        except Exception as e:
+            print(f"  Warning: Could not check unmapped genes: {e}")
+    
+    def _build_ensembl_to_symbol_map_from_data(self) -> None:
+        """Fallback method to build mapping from data files if symbol2ens.pkl is not available."""
+        meta_paths = sorted(self.root.glob("*.json"))
+        if not meta_paths:
+            return
+        
+        # Try to load from the first batch
+        meta = json.loads(meta_paths[0].read_text())
+        h5_path = str(meta.get("file", meta_paths[0].with_suffix(".h5ad")))
+        
+        try:
+            adata = sc.read_h5ad(h5_path, backed="r")
+            
+            # Build the mapping
+            if "gene_symbol" in adata.var.columns:
+                for ensembl_id, gene_symbol in zip(adata.var_names, adata.var["gene_symbol"]):
+                    # For unmapped genes (where symbol == ensembl_id), keep the Ensembl ID as the symbol
+                    # This ensures we don't lose genes like ENSG00000170846 that weren't properly mapped
+                    if str(gene_symbol).startswith("ENSG") and str(ensembl_id) == str(gene_symbol):
+                        # Keep the Ensembl ID as the symbol for unmapped genes
+                        self._ensembl_to_symbol_map[str(ensembl_id)] = str(gene_symbol)
+                    elif not str(gene_symbol).startswith("ENSG"):
+                        # Normal case: gene symbol is different from Ensembl ID
+                        self._ensembl_to_symbol_map[str(ensembl_id)] = str(gene_symbol)
+            
+            adata.file.close()
+            print(f"  Built mapping for {len(self._ensembl_to_symbol_map)} Ensembl IDs to gene symbols from data")
+        except Exception as e:
+            print(f"  Warning: Could not build Ensembl to symbol mapping from data: {e}")
 
     # ------------------------------------------------------------------
     # Metadata scanning helpers
@@ -107,6 +272,7 @@ class OrionPairedDataset(Dataset):  # noqa: E501
                 self.gene_list = cache["gene_list"]
                 self._keep_gene_idx = cache.get("keep_gene_idx")
                 self.unique_batches = cache["unique_batches"]
+                self.gene_symbols_list = cache.get("gene_symbols_list", self.gene_list)
                 return  # loaded successfully – skip expensive scan
             except Exception as e:
                 # Cache may be corrupted or incompatible with current code – rebuild
@@ -155,6 +321,22 @@ class OrionPairedDataset(Dataset):  # noqa: E501
             self._ctrl_file_to_count[fp] += 1
 
         self.gene_list = first_gene_list if first_gene_list is not None else []
+        
+        # Also get gene symbols if available
+        if meta_paths:
+            try:
+                meta = json.loads(meta_paths[0].read_text())
+                h5_path = str(meta.get("file", meta_paths[0].with_suffix(".h5ad")))
+                adata = sc.read_h5ad(h5_path, backed="r")
+                if "gene_symbol" in adata.var.columns:
+                    self.gene_symbols_list = list(adata.var["gene_symbol"].values)
+                else:
+                    self.gene_symbols_list = self.gene_list
+                adata.file.close()
+            except:
+                self.gene_symbols_list = self.gene_list
+        else:
+            self.gene_symbols_list = self.gene_list
 
         # ------------------------------------------------------------------
         # Collapse duplicate genes (keep one copy randomly)
@@ -177,6 +359,9 @@ class OrionPairedDataset(Dataset):  # noqa: E501
                 print(f"OrionPairedDataset: collapsed {duplicates} duplicate gene columns → {len(keep_idx_set)} unique genes")
             self._keep_gene_idx = sorted(keep_idx_set)
             self.gene_list = [self.gene_list[i] for i in self._keep_gene_idx]
+            # Also update gene_symbols_list if it exists
+            if hasattr(self, 'gene_symbols_list') and self.gene_symbols_list:
+                self.gene_symbols_list = [self.gene_symbols_list[i] for i in self._keep_gene_idx]
         else:
             self._keep_gene_idx = None
 
@@ -197,6 +382,7 @@ class OrionPairedDataset(Dataset):  # noqa: E501
                 "ctrl_pool": self._ctrl_pool,
                 "ctrl_file_to_count": dict(self._ctrl_file_to_count),
                 "gene_list": self.gene_list,
+                "gene_symbols_list": getattr(self, 'gene_symbols_list', self.gene_list),
                 "keep_gene_idx": self._keep_gene_idx,
                 "unique_batches": self.unique_batches
             }
@@ -212,11 +398,21 @@ class OrionPairedDataset(Dataset):  # noqa: E501
 
     def _apply_hvg_filter(self, hvg_gene_ids: List[str]):
         # Build map from gene -> index in full gene list
+        # Note: gene_list may contain Ensembl IDs, while hvg_gene_ids are gene symbols after conversion
         idx_map = {g: i for i, g in enumerate(self.gene_list)}
+        
+        # Also try with gene symbols if we have them
+        if hasattr(self, 'gene_symbols_list'):
+            idx_map_symbols = {g: i for i, g in enumerate(self.gene_symbols_list)}
+        else:
+            idx_map_symbols = idx_map
+        
         self._hvg_idx: List[int] = []
         missing = 0
         for g in hvg_gene_ids:
-            if g in idx_map:
+            if g in idx_map_symbols:
+                self._hvg_idx.append(idx_map_symbols[g])
+            elif g in idx_map:
                 self._hvg_idx.append(idx_map[g])
             else:
                 missing += 1
@@ -338,9 +534,22 @@ class OrionPairedDataset(Dataset):  # noqa: E501
             ctrl_samples.append(sample_c)
         ctrl_expr = torch.from_numpy(np.stack(ctrl_expr_list)).float()  # (S,N)
 
-        # Determine target-gene column index (may be absent ⇒ -1)
+        # Determine target-gene column index
+        # After filtering, all target genes should be in the HVG list
         matches = np.where(gene_symbols_ref == gene_target)[0] if gene_symbols_ref is not None else []
-        target_gene_idx = int(matches[0]) if len(matches) > 0 else -1
+        
+        if len(matches) == 0:
+            # This should not happen after filtering non-HVG targets
+            print(f"ERROR: Target gene '{gene_target}' not found in gene symbols after HVG filtering - this shouldn't happen!")
+            print(f"DEBUG: gene_symbols shape: {gene_symbols_ref.shape if hasattr(gene_symbols_ref, 'shape') else len(gene_symbols_ref) if gene_symbols_ref is not None else 0}")
+            print(f"DEBUG: First 10 gene symbols: {list(gene_symbols_ref[:10]) if gene_symbols_ref is not None and len(gene_symbols_ref) > 0 else []}")
+            target_gene_idx = -1
+        elif len(matches) > 1:
+            print(f"Warning: Multiple matches ({len(matches)}) found for target gene '{gene_target}', using first match at index {matches[0]}")
+            target_gene_idx = int(matches[0])
+        else:
+            # Successfully found the target gene
+            target_gene_idx = int(matches[0])
 
         return {
             "perturbed_expr": pert_expr,   # (S,N)
@@ -356,10 +565,10 @@ class OrionPairedDataset(Dataset):  # noqa: E501
 # Helper for building DataLoader (shared by train/val)
 # -------------------------------------------------------------------------
 
-def _build_dataloader(dataset: Dataset, collate_fn=None, *, shuffle: bool, num_workers: int, prefetch_factor: int, pin_memory: bool):
+def _build_dataloader(dataset: Dataset, collate_fn=None, *, shuffle: bool, num_workers: int, prefetch_factor: int, pin_memory: bool, batch_size: int = 1):
     return DataLoader(
         dataset,
-        batch_size=1,  # one set per batch – collator flattens later
+        batch_size=batch_size,
         shuffle=shuffle,
         num_workers=num_workers,
         prefetch_factor=prefetch_factor if num_workers > 0 else None,
@@ -377,6 +586,7 @@ def create_orion_paired_dataloader(
     batches_dir: str | Path,
     set_size: int = 16,
     hvg_gene_ids: List[str] | None = None,
+    batch_size: int = 1,
     shuffle: bool = True,
     num_workers: int = 4,
     random_seed: int = 42,
@@ -386,7 +596,7 @@ def create_orion_paired_dataloader(
     control_label: str = "Non-Targeting",
 ):
     ds = OrionPairedDataset(batches_dir, set_size=set_size, hvg_gene_ids=hvg_gene_ids, control_label=control_label, seed=random_seed)
-    dl = _build_dataloader(ds, None, shuffle=shuffle, num_workers=num_workers, prefetch_factor=prefetch_factor, pin_memory=pin_memory)
+    dl = _build_dataloader(ds, None, shuffle=shuffle, num_workers=num_workers, prefetch_factor=prefetch_factor, pin_memory=pin_memory, batch_size=batch_size)
     return ds, dl
 
 
@@ -394,12 +604,13 @@ def create_orion_train_val_dataloaders(
     batches_dir: str | Path,
     set_size: int = 16,
     hvg_gene_ids: List[str] | None = None,
+    batch_size: int = 1,
     num_workers: int = 4,
     random_seed: int = 42,
     tokenizer=None,  # kept for signature parity
     prefetch_factor: int = 2,
     pin_memory: bool = False,
-    train_split: float = 0.8,
+    train_split: float = 1.0,
     shuffle_train: bool = True,
     control_label: str = "Non-Targeting",
 ):
@@ -422,7 +633,8 @@ def create_orion_train_val_dataloaders(
         num_workers=num_workers,
         prefetch_factor=prefetch_factor,
         pin_memory=pin_memory,
-        collate_fn=collate_fn
+        collate_fn=collate_fn,
+        batch_size=batch_size,
     )
     val_dl = _build_dataloader(
         val_ds,
@@ -430,7 +642,8 @@ def create_orion_train_val_dataloaders(
         num_workers=0,
         prefetch_factor=prefetch_factor,
         pin_memory=pin_memory,
-        collate_fn=collate_fn
+        collate_fn=collate_fn,
+        batch_size=24, # hardcode to 24
     )
 
     return (train_ds, train_dl), (val_ds, val_dl)

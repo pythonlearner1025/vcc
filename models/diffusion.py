@@ -26,38 +26,65 @@ from torch.nn.attention import sdpa_kernel, SDPBackend
 # Try to import flash_attn for native MQA support
 try:
     from flash_attn import flash_attn_func, flash_attn_varlen_qkvpacked_func
-    HAS_FLASH_ATTN = False
+    HAS_FLASH_ATTN = True
     print("Using flash_attn for MQA support")
 except ImportError:
     HAS_FLASH_ATTN = False
     print("flash_attn not available, falling back to PyTorch SDPA")
 
-# ----------------------------------------------------------------------
-# Transformer-Engine (FP8) integration
-# ----------------------------------------------------------------------
 import os
-USE_TE = int(os.getenv("TE", 0))
-HAS_TE = False
-if USE_TE:
-    try:
-        import transformer_engine.pytorch as te
-        from transformer_engine.pytorch import fp8_autocast
-        print("USING TRANSFORMER ENGINE FP8")
-        HAS_TE = True
-    except ImportError:
-        from contextlib import nullcontext as _nullctx
-        def fp8_autocast(enabled=True, *args, **kwargs):
-            """Fallback to no-op context manager when TE is unavailable or disabled."""
-            return _nullctx()
-        HAS_TE = False
 
 # Drop-in replacements enabling FP8 kernels when TE is available
-if HAS_TE:
-    Linear = te.Linear
-    LayerNorm = te.LayerNorm
+Linear = torch.nn.Linear
+
+# Rotary embeddings (RoPE)
+try:
+    from rotary_embedding_torch import RotaryEmbedding
+except Exception:
+    RotaryEmbedding = None  # allow import of this file without the dependency; will assert on use
+
+# Replace all LayerNorm with RMSNorm throughout this module.
+# Prefer PyTorch's built-in RMSNorm when available; otherwise, use a local fallback.
+try:
+    from torch.nn import RMSNorm as _TorchRMSNorm  # PyTorch >= 2.5
+    _HAS_TORCH_RMSNORM = True
+except Exception:
+    _HAS_TORCH_RMSNORM = False
+
+if _HAS_TORCH_RMSNORM:
+    RMSNorm = _TorchRMSNorm
 else:
-    Linear = torch.nn.Linear
-    LayerNorm = torch.nn.LayerNorm
+    class RMSNorm(nn.Module):
+        def __init__(
+            self,
+            normalized_shape: int | tuple[int, ...],
+            eps: float = 1e-8,
+            elementwise_affine: bool = True,
+            device=None,
+            dtype=None,
+        ) -> None:
+            super().__init__()
+            if isinstance(normalized_shape, int):
+                normalized_shape = (normalized_shape,)
+            self.normalized_shape = tuple(normalized_shape)
+            self.eps = float(eps)
+            self.elementwise_affine = bool(elementwise_affine)
+            factory_kwargs = {"device": device, "dtype": dtype}
+            if self.elementwise_affine:
+                self.weight = nn.Parameter(torch.ones(self.normalized_shape, **factory_kwargs))
+            else:
+                self.register_parameter("weight", None)
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            dims = tuple(range(-len(self.normalized_shape), 0))
+            rms_inv = x.pow(2).mean(dim=dims, keepdim=True).add(self.eps).rsqrt()
+            y = x * rms_inv
+            if self.elementwise_affine:
+                y = y * self.weight
+            return y
+
+# Alias so existing LayerNorm instantiations become RMSNorm without further changes
+LayerNorm = RMSNorm
 
 @dataclass
 class ConditionalModelConfig:
@@ -66,11 +93,22 @@ class ConditionalModelConfig:
     train_notes: str = ""
     dim: int = 256
     n_head: int = 8
+    n_group: int = 8
     n_layer: int = 8
     ffn_mult: int = 8
-    vocab_size: int = 64  # 64 expression bins
+    # Data vocabulary size (number of valid expression bins)
+    vocab_size: int = 64  # 64 expression bins (data tokens only; mask is separate)
+    # Optional explicit mask token id; if None it defaults to vocab_size (i.e., the first id after the data vocab)
+    mask_token_id: Optional[int] = None
     token_max_value: float = 9.2
     n_genes: int = 2000  # Number of HVGs
+    n_latents: int = 256
+
+    # Learned set compressor (per set) → memory tokens (M ≪ N)
+    mem_slots: int = 8           # M, choose so S·M ≤ 256 (with S set size)
+    compressor_iters: int = 2    # routing iterations
+    mem_kdim: Optional[int] = None  # projection dim for Q/K in decode (defaults to dim)
+    use_memory_rope: bool = True  # Apply RoPE to memory tokens for structured attention
 
     # Training target type
     target_is_delta: bool = True  # Predict Δ rather than raw counts during fine-tune
@@ -80,14 +118,15 @@ class ConditionalModelConfig:
     gene_embed_dim: int = 128
     
     # ESM2 embeddings
-    esm_matrix_path: Optional[str] = "/esm_all.pt"  # Path to precomputed ESM2 embeddings (None to skip)
+    esm_matrix_path: Optional[str] = "esm_all.pt" # Path to precomputed ESM2 embeddings (None to skip)
     esm_proj_dim: int = 256  # Projection dimension for ESM2 embeddings
     
     # Batch conditioning
     # TODO get true number of batches in VCC
     n_technical_batches: int = 48  # Estimate of unique batches across datasets
     batch_embed_dim: int = 64  # Batch embedding dimension
-    use_batch_conditioning: bool = True
+    use_batch_conditioning: bool = False
+    use_memory_rope: bool = True
     # Latent context compression: number of latent summary tokens (0 = disabled)
     context_compressed_len: int = 0
     
@@ -105,7 +144,7 @@ class ConditionalModelConfig:
     # Masking parameters
     pretrain_mask_ratio: float = 0.20  # Fixed mask ratio for pretraining
     finetune_mask_ratio_start: float = 0.30  # Starting mask ratio for finetuning
-    finetune_mask_ratio_end: float = 0.90  # End mask ratio for finetuning (curriculum)
+    finetune_mask_ratio_end: float = 1.0  # End mask ratio for finetuning (curriculum)
     finetune_mask_ratio_steps: int = 100_000  # Steps to ramp from start to end
     finetune_full_mask_prob: float = 0.10  # Probability of 100% masking during finetune
     
@@ -121,6 +160,8 @@ class ConditionalModelConfig:
     finetune_adam_lr: float = 1e-4
     # Enable FP8 execution via Transformer-Engine (if available)
     use_fp8: bool = True  # Now working with custom-built wheel
+    # Enable auxiliary DE heads/returns
+    use_aux: bool = True
     
     # Gradient checkpointing - disable for large-batch FP8 runs to see true kernel speed
     grad_ckpt: bool = True  # Enable activation checkpointing (trades compute for memory)
@@ -134,6 +175,7 @@ class ConditionalModelConfig:
     pretrain_data_dir: str = "data/scRNA"
     finetune_data_path: str = "data/vcc_data/"
     hvg_info_path: str = ".txt"
+    n_xattn_loops: int = 6
     
     # Logging
     log_every: int = 100
@@ -150,14 +192,13 @@ class ConditionalModelConfig:
     @property
     def n_params(self) -> int:
         """Estimate parameter count."""
-        params = self.vocab_size * self.dim  # Token embedding
+        # Token embedding includes an extra row for the [MASK] token
+        params = (self.vocab_size + 1) * self.dim
         params += self.n_timesteps * self.dim  # Time embedding
         params += self.n_total_genes * self.gene_embed_dim  # Gene embeddings
         
         # Batch conditioning
-        if self.use_batch_conditioning:
-            params += self.n_batches * self.batch_embed_dim  # Batch embeddings
-        
+        params += (self.n_technical_batches if self.use_batch_conditioning else 0) * self.batch_embed_dim
         # Transformer layers
         per_layer = (
             4 * self.dim * self.dim +  # QKV + proj
@@ -165,11 +206,10 @@ class ConditionalModelConfig:
         )
         params += self.n_layer * per_layer
         
-        # Output head
+        # Output head predicts only data tokens (excludes [MASK])
         params += self.dim * self.vocab_size
         
         return params
-
 
 class SinusoidalPosEmb(nn.Module):
     """Sinusoidal positional embeddings for time steps."""
@@ -187,190 +227,6 @@ class SinusoidalPosEmb(nn.Module):
         emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=-1)
         return emb
 
-class GroupedQueryAttention(nn.Module):
-    """Grouped Query Attention (GQA) with grouped key/value projections."""
-    
-    def __init__(self, dim: int, n_head: int, n_group: int = 2):
-        super().__init__()
-        self.dim = dim
-        self.n_head = n_head
-        self.n_group = n_group  # Store n_group as instance variable
-        self.head_dim = dim // n_head
-        
-        # Ensure n_head is divisible by n_group
-        assert n_head % n_group == 0, f"n_head ({n_head}) must be divisible by n_group ({n_group})"
-        self.heads_per_group = n_head // n_group
-        
-        # Query projection for all heads
-        self.q_proj = Linear(dim, dim)
-        
-        # Grouped key/value projections (n_group groups)
-        self.kv_proj = Linear(dim, 2 * self.n_group * self.head_dim)
-        
-        # Output projection
-        self.out_proj = Linear(dim, dim)
-
-        
-    def forward(self, x: torch.Tensor, kv: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """
-        Args:
-            x: Input tensor (B, N, D)
-            kv: Optional key/value tensor (B, M, D). If None, uses x.
-        
-        Returns:
-            Output tensor (B, N, D)
-        """
-        B, N, D = x.shape
-        
-        # Use x for key/value if not provided
-        if kv is None: 
-            kv = x
-        #else: 1663ms fwd, 5675 back
-            #kv = kv[:,:684,:]
-        '''
-            6886->6886:2259ms fwd, 7788ms back
-            6886->684: 1663ms fwd, 5675ms back
-            # one epoch 38569 steps
-            # full 27hr diff in one epoch
-        '''
-
-        M = kv.shape[1]  # kv sequence length (6288)
-        
-        # Project queries for all heads
-        # (128, 6288, 12, 57)
-        q = self.q_proj(x).view(B, N, self.n_head, self.head_dim)  # (B, N, H, HD)
-        
-        # Project grouped key/value
-        # (128, 6288, G, 57)
-        kv_proj = self.kv_proj(kv).view(B, M, self.n_group, 2*self.head_dim)  # (B, M, G, 2*HD)
-        k, v = kv_proj.chunk(2, dim=-1)  # Each is (B, M, G, HD)
-
-        if HAS_FLASH_ATTN:
-            # Flash attention natively supports GQA when k,v have fewer heads than q
-            # Ensure k and v are contiguous after chunk operation
-            k = k.contiguous()  # (B, M, G, HD)
-            v = v.contiguous()  # (B, M, G, HD)
-            
-            out = flash_attn_func(
-                q, k, v,
-                dropout_p=0.0,
-                softmax_scale=None,  # Will default to 1/sqrt(head_dim)
-                causal=False,
-                window_size=(-1, -1),
-                alibi_slopes=None,
-                deterministic=False
-            )  # (B, N, H, HD)
-            
-            # Reshape back to (B, N, D)
-            out = out.contiguous().view(B, N, D)
-        else:
-            # ------------------------------------------------------------------
-            #  Fallback: PyTorch SDPA with K/V group expansion
-            # ------------------------------------------------------------------
-            # Transpose for SDPA format: (B, H, N, HD)
-            q = q.transpose(1, 2)  # (B, H, N, HD)
-            
-            # Expand k, v from groups to all heads
-            # Each group serves heads_per_group query heads
-            k = k.unsqueeze(2).expand(-1, -1, self.heads_per_group, -1, -1)  # (B, M, heads_per_group, G, HD)
-            k = k.reshape(B, M, self.n_head, self.head_dim).transpose(1, 2)  # (B, H, M, HD)
-            
-            v = v.unsqueeze(2).expand(-1, -1, self.heads_per_group, -1, -1)  # (B, M, heads_per_group, G, HD)
-            v = v.reshape(B, M, self.n_head, self.head_dim).transpose(1, 2)  # (B, H, M, HD)
-            
-            # Use PyTorch's SDPA with optional flash attention backend
-            with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
-                out = F.scaled_dot_product_attention(
-                    q, k, v, 
-                    dropout_p=0.0, 
-                    is_causal=False
-                )  # (B, H, N, HD)
-            
-            # Reshape back to (B, N, D)
-            out = out.transpose(1, 2).contiguous().view(B, N, D)
-        
-        # Project output
-        out = self.out_proj(out)
-        
-        return out
-
-class LatentContextCompressor(nn.Module):
-    """Learn **K** latent tokens that attend over the full gene sequence and
-    return an orderless summary (B, K, D). Equivalent to one Perceiver-style
-    cross-attention block.
-    """
-    def __init__(self, dim: int, k: int, n_head: int, dropout: float = 0.0):
-        super().__init__()
-        self.k = k
-        self.latents = nn.Parameter(torch.randn(1, k, dim) * 0.02)
-
-        # Q comes from latents, K/V from gene tokens using grouped-query attention
-        self.cross_attn = GroupedQueryAttention(dim, n_head, n_group=2)
-        self.ln_q = LayerNorm(dim)
-        self.ln_kv = LayerNorm(dim)
-
-        self.mlp = nn.Sequential(
-            LayerNorm(dim),
-            Linear(dim, 4 * dim),
-            nn.GELU(),
-            Linear(4 * dim, dim),
-        )
-
-    def forward(self, gene_tokens: torch.Tensor) -> torch.Tensor:
-        """gene_tokens: (B, N, D) → (B, K, D)"""
-        B, _, _ = gene_tokens.shape
-        lat = self.latents.expand(B, -1, -1)  # (B, K, D)
-
-        lat2 = self.cross_attn(
-            self.ln_q(lat),
-            kv=self.ln_kv(gene_tokens),
-        )
-        lat = lat + lat2
-        lat = lat + self.mlp(lat)
-        return lat
-
-class TransformerBlock(nn.Module):
-    """Transformer block with MQA and cross-attention support."""
-    
-    def __init__(self, dim: int, n_head: int, ffn_mult: int = 4):
-        super().__init__()
-        # Self-attention
-        self.ln1 = LayerNorm(dim)
-        self.self_attn = GroupedQueryAttention(dim, n_head)
-        
-        # Cross-attention (optional)
-        self.ln2 = LayerNorm(dim)
-        self.cross_attn = GroupedQueryAttention(dim, n_head)
-        
-        self.ln3 = LayerNorm(dim)
-        try:
-            from xformers.ops import FusedDenseGeluDense
-            self.mlp = FusedDenseGeluDense(dim, dim * ffn_mult, dim)
-            print("Built with FusedDenseGelu")
-        except ImportError:
-            self.mlp = nn.Sequential(
-                Linear(dim, dim * ffn_mult),
-                nn.GELU(),
-                Linear(dim * ffn_mult, dim))
-        
-    def forward(self, x: torch.Tensor, context: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """
-        Args:
-            x: Input tensor (B, N, D)
-            context: Optional context tensor for cross-attention (B, M, D)
-        """
-        # Self-attention
-        x = x + self.self_attn(self.ln1(x))
-        
-        # Cross-attention (if context provided)
-        if context is not None:
-            #print(f"block context.shape: {context.shape}")
-            x = x + self.cross_attn(self.ln2(x), kv=context)
-        
-        # FFN
-        x = x + self.mlp(self.ln3(x))
-        return x
-
 class AugmentedGeneEmbedding(nn.Module):
     """Minimal version: trainable ID embedding + frozen ESM2 table."""
 
@@ -382,16 +238,14 @@ class AugmentedGeneEmbedding(nn.Module):
         proj_dim: int = 256,
     ):
         super().__init__()
-
         # Trainable gene‑ID embedding
         self.id_emb = nn.Embedding(n_genes, id_dim, device="cpu")
-
         # If no ESM table is given we just fall back to the ID embedding.
         if esm_matrix_path is None:
             self.has_esm = False
+            print("NO ESM")
             return
         try:
-
             print("using AugmentedGeneEmbedding")
             obj = torch.load(esm_matrix_path, map_location="cpu")
             seq_dim = obj["emb"].shape[-1]
@@ -400,7 +254,6 @@ class AugmentedGeneEmbedding(nn.Module):
             table = torch.zeros(n_genes, seq_dim)
             genes = obj["genes"]
             iso_map = obj["gene_to_isoform_indices"]
-
             for g, iso_idxs in iso_map.items():
                 if g not in genes:
                     continue
@@ -430,54 +283,308 @@ class AugmentedGeneEmbedding(nn.Module):
             return id_vec
 
         # 4‑line sequence branch
-        seq_vec = self.esm_proj(self.esm_emb(idx).float())
+        seq_vec = self.esm_proj(self.esm_emb(idx))
         fused = self.mix(torch.cat([id_vec, torch.tanh(self.gate) * seq_vec], dim=-1))
         return fused
 
-class ConditionalDiffusionTransformer(nn.Module):
-    """Conditional discrete diffusion transformer that optionally injects
-    per‑gene ESM2 features into the token stream whenever the underlying
-    `AugmentedGeneEmbedding` has a loaded ESM table.
+class GroupedQueryAttention(nn.Module):
+    """Grouped Query Attention (GQA) with grouped key/value projections."""
+    
+    def __init__(self, dim: int, n_head: int, n_group: int = 2):
+        super().__init__()
+        self.dim = dim
+        self.n_head = n_head
+        self.n_group = n_group  # Store n_group as instance variable
+        self.head_dim = dim // n_head
+        
+        # Ensure n_head is divisible by n_group
+        assert n_head % n_group == 0, f"n_head ({n_head}) must be divisible by n_group ({n_group})"
+        self.heads_per_group = n_head // n_group
+        
+        # Query projection for all heads
+        self.q_proj = Linear(dim, dim)
+        
+        # Grouped key/value projections (n_group groups)
+        self.kv_proj = Linear(dim, 2 * self.n_group * self.head_dim)
+        
+        # Output projection
+        self.out_proj = Linear(dim, dim)
+
+        # RoPE for each head
+        head_dim = dim // n_head
+        if RotaryEmbedding is None:
+            raise ImportError("rotary-embedding-torch is required for RoPE. Please install it: pip install rotary-embedding-torch")
+        self.rope = RotaryEmbedding(dim=head_dim)
+
+        
+    def forward(self, x: torch.Tensor, kv: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        Args:
+            x: Input tensor (B, N, D)
+            kv: Optional key/value tensor (B, M, D). If None, uses x.
+        
+        Returns:
+            Output tensor (B, N, D)
+        """
+        B, N, D = x.shape
+        
+        # Use x for key/value if not provided
+        if kv is None: 
+            kv = x
+
+        M = kv.shape[1]  # kv sequence length (6288)
+        
+        # Project queries for all heads
+        q = self.q_proj(x).view(B, N, self.n_head, self.head_dim)  # (B, N, H, HD)
+        
+        # Project grouped key/value
+        kv_proj = self.kv_proj(kv).view(B, M, self.n_group, 2 * self.head_dim)  # (B, M, G, 2*HD)
+        k, v = kv_proj.chunk(2, dim=-1)  # Each is (B, M, G, HD)
+
+        # Apply standard RoPE to queries and keys
+        # q: (B, N, H, HD) -> (B, H, N, HD) -> rotate -> back
+        q = self.rope.rotate_queries_or_keys(q.transpose(1, 2)).transpose(1, 2).contiguous()
+        # k: (B, M, G, HD) -> (B, G, M, HD) -> rotate -> back
+        k = self.rope.rotate_queries_or_keys(k.transpose(1, 2)).transpose(1, 2).contiguous()
+
+
+        if HAS_FLASH_ATTN and x.is_cuda:
+            # Flash attention natively supports GQA when k,v have fewer heads than q
+            # Ensure k and v are contiguous after chunk operation
+            k = k.contiguous()  # (B, M, G, HD)
+            v = v.contiguous()  # (B, M, G, HD)
+            
+            # Flash attn expects (B, N, H, HD) for q and (B, M, G, HD) for grouped k/v
+            out = flash_attn_func(
+                q, k, v,
+                dropout_p=0.0,
+                softmax_scale=None,  # Will default to 1/sqrt(head_dim)
+                causal=False,
+                window_size=(-1, -1),
+                alibi_slopes=None,
+                deterministic=False
+            )  # (B, N, H, HD)
+            
+            # Reshape back to (B, N, D)
+            out = out.contiguous().view(B, N, D)
+        else:
+            # ------------------------------------------------------------------
+            #  Fallback: PyTorch SDPA with K/V group expansion
+            # ------------------------------------------------------------------
+            # Transpose for SDPA format: (B, H, N, HD)
+            qn = q.transpose(1, 2)  # (B, H, N, HD)
+            
+            # Expand k, v from groups to all heads
+            # Each group serves heads_per_group query heads
+            k = k.unsqueeze(2).expand(-1, -1, self.heads_per_group, -1, -1)  # (B, M, heads_per_group, G, HD)
+            k = k.reshape(B, M, self.n_head, self.head_dim).transpose(1, 2).contiguous()  # (B, H, M, HD)
+            
+            v = v.unsqueeze(2).expand(-1, -1, self.heads_per_group, -1, -1)  # (B, M, heads_per_group, G, HD)
+            v = v.reshape(B, M, self.n_head, self.head_dim).transpose(1, 2).contiguous()  # (B, H, M, HD)
+            
+            # Use PyTorch's SDPA; pick backend based on device
+            backend = SDPBackend.FLASH_ATTENTION if qn.is_cuda else SDPBackend.MATH
+            with sdpa_kernel(backend):
+                out = F.scaled_dot_product_attention(
+                    qn, k, v, 
+                    dropout_p=0.0, 
+                    is_causal=False
+                )  # (B, H, N, HD)
+            
+            # Reshape back to (B, N, D)
+            out = out.transpose(1, 2).contiguous().view(B, N, D)
+        
+        # Project output
+        out = self.out_proj(out)
+        
+        return out
+
+class TransformerBlock(nn.Module):
+    """Transformer block with MQA and cross-attention support, with residual scaling."""
+    
+    def __init__(self, dim: int, n_head: int, ffn_mult: int = 4, n_group: int = 4, residual_scale: float = 1.0):
+        super().__init__()
+        self.residual_scale = residual_scale
+        self.ln0 = LayerNorm(dim)
+        self.ln1 = LayerNorm(dim)
+        self.cross_attn = GroupedQueryAttention(dim, n_head, n_group=n_group)
+        self.self_attn = GroupedQueryAttention(dim, n_head, n_group=n_group)
+        
+        self.ln2 = LayerNorm(dim)
+        try:
+            from xformers.ops import FusedDenseGeluDense
+            self.mlp = FusedDenseGeluDense(dim, dim * ffn_mult, dim)
+        except ImportError:
+            self.mlp = nn.Sequential(
+                Linear(dim, dim * ffn_mult),
+                nn.GELU(),
+                Linear(dim * ffn_mult, dim)
+            )
+
+    def forward(self, x: torch.Tensor, kv: Optional[torch.Tensor] = None) -> torch.Tensor:
+        if kv is not None:
+            x = x + self.residual_scale * self.cross_attn(self.ln0(x), kv=kv)
+        else:
+            x = x + self.residual_scale * self.cross_attn(self.ln0(x))
+        
+        x = x + self.residual_scale * self.self_attn(self.ln1(x))
+        x = x + self.residual_scale * self.mlp(self.ln2(x))
+        return x
+
+class LearnedSetCompressorFA(nn.Module):
+    """
+    Compress (B,S,N,D) genes -> (B,S,M,D) memory using slot attention with FlashAttention.
+    Permutation-invariant (no positions required).
     """
 
-    def __init__(self, config):
+    def __init__(self, dim: int, M: int = 8, heads: int = 8, iters: int = 2):
+        super().__init__()
+        assert dim % heads == 0
+        self.M, self.H, self.Hd = M, heads, dim // heads
+        self.iters = int(iters)
+        self.slots = nn.Parameter(torch.randn(1, 1, M, dim) * 0.02)
+        self.q_proj = Linear(dim, dim, bias=False)
+        self.k_proj = Linear(dim, dim, bias=False)
+        self.v_proj = Linear(dim, dim, bias=False)
+        self.o_proj = Linear(dim, dim, bias=False)
+        self.norm_slot = LayerNorm(dim)
+        if RotaryEmbedding is None:
+            raise ImportError("rotary-embedding-torch is required for RoPE. Please install it: pip install rotary-embedding-torch")
+        self.rope = RotaryEmbedding(dim=self.Hd)
+
+    def _reshape_h(self, x: torch.Tensor) -> torch.Tensor:
+        B_, L, D = x.shape
+        return x.view(B_, L, self.H, self.Hd)
+
+    def forward(self, x_gene: torch.Tensor, pert = None) -> torch.Tensor:
+        """
+        x_gene: (B,S,N,D)
+        returns mem: (B,S,M,D)
+        """
+        B, S, N, D = x_gene.shape
+        BS = B * S
+
+        # Project gene features directly (no norm to preserve RoPE)
+        xg = x_gene.reshape(BS, N, D)
+        k = self._reshape_h(self.k_proj(xg))  # (BS,N,H,Hd)
+        v = self._reshape_h(self.v_proj(xg))  # (BS,N,H,Hd)
+
+        # Apply RoPE to keys across the gene dimension (N)
+        k = self.rope.rotate_queries_or_keys(k.transpose(1, 2)).transpose(1, 2).contiguous()
+
+        # init slots per set
+        slots = self.slots.expand(B, S, -1, -1).reshape(BS, self.M, D)
+        if pert is not None:
+            # Experiment: add pert only to first 25 memory tokens
+            pert = pert.unsqueeze(1)
+            print(f"adding pert {pert.shape} to first 25 slots of {slots.shape}")
+            # Add pert to first 25 slots, leave remaining slots unchanged
+            first_25_slots = slots[:, :10] + pert  # Modified first 25 slots
+            remaining_slots = slots[:, 10:]         # Unchanged remaining slots
+            slots = torch.cat([first_25_slots, remaining_slots], dim=1)
+        for _ in range(self.iters):
+            qs = self._reshape_h(self.q_proj(self.norm_slot(slots)))  # (BS,M,H,Hd)
+            # Apply RoPE to slot queries across the slot dimension (M)
+            qs = self.rope.rotate_queries_or_keys(qs.transpose(1, 2)).transpose(1, 2).contiguous()
+
+            if HAS_FLASH_ATTN:
+                out = flash_attn_func(
+                    qs, k, v,
+                    dropout_p=0.0,
+                    softmax_scale=None,
+                    causal=False,
+                )  # (BS,M,H,Hd)
+            else:
+                qh = qs.transpose(1, 2)  # (BS,H,M,Hd)
+                kh = k.transpose(1, 2)   # (BS,H,N,Hd)
+                vh = v.transpose(1, 2)   # (BS,H,N,Hd)
+                out = F.scaled_dot_product_attention(qh, kh, vh, dropout_p=0.0, is_causal=False)
+                out = out.transpose(1, 2)  # (BS,M,H,Hd)
+
+            out = out.reshape(BS, self.M, D)
+            slots = slots + self.o_proj(out)  # residual update
+
+        mem = slots.view(B, S, self.M, D)
+        return mem
+
+class DecodeAttentionFA(nn.Module):
+    """
+    Attend from genes (N) to set memory (M) using FlashAttention.
+    Maps (B,S,N,D) gene queries over (B,S,M,D) memory -> (B,S,N,D_out)
+    """
+
+    def __init__(self, dim: int, heads: int = 8, ctx_dim: Optional[int] = None):
+        super().__init__()
+        assert dim % heads == 0
+        self.H, self.Hd = heads, dim // heads
+        d_out = ctx_dim or dim
+        self.q_proj = Linear(dim, dim, bias=False)
+        self.k_proj = Linear(dim, dim, bias=False)
+        self.v_proj = Linear(dim, dim, bias=False)
+        self.o_proj = Linear(dim, d_out, bias=False)
+        if RotaryEmbedding is None:
+            raise ImportError("rotary-embedding-torch is required for RoPE. Please install it: pip install rotary-embedding-torch")
+        self.rope = RotaryEmbedding(dim=self.Hd)
+
+    def _reshape_h(self, x: torch.Tensor) -> torch.Tensor:
+        B_, L, D = x.shape
+        return x.view(B_, L, self.H, self.Hd)
+
+    def forward(self, gene_q: torch.Tensor, mem_kv: torch.Tensor) -> torch.Tensor:
+        """
+        gene_q: (B,S,N,D)
+        mem_kv: (B,S,M,D)
+        returns ctx: (B,S,N,D_out)
+        """
+        B, S, N, D = gene_q.shape
+        _, _, M, _ = mem_kv.shape
+        BS = B * S
+
+        q = self._reshape_h(self.q_proj(gene_q.reshape(BS, N, D)))  # (BS,N,H,Hd)
+        k = self._reshape_h(self.k_proj(mem_kv.reshape(BS, M, D)))  # (BS,M,H,Hd)
+        v = self._reshape_h(self.v_proj(mem_kv.reshape(BS, M, D)))  # (BS,M,H,Hd)
+
+        # Apply RoPE to gene queries across N and memory keys across M
+        q = self.rope.rotate_queries_or_keys(q.transpose(1, 2)).transpose(1, 2).contiguous()
+        k = self.rope.rotate_queries_or_keys(k.transpose(1, 2)).transpose(1, 2).contiguous()
+
+        if HAS_FLASH_ATTN:
+            out = flash_attn_func(q, k, v, dropout_p=0.0, softmax_scale=None, causal=False)  # (BS,N,H,Hd)
+        else:
+            qh = q.transpose(1, 2)  # (BS,H,N,Hd)
+            kh = k.transpose(1, 2)  # (BS,H,M,Hd)
+            vh = v.transpose(1, 2)  # (BS,H,M,Hd)
+            out = F.scaled_dot_product_attention(qh, kh, vh, dropout_p=0.0, is_causal=False)
+            out = out.transpose(1, 2)  # (BS,N,H,Hd)
+
+        out = out.reshape(BS, N, D)
+        return self.o_proj(out).view(B, S, N, -1)
+
+class ConditionalDiffusionTransformer(nn.Module):
+    """Conditional discrete diffusion transformer with residual scaling in blocks."""
+    
+    def __init__(self, config, residual_scale: float = 1.0):
         super().__init__()
         self.config = config
-        # Enable FP8 execution if requested and Transformer-Engine is available
-        self.fp8_enabled = getattr(config, "use_fp8", False) and HAS_TE
+        self.fp8_enabled = getattr(config, "use_fp8", False) 
+        
+        # experimental conditioning memory token
+        self.pert_memory = nn.Parameter(torch.randn(config.n_total_genes, config.dim) * 0.02)
 
-        # ------------------------------------------------------------------
-        #  Embeddings
-        # ------------------------------------------------------------------
-        self.token_emb = nn.Embedding(config.vocab_size, config.dim)
-
-        # Gene‑level embeddings (trainable IDs + optional ESM2 vectors)
+        self.token_emb = nn.Embedding(config.vocab_size + 1, config.dim)
         self.gene_embed = AugmentedGeneEmbedding(
             n_genes=config.n_total_genes,
             id_dim=config.gene_embed_dim,
             esm_matrix_path=config.esm_matrix_path,
             proj_dim=config.esm_proj_dim,
         )
+        self.gene_proj = Linear(config.gene_embed_dim, config.dim, bias=False)
+        self.fuse_proj = Linear(config.dim * 2, config.dim)
 
-        # If ESM2 is present we project it to `dim` and cache HVG indices.
         self.use_esm_in_sequence = getattr(self.gene_embed, "has_esm", False)
-        if self.use_esm_in_sequence:
-            print("self.use_esm_in_sequence = True")
-            self.register_buffer(
-                "_hvg_idx", torch.arange(config.n_genes, dtype=torch.long), persistent=False
-            )
-            self.gene_proj = Linear(config.gene_embed_dim, config.dim, bias=False)
-            # Fusion layer to combine token and per-gene features (token_emb || gene_feat)
-            self.fuse_proj = Linear(config.dim * 2, config.dim)
-            
-            # Pre-compute and cache the projected HVG features to avoid recomputation
-            with torch.no_grad():
-                gene_ids = torch.arange(config.n_genes, dtype=torch.long)
-                gene_feat = self.gene_embed(gene_ids)  # (N, gene_embed_dim)
-                gene_feat_proj = self.gene_proj(gene_feat)  # (N, D)
-            self.register_buffer("_cached_gene_features", gene_feat_proj, persistent=False)
+        gene_ids = torch.arange(config.n_genes, dtype=torch.long)
+        self.register_buffer("_gene_ids", torch.arange(config.n_genes, dtype=torch.long), persistent=False)
 
-        # Time embedding
         self.time_emb = nn.Sequential(
             SinusoidalPosEmb(config.dim),
             Linear(config.dim, config.dim),
@@ -487,6 +594,7 @@ class ConditionalDiffusionTransformer(nn.Module):
 
         if config.use_batch_conditioning:
             self.batch_embed = nn.Embedding(config.n_technical_batches, config.batch_embed_dim)
+
         batch_dim = config.batch_embed_dim if config.use_batch_conditioning else 0
         self.cond_proj = nn.Sequential(
             Linear(config.gene_embed_dim + batch_dim, config.dim),
@@ -494,365 +602,580 @@ class ConditionalDiffusionTransformer(nn.Module):
             Linear(config.dim, config.dim),
         )
 
-                # Optional latent context compressor
-        self.context_compressor = None
-        compressed_len = getattr(config, "context_compressed_len", 12)
-        if compressed_len and compressed_len > 0:
-            self.context_compressor = LatentContextCompressor(
-                dim=config.dim,
-                k=compressed_len,
-                n_head=config.n_head,
-            )
-
-        self.blocks = nn.ModuleList(
-            [TransformerBlock(config.dim, config.n_head, config.ffn_mult) for _ in range(config.n_layer)]
+        self.control_id_emb = nn.Embedding(1, config.dim)
+        # Learned set compressor (FlashAttention) to produce memory tokens per set
+        self.mem_slots = int(getattr(config, "n_latents", 8))
+        self.x_compressor = LearnedSetCompressorFA(
+            dim=config.dim,
+            M=self.mem_slots,
+            heads=config.n_head,
+            iters=int(getattr(config, "compressor_iters", 2)),
         )
+        self.c_compressor = LearnedSetCompressorFA(
+            dim=config.dim,
+            M=self.mem_slots,
+            heads=config.n_head,
+            iters=int(getattr(config, "compressor_iters", 2)),
+        )
+
+        gqa_groups = config.n_group 
+        self.blocks = nn.ModuleList([
+            TransformerBlock(config.dim, config.n_head, config.ffn_mult, n_group=gqa_groups, residual_scale=residual_scale)
+            for _ in range(config.n_layer)
+        ])
+        # Decode attention from genes to memory using FlashAttention
+        self.decode_attn = DecodeAttentionFA(config.dim, heads=config.n_head, ctx_dim=config.dim)
+
+        self.target_flag = nn.Embedding(2, config.dim)
+        self.segment_emb = nn.Embedding(2, config.dim)
+
+        self.lat_q_ln = LayerNorm(config.dim)
+        self.kv_ln = LayerNorm(config.dim)
+
         self.ln_f = LayerNorm(config.dim)
-        self.head = nn.Linear(config.dim, config.vocab_size)
+        self.head = nn.Linear(config.dim, config.vocab_size + 1)
+        self.de_sig_head = nn.Linear(config.dim, 1)
+        self.de_dir_head = nn.Linear(config.dim, 2)
+        self.de_rank_head = nn.Linear(config.dim, 1)
+        self.return_aux = bool(getattr(config, "use_aux", False))
 
         self.apply(self._init_weights)
 
-    # ----------------------------------------------------------------------
-    #  Helpers
-    # ----------------------------------------------------------------------
-    @staticmethod
-    def _init_weights(m):
+    def _init_weights(self, m):
         if isinstance(m, (nn.Linear, Linear)):
             nn.init.normal_(m.weight, mean=0.0, std=0.02)
             if m.bias is not None:
                 nn.init.zeros_(m.bias)
         elif isinstance(m, nn.Embedding):
+            if hasattr(self, "gene_embed") and getattr(self.gene_embed, "has_esm", False):
+                if m is getattr(self.gene_embed, "esm_emb", None):
+                    return
+            if getattr(m, "weight", None) is not None and not m.weight.requires_grad:
+                return
             nn.init.normal_(m.weight, mean=0.0, std=0.02)
 
-    # ----------------------------------------------------------------------
-    #  Forward
-    # ----------------------------------------------------------------------
-    def forward(
-        self,
-        tokens: torch.LongTensor,  # (B, N)
-        timesteps: torch.LongTensor,  # (B,)
-        target_gene_idx: Optional[torch.LongTensor] = None,  # (B,)
-        batch_idx: Optional[torch.LongTensor] = None,  # (B,)
-        control_context: Optional[torch.Tensor] = None,  # (B, S, D) - pre-encoded control set
-    ) -> torch.Tensor:
-        B, N = tokens.shape
-
-        # ------------------------------------------------------------------
-        #  (1) Base token embeddings (and optional gene features)
-        # ------------------------------------------------------------------
-        token_emb = self.token_emb(tokens)  # (B, N, D)
-        context_emb = self.token_emb(control_context)
-
-        # Apply optional compression to context sequence
-        if self.context_compressor is not None:
-            context_emb = self.context_compressor(context_emb)
-
-        # Optionally add per‑gene ESM2/ID embeddings projected to model dim.
-        if self.use_esm_in_sequence:
-            # Use cached pre-projected gene features instead of recomputing
-            gene_feat = self._cached_gene_features.to(tokens.device)  # (N, D)
-            # Expand across batch and fuse by addition to avoid extra matmul
-            gene_feat = gene_feat.unsqueeze(0).expand(token_emb.size(0), -1, -1)
-            x = token_emb + gene_feat  # additive fusion (faster than concat+linear)
-            context_emb += gene_feat
+    @staticmethod
+    def _normalize_to_BS(idx: Optional[torch.Tensor], B: int, S: int, name: str, device: Optional[torch.device] = None) -> Optional[torch.Tensor]:
+        if idx is None:
+            return None
+        if not torch.is_tensor(idx):
+            idx = torch.as_tensor(idx, device=device)
+        if idx.ndim == 0:
+            idx = idx.view(1, 1).expand(B, S)
+        elif idx.ndim == 1:
+            length = idx.shape[0]
+            if length == B:
+                idx = idx.view(B, 1).expand(B, S)
+            elif length == S:
+                idx = idx.view(1, S).expand(B, S)
+            elif length == 1:
+                idx = idx.view(1, 1).expand(B, S)
+            else:
+                raise ValueError(f"{name} shape mismatch")
+        elif idx.ndim == 2:
+            b, s = idx.shape
+            if (b, s) == (B, S):
+                pass
+            elif (b, s) == (B, 1):
+                idx = idx.expand(B, S)
+            elif (b, s) == (1, S):
+                idx = idx.expand(B, S)
+            elif (b, s) == (1, 1):
+                idx = idx.expand(B, S)
+            else:
+                raise ValueError(f"{name} shape mismatch")
         else:
-            x = token_emb
+            raise ValueError(f"{name} ndim invalid")
+        return idx.to(dtype=torch.long, device=device)
 
-        # ------------------------------------------------------------------
-        #  (2) Global time embedding
-        # ------------------------------------------------------------------
-        t_emb = self.time_emb(timesteps.float())  # (B, D)
+    def forward(self, tokens, timesteps, target_gene_idx=None, batch_idx=None, control_context=None, return_aux=False):
+        B, S, N = tokens.shape
+        token_emb = self.token_emb(tokens)
+        context_emb = self.token_emb(control_context) if control_context is not None else None
 
-        # ------------------------------------------------------------------
-        #  (4) Conditioning vector (target gene + batch) if provided
-        # ------------------------------------------------------------------
-        combined_emb = t_emb  # always include time
+        gene_feat = self.gene_proj(self.gene_embed(self._gene_ids))      # (N, id_dim)->(N, D)
+        gene_feat_projected = gene_feat.to(token_emb.dtype).unsqueeze(0).unsqueeze(0).expand(B, S, -1, -1)
+        token_emb = self.fuse_proj(torch.cat([token_emb, gene_feat_projected], dim=-1))
+        if context_emb is not None:
+            context_emb = self.fuse_proj(torch.cat([context_emb, gene_feat_projected], dim=-1))
+
+        x = token_emb
+        t_emb = self.time_emb(timesteps.float())[:, None, None, :]
+
         if target_gene_idx is not None:
-            target_gene_idx = torch.clamp(target_gene_idx, 0, self.config.n_total_genes - 1)
-            gene_cond_emb = self.gene_embed(target_gene_idx)  # (B, gene_embed_dim)
-            cond_parts = [gene_cond_emb]
-            if self.config.use_batch_conditioning and batch_idx is not None:
-                batch_idx = torch.clamp(batch_idx, 0, self.config.n_technical_batches - 1)
-                cond_parts.append(self.batch_embed(batch_idx))
-            cond_vec = torch.cat(cond_parts, dim=-1)
-            cond_vec = self.cond_proj(cond_vec)
-            combined_emb = combined_emb + cond_vec
+            tgt = self._normalize_to_BS(target_gene_idx, B, S, "target_gene_idx", tokens.device)
+            gene_cond = self.gene_embed(tgt)
+        else:
+            gene_cond = torch.zeros(B, S, self.config.gene_embed_dim, device=tokens.device, dtype=token_emb.dtype)
 
-        # Inject combined (time + conditioning) into every token position
-        x = x + combined_emb.unsqueeze(1)  # (B, 1, D)
+        if self.config.use_batch_conditioning and batch_idx is not None:
+            bat_idx = self._normalize_to_BS(batch_idx, B, S, "batch_idx", tokens.device)
+            bat_idx = torch.clamp(bat_idx, 0, self.config.n_technical_batches - 1)
+            batch_cond = self.batch_embed(bat_idx)
+        else:
+            batch_cond = torch.zeros(B, S, getattr(self.config, "batch_embed_dim", 0), device=tokens.device, dtype=token_emb.dtype)
 
-        # ------------------------------------------------------------------
-        #  (5) Transformer
-        # ------------------------------------------------------------------
+        if getattr(self.config, "use_batch_conditioning", False):
+            cond_input = torch.cat([gene_cond, batch_cond], dim=-1)
+            cond_vec = self.cond_proj(cond_input)[:, :, None, :]
+            x = x + cond_vec + t_emb
+            context_emb = context_emb + cond_vec + t_emb
+        else:
+            x = x + t_emb
+            if context_emb is not None:
+                context_emb = context_emb + t_emb
+
+        idx = torch.arange(N, device=tokens.device)[None, None, :]
+        if target_gene_idx is not None:
+            flag = (idx == tgt[:, :, None]).long()
+            #assert target_gene_idx.shape == (B,)
+            #print(target_gene_idx.shape)
+            #print(gene_feat.shape)
+            pert_feats = self.pert_memory[target_gene_idx]
+            #print(pert_feats.shape)
+        else:
+            flag = torch.zeros(B, S, N, dtype=torch.long, device=tokens.device)
+            pert_feats = None
+        x = x + self.target_flag(flag)
+
+        if context_emb is not None:
+            # Build control memories per set
+            cmem = self.c_compressor(context_emb)  # (B,S,M,D)
+
+        # Compress per-set genes to memory tokens
+        # Note: Using RoPE-encoded features for compression to maintain positional awareness across genes
+        xmem = self.x_compressor(x, pert=pert_feats)  # (B,S,M,D)
+
+        # Add segment/type embeddings to disambiguate sources
+        xmem = xmem + self.segment_emb.weight[0]
+        if context_emb is not None:
+            cmem = cmem + self.segment_emb.weight[1]
+            # Concatenate per-set along memory dimension so each set attends to its own xmem and cmem only
+            kv = torch.cat([xmem, cmem], dim=2)  # (B,S,2M,D)
+        else:
+            kv = xmem  # (B,S,M,D)
+
+        # Normalize K/V to stabilise attention scales
+        kv = self.kv_ln(kv)
+
+        # Queries are the xmem tokens per set
+        lat = xmem  # (B,S,M,D)
+
+        # Process each set independently by flattening (B,S) -> (BS)
+        BS = B * S
+        M = self.mem_slots
+        D_ = lat.shape[-1]
+        K_len = kv.shape[2]
+        lat = lat.view(BS, M, D_)
+        kv = kv.view(BS, K_len, D_)
+
         use_ckpt = self.config.grad_ckpt and self.training and torch.is_grad_enabled()
-        for block in self.blocks:
+        for _, block in enumerate(self.blocks):
             if use_ckpt:
-                # Activation checkpointing to trade compute for memory.
-                # Pass the context tensor explicitly to avoid it being captured
-                # by the Python closure which breaks checkpointing and leads
-                # to "Trying to backward through the graph a second time" errors.
-                def _forward(_x, _ctx):
-                    # No nested autocast - let the outer context govern precision
-                    return block(_x, context=_ctx)
-                # Use the newer non-re-entrant checkpointing (required for FP8 compatibility)
-                x = torch.utils.checkpoint.checkpoint(_forward, x, context_emb, use_reentrant=False)
+                lat = torch.utils.checkpoint.checkpoint(lambda _lat, _kv: block(_lat, _kv), lat, kv, use_reentrant=True)
             else:
-                x = block(x, context=context_emb)
+                lat = block(lat, kv=kv)
 
-        # ------------------------------------------------------------------
-        #  (6) Output head
-        # ------------------------------------------------------------------
-        x = self.ln_f(x)
-        return self.head(x)
+        # Restore (B,S,M,D)
+        mem_kv = lat.view(B, S, M, D_)
+        # Decode from genes to memory using FlashAttention-based module
+        # Use the RoPE-encoded features for query in decode attention
+        ctx = self.decode_attn(gene_q=x, mem_kv=mem_kv)  # (B,S,N,D)
+        h = self.ln_f(ctx)
+        vocab_logits = self.head(h)
+
+        if not (return_aux or self.return_aux):
+            return vocab_logits
+        return {
+            "logits": vocab_logits,
+            "hidden": h,
+            "de_sig_logit": self.de_sig_head(h).squeeze(-1),
+            "de_dir_logits": self.de_dir_head(h),
+            "de_rank_score": self.de_rank_head(h).squeeze(-1),
+        }
 
 
-class PartialMaskingDiffusion:
-    """Discrete diffusion with partial masking strategy."""
-    
+class AbsorbingMaskMD4Continuous(nn.Module):
+    """
+    Continuous-time per-token absorbing-mask diffusion (MD4-style)
+    with auxiliary DE losses ported from PartialMaskingDiffusion.
+    """
+
     def __init__(self, config: ConditionalModelConfig):
+        super().__init__()
         self.config = config
-        self.n_timesteps = config.n_timesteps
-        self.vocab_size = config.vocab_size
-        self.mask_ratio = config.mask_ratio
-        
-        # Cosine schedule
-        s = 0.008
-        steps = torch.arange(self.n_timesteps + 1, dtype=torch.float32)
-        alphas = torch.cos((steps / self.n_timesteps + s) / (1 + s) * math.pi * 0.5) ** 2
-        alphas = alphas / alphas[0]
-        self.mask_probs = 1 - alphas[:-1]
-        self.mask_probs = self.mask_probs * self.mask_ratio / self.mask_probs[-1]
-        
-        # Load token weights for frequency-aware masking
-        self.token_weights = None
-        if config.token_distribution_json:
-            self.token_weights = self._compute_token_mask_weights(config.token_distribution_json)
-    
-    def _compute_token_mask_weights(self, token_distribution_json: str, smoothing: float = 1.0) -> torch.Tensor:
-        """Compute token mask weights based on inverse frequency."""
-        with open(token_distribution_json, 'r') as f:
-            token_counts = json.load(f)
-        
-        counts = np.zeros(self.vocab_size)
-        total_count = 0
-        for k, v in token_counts.items():
-            k = int(k)
-            if k < self.vocab_size:
-                counts[k] = v
-                total_count += v
-        
-        # Calculate frequencies
-        frequencies = counts / (total_count + 1e-10)
-        
-        # For tokens not in the distribution, use median frequency
-        seen_mask = counts > 0
-        if seen_mask.any():
-            median_freq = np.median(frequencies[seen_mask])
+        self.K = int(config.vocab_size)
+        self.mask_token_id = self.K
+        self.eps = 1e-4
+        self.t1 = 1e-2  # float(getattr(config, "t1", 1e-2))
+        self.antithetic = bool(getattr(config, "antithetic_time_sampling", True))
+        # Per-token polynomial exponent w_v (fixed schedule by default; non-trainable)
+        self.power_const = torch.ones(self.K) * float(getattr(config, "power_init", 1.0))
+
+    # ---- Schedule and derivatives ----
+    def alpha(self, t: torch.Tensor) -> torch.Tensor:
+        w = F.softplus(self.power_const).mean()  # or just a single learnable scalar
+        return 1.0 - (1.0 - self.eps) * t.clamp_min(1e-8) ** w
+
+    def dgamma_times_alpha(self, t):
+        w = F.softplus(self.power_const).mean().to(t.device)  # scalar
+        return w / t.unsqueeze(-1)
+
+    # ---- Forward process ----
+    def q_sample(self, x0: torch.LongTensor, t: torch.Tensor) -> torch.LongTensor:
+        B = x0.shape[0]
+        alpha_t = self.alpha(t).view(B, *([1] * (x0.ndim - 1)))  # broadcast to x0 shape
+        keep_prob = alpha_t.expand_as(x0)  # same keep prob for all tokens
+        survive = torch.rand_like(keep_prob, dtype=keep_prob.dtype) < keep_prob
+        return torch.where(survive, x0, torch.full_like(x0, self.mask_token_id)) # replaced self.mask_token_id
+
+    # ---- Helpers (ported) ----
+    @staticmethod
+    @torch.no_grad()
+    def build_de_targets(delta, signif_mode="percentile", signif_arg=0.10, mlm_mask=None):
+        B, N = delta.shape
+        abs_delta = delta.abs()
+        if mlm_mask is None:
+            valid_mask = torch.isfinite(delta)
         else:
-            median_freq = 1.0 / self.vocab_size
-        
-        # Set frequency for unseen tokens
-        frequencies[~seen_mask] = median_freq
-        
-        # Compute weights as inverse frequency with smoothing
-        # Add smoothing to avoid division by zero and extreme weights
-        weights = 1.0 / (frequencies + smoothing / self.vocab_size)
-        
-        # Normalize so average weight is 1.0 (preserves overall mask rate)
-        weights = weights / weights.mean()
-        
-        return torch.tensor(weights, dtype=torch.float32)
-    
-    def sample_mask_ratio(self, is_conditioned: bool, step: int) -> float:
-        """
-        Sample masking ratio based on conditioning and training step.
-        
-        Args:
-            is_conditioned: Whether this batch has conditioning
-            step: Current training step
-            
-        Returns:
-            Mask ratio to use
-        """
-        if is_conditioned:
-            # Fine-tuning: check for random 100% masking injection
-            if torch.rand(1).item() < self.config.finetune_full_mask_prob:
-                return 1.0  # 100% masking
-            
-            # Otherwise, use curriculum learning: ramp from start to end ratio
-            progress = min(1.0, step / self.config.finetune_mask_ratio_steps)
-            base_ratio = (self.config.finetune_mask_ratio_start + 
-                         (self.config.finetune_mask_ratio_end - self.config.finetune_mask_ratio_start) * progress)
-            
-            # Sample from beta distribution for variance
-            # Beta(2, 5) gives a right-skewed distribution favoring lower values
-            u = torch.distributions.Beta(2, 5).sample().item()
-            return base_ratio * u
+            valid_mask = torch.isfinite(delta) & mlm_mask
+        de_sig = torch.zeros_like(abs_delta, dtype=torch.bool)
+        if signif_mode == "percentile":
+            for b in range(B):
+                vb = valid_mask[b]
+                if vb.sum() == 0:
+                    continue
+                k = max(1, int(vb.sum().item() * signif_arg))
+                vals = abs_delta[b][vb]
+                thr = vals.topk(k).values[-1]
+                de_sig[b] = (abs_delta[b] >= thr) & vb
         else:
-            # Pretraining: use fixed mask ratio with beta sampling for variance
-            u = torch.distributions.Beta(2, 5).sample().item()
-            return self.config.pretrain_mask_ratio * u
-    
-    def q_sample(
-        self, 
-        x_start: torch.LongTensor, 
-        t: torch.LongTensor,
-        mask_token: int = 63,  # Last token is [MASK]
-        mask_ratio: Optional[float] = None,
-        step: int = 0
-    ) -> Tuple[torch.LongTensor, torch.BoolTensor]:
-        """
-        Forward diffusion: partially mask tokens based on timestep.
-        
-        Returns:
-            x_noisy: Partially masked tokens
-            mask: Boolean mask indicating which positions were masked
-        """
-        B, N = x_start.shape
-        device = x_start.device
-        
-        if mask_ratio is not None:
-            # Use provided mask ratio
-            mask_prob = torch.full((B,), mask_ratio, device=device)
+            de_sig = (abs_delta >= signif_arg) & valid_mask
+        de_dir = (delta > 0).long()
+        rank_score = abs_delta
+        return de_sig, de_dir, rank_score, valid_mask
+
+    def _bce_with_logits_masked(self, logits: torch.Tensor, target: torch.Tensor, mask: torch.Tensor, pos_weight: Optional[float] = None):
+        if pos_weight is not None:
+            pw = torch.tensor(pos_weight, device=logits.device, dtype=logits.dtype)
+            loss_fn = nn.BCEWithLogitsLoss(reduction="none", pos_weight=pw)
         else:
-            # Get mask probability for each timestep
-            mask_prob = self.mask_probs[t].to(device)  # (B,)
+            loss_fn = nn.BCEWithLogitsLoss(reduction="none")
+        loss = loss_fn(logits, target.float())
+        denom = mask.float().sum().clamp_min(1.0)
+        loss = (loss * mask.float()).sum() / denom
+        return loss
+
+    def _ce_masked(self, logits: torch.Tensor, target: torch.Tensor, mask: torch.Tensor):
+        loss = F.cross_entropy(logits.view(-1, 2), target.contiguous().view(-1), reduction="none")
+        loss = loss.view_as(mask)
+        denom = mask.float().sum().clamp_min(1.0)
+        loss = (loss * mask.float()).sum() / denom
+        return loss
+
+    def _ranknet_loss(self, scores, targets, mask, num_pairs=1024, margin=0.0, top_percent=0.1):
+        s = scores.mean(dim=1)  # (B,N)
+        t = targets.mean(dim=1)  # (B,N)
+        m = mask.any(dim=1)  # (B,N)
+        B, N = s.shape
+        eps = 0.05 * self.config.token_max_value
+        total = 0.0
+        denom = 0
+        for b in range(B):
+            valid = m[b]
+            tb, sb = t[b], s[b]
+            top_mask = valid & (tb >= eps)
+            bot_mask = valid & (tb < eps)
+            if top_mask.sum() == 0 or bot_mask.sum() == 0:
+                continue
+            k_top = max(1, int(top_mask.sum().item() * top_percent))
+            k_bot = max(1, int(bot_mask.sum().item() * top_percent))
+            top_idx = torch.where(top_mask)[0][tb[top_mask].topk(k_top).indices]
+            bot_idx = torch.where(bot_mask)[0][(-tb[bot_mask]).topk(k_bot).indices]
+            n = min(num_pairs, top_idx.numel(), bot_idx.numel())
+            if n == 0:
+                continue
+            ti = top_idx[torch.randint(0, top_idx.numel(), (n,), device=sb.device)]
+            tj = bot_idx[torch.randint(0, bot_idx.numel(), (n,), device=sb.device)]
+            total += (-F.logsigmoid(sb[ti] - sb[tj] - margin)).mean()
+            denom += 1
+        return (total / denom) if denom > 0 else s.new_zeros(())
+
+    def _masked_ce_loss(self, x_t, x0, logits, t):
+        # Ensure we have logits over data classes only (exclude mask category)
+        log_probs = F.log_softmax(logits[..., : self.K], dim=-1)
+        one_hot_x0 = F.one_hot(x0.clamp_max(self.K-1), num_classes=self.K).float()
+        neg_ce = -(one_hot_x0 * log_probs).sum(dim=-1)  # [B,S,N]
+        mask = (x_t == self.mask_token_id).float() # replaced mask_token_id
+        weight = self.dgamma_times_alpha(t).mean(dim=-1).view(x_t.shape[0], 1, 1)
+        loss = (mask * neg_ce * weight).sum(dim=(1, 2)) / mask.sum(dim=(1, 2)).clamp_min(1.0)
+        unweighted_loss = (mask * neg_ce).sum(dim=(1, 2)) / mask.sum(dim=(1, 2)).clamp_min(1.0)
+        return loss.mean(), unweighted_loss.mean()
+
+    def _masked_ce_soft_loss(self, x_t, logits, t, soft_targets):
+        """
+        x_t:          (B,S,N) masked input tokens at step t
+        logits:       (B,S,N,K+1) model output logits (data bins + mask bin)
+        t:            (B,) time steps
+        soft_targets: (B,N,K) per gene soft target dist (sum=1 over K data bins)
+        """
+        # 1. Take log-softmax over data bins only (exclude mask bin)
+        log_probs = F.log_softmax(logits[..., : self.K], dim=-1)  # (B,S,N,K)
         
-        if self.token_weights is None:
-            # Uniform masking
-            rand = torch.rand(B, N, device=device)
-            mask = rand < mask_prob.unsqueeze(1)
+        # Get probabilities for KL divergence computation
+        probs = F.softmax(logits[..., : self.K], dim=-1)  # (B,S,N,K)
+
+        # 2. Broadcast soft_targets across S
+        soft_targets_b = soft_targets.unsqueeze(1).expand_as(log_probs)  # (B,S,N,K)
+
+        # 3. Negative cross-entropy with soft targets
+        neg_ce = -(soft_targets_b * log_probs).sum(dim=-1)  # (B,S,N)
+
+        # 4. Mask out positions that aren't masked in x_t
+        mask = (x_t == self.mask_token_id).float()  # (B,S,N)
+        
+        # Compute KL divergence: KL(soft_targets || predicted_probs)
+        # KL(P||Q) = sum(P * log(P/Q)) = sum(P * log(P)) - sum(P * log(Q))
+        epsilon = 1e-10  # Small value to avoid log(0)
+        soft_targets_log = torch.log(soft_targets_b + epsilon)
+        kl_div = (soft_targets_b * (soft_targets_log - log_probs)).sum(dim=-1)  # (B,S,N)
+        
+        # Average KL divergence over masked positions
+        masked_kl = (mask * kl_div).sum() / mask.sum().clamp_min(1.0)
+        
+        # Define effective_bins function
+        def effective_bins(soft_targets):  # (B,N,K)
+            p = soft_targets.clamp_min(1e-12)
+            H = -(p * p.log()).sum(dim=-1)      # (B,N)
+            eff = torch.exp(H)                  # exp(entropy)
+            return eff.median().item(), eff.mean().item()
+        
+        # Print KL divergence statistics
+        if hasattr(self, '_log_counter'):
+            self._log_counter += 1
         else:
-            # Token-aware masking with annealing
-            if self.config.token_weighting_annealing_steps is None or self.config.token_weighting_annealing_steps == 0:
-                # No annealing - use full frequency-based masking
-                annealing_factor = 1.0
-            else:
-                annealing_factor = min(1.0, step / self.config.token_weighting_annealing_steps)
+            self._log_counter = 0
             
-            # Get frequency-based weights for tokens
-            freq_weights = self.token_weights.to(device)[x_start]  # shape: [B, N]
+        if self._log_counter % 100 == 0:  # Print every 10 iterations
+            # Compute effective bins for soft targets (sharpened)
+            eff_median, eff_mean = effective_bins(soft_targets)
             
-            # Blend uniform weights (1.0) with frequency weights based on annealing
-            weights = (1.0 - annealing_factor) + annealing_factor * freq_weights
+            # Compute effective bins for predicted probabilities (only for masked positions)
+            # Average probs across S dimension for masked positions  
+            mask_expanded = mask.unsqueeze(-1).expand_as(probs)  # (B,S,N,K)
+            masked_probs = probs * mask_expanded  # Zero out non-masked positions
+            # Average over S dimension for masked positions
+            avg_probs = masked_probs.mean(dim=1)  # (B,N,K)
+            pred_eff_median, pred_eff_mean = effective_bins(avg_probs)
             
-            # Scale mask probability by token weight
-            scaled_probs = weights * mask_prob.unsqueeze(1)
-            rand = torch.rand(B, N, device=device)
-            mask = rand < scaled_probs.clamp(0, 1)
-        
-        # Apply mask
-        x_noisy = torch.where(mask, mask_token, x_start)
-        
-        return x_noisy, mask
-    
+            print(f"[Step {self._log_counter}] KL divergence (masked tokens): {masked_kl.item():.4f}")
+            print(f"  - Mean KL per masked position: {masked_kl.item():.4f}")
+            print(f"  - Max KL per position: {(mask * kl_div).max().item():.4f}")
+            print(f"  - Min KL per position (non-zero): {kl_div[mask > 0].min().item() if (mask > 0).any() else 0:.4f}")
+            print(f"  - Num masked tokens: {mask.sum().item():.0f}")
+            print(f"  - Effective bins (sharpened targets γ=3.0) - Median: {eff_median:.2f}, Mean: {eff_mean:.2f}")
+            print(f"  - Effective bins (predictions) - Median: {pred_eff_median:.2f}, Mean: {pred_eff_mean:.2f}")
+
+        # 5. Weight schedule (same as before)
+        weight = self.dgamma_times_alpha(t).mean(dim=-1).view(x_t.shape[0], 1, 1)
+
+        # 6. Weighted average loss over masked positions
+        loss = (mask * neg_ce * weight).sum(dim=(1, 2)) / mask.sum(dim=(1, 2)).clamp_min(1.0)
+
+        # 7. Unweighted version for logging
+        unweighted_loss = (mask * neg_ce).sum(dim=(1, 2)) / mask.sum(dim=(1, 2)).clamp_min(1.0)
+
+        return loss.mean(), unweighted_loss.mean()
+
+    # ---- Training loss ----
     def compute_loss(
         self,
         model: nn.Module,
-        x_start: torch.LongTensor,
+        x0: torch.LongTensor,
         control_set: Optional[torch.LongTensor] = None,
         target_gene_idx: Optional[torch.LongTensor] = None,
         batch_idx: Optional[torch.LongTensor] = None,
-        mask_token: int = 63,
         step: int = 0,
+        max_steps: int = 1000,
+        lambda_de: float = 0.5,
+        lambda_dir: float = 0.2,
+        lambda_rank: float = 0.2,
+        de_pos_weight: Optional[float] = 2.0,
+        signif_mode: str = "percentile",
+        signif_arg: float = 0.1,
+        delta_means: Optional[torch.FloatTensor] = None,
+        soft_targets: Optional[torch.FloatTensor] = None,
+        return_aux: bool = True,
     ) -> torch.Tensor:
-        """
-        Compute training loss with partial masking and cross-attention conditioning.
-        """
-        B, N = x_start.shape
-        device = x_start.device
-        
-        # Sample random timesteps
-        t = torch.randint(0, self.n_timesteps, (B,), device=device)
-        
-        # Determine mask ratio based on conditioning
-        is_conditioned = control_set is not None
-        mask_ratio = self.sample_mask_ratio(is_conditioned, step)
-        
-        # Partial masking
-        x_noisy, mask = self.q_sample(x_start, t, mask_token, mask_ratio=mask_ratio, step=step)
-        
-        # Predict original tokens
-        logits = model(
-            x_noisy, t,
+        """Continuous-time MD4 objective with optional auxiliary DE losses."""
+        B = x0.shape[0]
+        device = x0.device
+
+        # Antithetic t sampling
+        if self.antithetic:
+            t0 = torch.rand((), device=device)
+            t = (t0 + torch.arange(0.0, 1.0, step=1.0 / max(1, B), device=device)) % 1.0
+        else:
+            t = torch.rand(B, device=device)
+        # Scale to [t1, 1.0]
+        t = (1 - self.t1) * t + self.t1
+
+        # Single z_t sample
+        zt = self.q_sample(x0, t)
+        out = model(
+            zt,
+            t,
             target_gene_idx=target_gene_idx,
             batch_idx=batch_idx,
-            control_context=control_set.detach()
+            control_context=control_set,
+            return_aux=return_aux,
         )
-        
-        # Compute loss only on masked positions
-        loss = F.cross_entropy(
-            logits[mask].view(-1, self.vocab_size),
-            x_start[mask].view(-1),
-            reduction='mean'
-        )
-        
-        return loss
-    
+        logits = out["logits"] if isinstance(out, dict) else out
+
+        main_loss, raw_main_loss = self._masked_ce_loss(zt, x0, logits, t)
+        #main_loss, raw_main_loss = self._masked_ce_soft_loss(zt, logits, t, soft_targets)
+
+        aux_loss = logits.new_zeros(())
+        aux_sig = logits.new_zeros(())
+        aux_dir = logits.new_zeros(())
+        aux_rank = logits.new_zeros(())
+
+        def ramp(cur_step, frac=0.2):
+            return min(1.0, cur_step / max(1, int(max_steps * frac)))
+
+        scale = ramp(step)
+        if return_aux and (control_set is not None) and isinstance(out, dict) and (delta_means is not None):
+            # Build DE targets using per-gene mask derived from zt
+            mlm_mask = (zt == self.mask_token_id)  # replaced mask_token_id (B,S,N) boolean
+            mlm_mask_gene = mlm_mask.any(dim=1)    # (B,N)
+            de_sig, de_dir, rank_score, valid = self.build_de_targets(
+                delta_means,
+                signif_mode=signif_mode,
+                signif_arg=signif_arg,
+                mlm_mask=mlm_mask_gene,
+            )
+
+            # Expand to (B,S,N)
+            B2, S2, N2, _ = logits.shape
+            de_sig = de_sig.unsqueeze(1).expand(-1, S2, -1)
+            de_dir_mask = de_sig
+            de_dir = de_dir.unsqueeze(1).expand(-1, S2, -1)
+            rank_score = rank_score.unsqueeze(1).expand(-1, S2, -1)
+            valid = valid.unsqueeze(1).expand(-1, S2, -1)
+
+            # Restrict aux to masked genes at each set position
+            valid = valid & mlm_mask
+            de_dir_mask = valid & de_dir_mask
+
+            # Compute individual aux losses
+            aux_sig = self._bce_with_logits_masked(out["de_sig_logit"], de_sig, valid, pos_weight=de_pos_weight) * lambda_de * scale
+            aux_loss = aux_loss + aux_sig
+
+            if de_dir_mask.any():
+                aux_dir = self._ce_masked(out["de_dir_logits"], de_dir, de_dir_mask) * lambda_dir * scale
+                aux_loss = aux_loss + aux_dir
+
+            aux_rank = self._ranknet_loss(out["de_rank_score"], rank_score, valid, num_pairs=512) * lambda_rank * scale
+            aux_loss = aux_loss + aux_rank
+
+        total_loss = main_loss + aux_loss
+
+        # Stash detailed loss breakdown for logging
+        try:
+            self._last_loss_stats = {
+                "loss_main": float(main_loss.detach().item()),
+                "loss_main_unweighted": float(raw_main_loss.detach().item()),
+                "loss_aux": float(aux_loss.detach().item()),
+                "loss_aux_de": float(aux_sig.detach().item()),
+                "loss_aux_dir": float(aux_dir.detach().item()),
+                "loss_aux_rank": float(aux_rank.detach().item()),
+                "loss_total": float(total_loss.detach().item()),
+            }
+        except Exception:
+            pass
+
+        return total_loss, raw_main_loss
+
+    # ---- Inference ----
     @torch.no_grad()
     def p_sample_loop(
         self,
         model: nn.Module,
-        shape: Tuple[int, int],
+        shape: Tuple[int, ...],
         control_set: Optional[torch.LongTensor] = None,
         target_gene_idx: Optional[torch.LongTensor] = None,
         batch_idx: Optional[torch.LongTensor] = None,
-        mask_token: int = 63,
-        temperature: float = 1.0,
-        device: str = 'cuda',
-    ) -> torch.LongTensor:
-        """
-        Generate samples with cross-attention conditioning and optional partial context.
-        """
-        B, N = shape
-        
-        # Start with all masks
-        x = torch.full((B, N), mask_token, device=device, dtype=torch.long)
-        
-        # Pre-encode control set once before denoising loop
-        control_context = control_set.detach()
-        # Iterative denoising
-        for t in reversed(range(self.n_timesteps)):
-            t_batch = torch.full((B,), t, device=device, dtype=torch.long)
-            
-            # Get model predictions with pre-encoded conditioning
+    ):
+        B = shape[0]
+        device = next(model.parameters()).device
+        x_t = torch.full(shape, self.mask_token_id, device=device, dtype=torch.long)
+
+        for i in range(self.config.n_timesteps - 1):
+            # fraction from high→low
+            t_frac = (self.config.n_timesteps - i) / self.config.n_timesteps
+            s_frac = t_frac - 1.0 / self.config.n_timesteps
+
+            t_val = math.cos(math.pi / 2.0 * (1.0 - t_frac))
+            s_val = math.cos(math.pi / 2.0 * (1.0 - s_frac))
+
+            t_batch = torch.full((B,), t_val, device=device)
+            s_batch = torch.full((B,), s_val, device=device)
+
+            # α(t), α(s) are computed from these
+            alpha_t = self.alpha(t_batch)
+            alpha_s = self.alpha(s_batch)
+
             logits = model(
-                x, t_batch,
-                control_set=None,  # Don't pass raw control_set
+                x_t,
+                t_batch,
                 target_gene_idx=target_gene_idx,
                 batch_idx=batch_idx,
-                control_context=control_context  # Pass pre-encoded context
+                control_context=control_set,
+                return_aux=False,
             )
-            
-            logits = logits / temperature
-            
-            # Determine which positions to unmask at this step
-            current_mask_prob = self.mask_probs[t]
-            if t > 0:
-                next_mask_prob = self.mask_probs[t-1]
-            else:
-                next_mask_prob = 0.0
-            
-            # Positions currently masked
-            is_masked = (x == mask_token)
-            
-            # Probability of unmasking
-            unmask_prob = 1.0 - (next_mask_prob / (current_mask_prob + 1e-8))
-            unmask_prob = min(max(unmask_prob, 0.0), 1.0)
-            
-            # Randomly select positions to unmask
-            unmask = torch.rand_like(is_masked.float()) < unmask_prob
-            unmask = unmask & is_masked
-            
-            # Sample new tokens for positions to unmask
-            if unmask.any():
-                probs = F.softmax(logits, dim=-1)
-                new_tokens = torch.multinomial(probs.view(-1, self.vocab_size), 1).view(x.shape)
-                x[unmask] = new_tokens[unmask]
-        
-        return x
+            if isinstance(logits, dict):
+                logits = logits.get("logits", logits)
+            probs_data = F.softmax(logits[..., : self.K], dim=-1)  # (B,S,N,K)
 
-def create_muon_optimizer(model: nn.Module, config: ConditionalModelConfig):
+            # MD4: unmask_prob = (α_s - α_t) / (1 - α_t)
+            unmask_prob = (alpha_s - alpha_t) / (1.0 - alpha_t).clamp_min(1e-8)  # (B,)
+            # reshape for broadcasting over (S,N)
+            unmask_prob = unmask_prob.view(B, *([1] * (x_t.ndim - 1)))
+
+            is_mask = (x_t == self.K)
+            if is_mask.any():
+                # sample unmask flags only on masked positions
+                rand = torch.rand_like(is_mask, dtype=probs_data.dtype)
+                unmask = (rand < unmask_prob).to(is_mask.dtype) & is_mask
+
+                if unmask.any():
+                    # sample tokens for the to-be-unmasked positions
+                    x_new = torch.multinomial(
+                        probs_data.view(-1, self.K), 1
+                    ).view_as(x_t)
+                    x_t = torch.where(unmask.bool(), x_new, x_t)
+
+        # FINAL DECODE STEP (t=0): fill any remaining masks
+        remaining = (x_t == self.mask_token_id)
+        if remaining.any():
+            t0 = torch.zeros(B, device=device)
+            logits0 = model(
+                x_t,
+                t0,
+                target_gene_idx=target_gene_idx,
+                batch_idx=batch_idx,
+                control_context=control_set,
+                return_aux=False,
+            )
+            if isinstance(logits0, dict):
+                logits0 = logits0.get("logits", logits0)
+            probs0 = F.softmax(logits0[..., : self.K], dim=-1)
+            x_fill = torch.multinomial(probs0.view(-1, self.K), 1).view_as(x_t)
+            x_t = torch.where(remaining, x_fill, x_t)
+
+        return x_t
+
+def create_muon_optimizer(model: nn.Module, config: ConditionalModelConfig, use_muon=True):
     """Create Muon optimizer with weight decay.
 
     Falls back to a non-distributed variant when ``torch.distributed`` is not
@@ -878,11 +1201,16 @@ def create_muon_optimizer(model: nn.Module, config: ConditionalModelConfig):
         if any(x in n for x in ["token_emb", "id_emb", "batch_embed", "ln", "norm"])
     ]
 
+    print(f"use_muon: {use_muon}")
+
     param_groups = [
-        dict(params=hidden_weights, use_muon=True,
-             lr=config.muon_lr, weight_decay=0.01),
+        dict(params=hidden_weights, use_muon=use_muon,
+             lr=config.muon_lr if use_muon else config.adam_lr, 
+             weight_decay=0.01,
+             **({"betas": (0.9, 0.95)} if not use_muon else {})),
+        # no decay on norms/embeds
         dict(params=hidden_gains_biases + nonhidden_params, use_muon=False,
-             lr=config.adam_lr, betas=(0.9, 0.95), weight_decay=0.01),
+             lr=config.adam_lr, betas=(0.9, 0.95), weight_decay=0.00),
     ]
 
     # ---------------------------------------------------------
@@ -908,4 +1236,4 @@ def get_lr(optimizer, it: int, cfg: ConditionalModelConfig):
     # 3) linear cooldown
     else:
         decay_ratio = (cfg.num_steps - it) / cfg.cooldown_steps
-        return decay_ratio
+        return decay_ratio 

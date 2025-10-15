@@ -34,7 +34,8 @@ class VCCPairedDataset(Dataset):
         normalize: bool = True,
         blacklist_path: str = None,
     ):
-  
+        # Save key construction arguments for downstream evaluation utilities
+        self.adata_path = adata_path
         self.set_size = set_size
         self.n_samples_per_gene = n_samples_per_gene
         self.random_seed = random_seed
@@ -250,9 +251,6 @@ class VCCPairedDataset(Dataset):
         
         # Calculate log2 fold change for the target gene BEFORE exponentiating
         gene_idx_in_adata = self.adata.var.index.get_loc(sample['gene'])
-        pert_gene_expr_log = pert_expr[:, gene_idx_in_adata].mean()
-        ctrl_gene_expr_log = ctrl_expr[:, gene_idx_in_adata].mean()
-        log2fc = (pert_gene_expr_log - ctrl_gene_expr_log) / np.log(2)
 
         pert_expr = torch.from_numpy(pert_expr).float()
         ctrl_expr = torch.from_numpy(ctrl_expr).float()
@@ -262,7 +260,6 @@ class VCCPairedDataset(Dataset):
             'control_expr': ctrl_expr,
             'target_gene': sample['gene'],
             'target_gene_idx': sample['gene_idx'],
-            'log2fc': torch.tensor(float(log2fc), dtype=torch.float32),
             'pert_batches': sample['pert_batches'].tolist(),
             'ctrl_batches': sample['ctrl_batches'].tolist(),
             'cell_type': sample['cell_type'],
@@ -276,6 +273,7 @@ def create_vcc_paired_dataloader(
     n_samples_per_gene: int = 10,
     train_split: float = 0.8,
     is_train: bool = True,
+    batch_size: int = 1,
     num_workers: int = 4,
     shuffle: bool = True,
     random_seed: int = 42,
@@ -302,7 +300,7 @@ def create_vcc_paired_dataloader(
     collate_fn = VCCCollator(tokenizer, dataset.batch_to_idx, set_size) if tokenizer else None
 
     dataloader_kwargs = dict(
-        batch_size=1,
+        batch_size=batch_size,
         shuffle=shuffle and is_train,  # Only shuffle training data
         num_workers=num_workers,
         drop_last=True,
@@ -326,6 +324,7 @@ def create_vcc_train_val_dataloaders(
     n_samples_per_gene_train: int = 10,
     n_samples_per_gene_val: int = 1,
     train_split: float = 0.8,
+    batch_size: int = 1,
     num_workers: int = 4,
     tokenizer=None,
     prefetch_factor: int = 2,
@@ -343,6 +342,7 @@ def create_vcc_train_val_dataloaders(
         n_samples_per_gene=n_samples_per_gene_train,
         train_split=train_split,
         is_train=True,
+        batch_size=batch_size,
         num_workers=num_workers,
         shuffle=True,
         random_seed=random_seed,
@@ -361,6 +361,7 @@ def create_vcc_train_val_dataloaders(
         n_samples_per_gene=n_samples_per_gene_val,
         train_split=train_split,
         is_train=False,
+        batch_size=24, # hardcode balcklist.txt gene size
         num_workers=0,  # Disable multiprocessing for validation
         shuffle=False,
         random_seed=random_seed,

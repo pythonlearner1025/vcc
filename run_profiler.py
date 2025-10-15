@@ -2,7 +2,7 @@
 import torch
 from torch.profiler import profile, ProfilerActivity           # ⬅ profiling
 from train_orion import train_epoch_st, ConditionalModelConfig        # your code
-from models.diffusion import PartialMaskingDiffusion, get_lr, create_muon_optimizer            # your code
+from models.diffusion import AbsorbingMaskMD4Continuous, get_lr, create_muon_optimizer            # your code
 from pathlib import Path
 
 # -------------------------------------------------------------------------
@@ -15,7 +15,7 @@ loader        = [dummy_tokens] * 12                     # > 11 steps available
 from models.diffusion import ConditionalDiffusionTransformer
 
 model         = ConditionalDiffusionTransformer(config).cuda()
-diffusion     = PartialMaskingDiffusion(config)         # ← your impl
+diffusion     = AbsorbingMaskMD4Continuous(config)         # ← your impl
 opt           = create_muon_optimizer(model, config)
 sch           = torch.optim.lr_scheduler.LambdaLR(opt, lambda it: get_lr(opt, it, config)) 
 
